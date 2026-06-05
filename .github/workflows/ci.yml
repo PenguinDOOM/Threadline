@@ -3,14 +3,12 @@ name: CI
 
 on:
   push:
-    branches:
-      - master
-      - dev-*
   pull_request:
     branches:
       - master
       - dev-*
   merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
