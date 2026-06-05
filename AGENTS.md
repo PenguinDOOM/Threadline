@@ -361,6 +361,14 @@ cargo test
 
 If a check cannot be run, record why in the final development summary, not in source comments.
 
+## CI and security scanning
+
+Keep GitHub Actions workflow names stable and descriptive.
+
+Use CodeQL for Rust security scanning. Prefer manual build mode so analysis sees the same crate graph that `cargo build` uses.
+
+Do not add temporary branch names, local phase labels, or orchestration notes to workflow names, job names, or step names.
+
 ## Development summary format
 
 When reporting changes, use:
