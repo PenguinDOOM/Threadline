@@ -5,11 +5,11 @@ on:
   push:
     branches:
       - master
-      - main
+      - dev-*
   pull_request:
     branches:
       - master
-      - main
+      - dev-*
   merge_group:
 
 permissions:
