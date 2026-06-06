@@ -1,5 +1,8 @@
-use axum::http::Request;
 use thiserror::Error;
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    http::{HeaderValue, Request},
+};
 use uuid::Uuid;
 
 use crate::auth::LoadedUpstreamAuth;
@@ -46,29 +49,49 @@ pub fn build_handshake_request(
     });
     let client_request_id = new_request_id();
 
-    let mut builder = Request::builder()
-        .method("GET")
-        .uri(url)
-        .header("authorization", format!("Bearer {}", auth.bearer_token))
-        .header("openai-beta", RESPONSES_WEBSOCKETS_BETA_HEADER)
-        .header("session-id", &session.session_id)
-        .header("thread-id", &session.thread_id)
-        .header("x-codex-window-id", &session.window_id)
-        .header("x-client-request-id", &client_request_id);
+    let mut request = url
+        .into_client_request()
+        .map_err(|_| HandshakeBuildError::RequestBuildFailed)?;
+    let headers = request.headers_mut();
+
+    headers.insert(
+        "authorization",
+        header_value(&format!("Bearer {}", auth.bearer_token))?,
+    );
+    headers.insert(
+        "OpenAI-Beta",
+        header_value(RESPONSES_WEBSOCKETS_BETA_HEADER)?,
+    );
+    headers.insert("originator", header_value("codex_vscode")?);
+    headers.insert(
+        "user-agent",
+        header_value(&format!(
+            "codex_vscode/0.1.0 Threadline/{}",
+            env!("CARGO_PKG_VERSION")
+        ))?,
+    );
+    headers.insert("version", header_value(env!("CARGO_PKG_VERSION"))?);
+    headers.insert("session-id", header_value(&session.session_id)?);
+    headers.insert("thread-id", header_value(&session.thread_id)?);
+    headers.insert("x-codex-window-id", header_value(&session.window_id)?);
+    headers.insert(
+        "x-client-request-id",
+        header_value(&client_request_id)?,
+    );
 
     if let Some(turn_state) = &session.turn_state {
-        builder = builder.header("x-codex-turn-state", turn_state);
+        headers.insert("x-codex-turn-state", header_value(turn_state)?);
     }
-
-    let request = builder
-        .body(())
-        .map_err(|_| HandshakeBuildError::RequestBuildFailed)?;
 
     Ok(CodexHandshake {
         request,
         session,
         client_request_id,
     })
+}
+
+fn header_value(value: &str) -> Result<HeaderValue, HandshakeBuildError> {
+    HeaderValue::from_str(value).map_err(|_| HandshakeBuildError::RequestBuildFailed)
 }
 
 fn new_request_id() -> String {
@@ -82,7 +105,8 @@ mod tests {
     use crate::auth::{AuthSource, LoadedUpstreamAuth, RefreshBoundary};
 
     use super::{
-        RESPONSES_WEBSOCKETS_BETA_HEADER, UpstreamSessionDescriptor, build_handshake_request,
+        HandshakeBuildError, RESPONSES_WEBSOCKETS_BETA_HEADER, UpstreamSessionDescriptor,
+        build_handshake_request,
     };
 
     fn test_auth() -> LoadedUpstreamAuth {
@@ -103,8 +127,18 @@ mod tests {
             handshake.request.uri().to_string(),
             "ws://localhost:9001/codex"
         );
+        assert_eq!(headers["connection"], "Upgrade");
+        assert_eq!(headers["upgrade"], "websocket");
+        assert!(headers.get("sec-websocket-key").is_some());
+        assert_eq!(headers["sec-websocket-version"], "13");
         assert_eq!(headers["authorization"], "Bearer top-secret-token");
         assert_eq!(headers["openai-beta"], RESPONSES_WEBSOCKETS_BETA_HEADER);
+        assert_eq!(headers["originator"], "codex_vscode");
+        assert_eq!(
+            headers["user-agent"],
+            format!("codex_vscode/0.1.0 Threadline/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(headers["version"], env!("CARGO_PKG_VERSION"));
         Uuid::parse_str(headers["session-id"].to_str().unwrap()).expect("session id uuid");
         Uuid::parse_str(headers["thread-id"].to_str().unwrap()).expect("thread id uuid");
         Uuid::parse_str(headers["x-codex-window-id"].to_str().unwrap()).expect("window id uuid");
@@ -134,5 +168,13 @@ mod tests {
         assert_eq!(headers["x-codex-window-id"], session.window_id);
         assert_eq!(headers["x-codex-turn-state"], "turn-state-abc");
         assert_ne!(headers["x-client-request-id"], "turn-state-abc");
+    }
+
+    #[test]
+    fn handshake_rejects_invalid_upstream_url() {
+        let error = build_handshake_request("not a websocket url", &test_auth(), None)
+            .expect_err("invalid url should fail");
+
+        assert!(matches!(error, HandshakeBuildError::RequestBuildFailed));
     }
 }
