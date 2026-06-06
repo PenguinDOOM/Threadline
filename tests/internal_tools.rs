@@ -206,6 +206,7 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     ))
     .expect("initial request json");
     assert_eq!(first_request["type"], "response.create");
+    assert_eq!(first_request["instructions"], "");
     assert!(first_request.get("response").is_none());
 
     let tools = first_request["tools"].as_array().expect("tools array");
@@ -240,6 +241,7 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     ))
     .expect("followup request json");
     assert_eq!(followup_request["type"], "response.create");
+    assert_eq!(followup_request["instructions"], "");
     assert!(followup_request.get("response").is_none());
     assert_eq!(
         followup_request["previous_response_id"],
