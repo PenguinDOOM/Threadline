@@ -141,6 +141,51 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
     }
 }
 
+fn split_sse_frames(body: &str) -> Vec<&str> {
+    body.split("\n\n")
+        .filter(|frame| !frame.trim().is_empty())
+        .collect()
+}
+
+fn sse_event_and_data(frame: &str) -> (&str, &str) {
+    let mut event = None;
+    let mut data = None;
+    let mut unexpected_lines = Vec::new();
+
+    for (index, line) in frame.lines().enumerate() {
+        if let Some(value) = line.strip_prefix("event: ") {
+            assert!(
+                event.replace(value).is_none(),
+                "expected exactly one event line in SSE frame, found duplicate at line {}: {frame}",
+                index + 1
+            );
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("data: ") {
+            assert!(
+                data.replace(value).is_none(),
+                "expected compact single-line SSE data payload, found duplicate data line at line {}: {frame}",
+                index + 1
+            );
+            continue;
+        }
+
+        unexpected_lines.push(format!("line {}: {line}", index + 1));
+    }
+
+    assert!(
+        unexpected_lines.is_empty(),
+        "expected exactly one event line and one compact data line in SSE frame; unexpected lines: {}. Frame: {frame}",
+        unexpected_lines.join(" | ")
+    );
+
+    (
+        event.unwrap_or_else(|| panic!("missing event line in SSE frame: {frame}")),
+        data.unwrap_or_else(|| panic!("missing data line in SSE frame: {frame}")),
+    )
+}
+
 async fn seed_marker(app: axum::Router, server: &ScriptedWebSocketServer, marker: &str) {
     let response = post_responses(app, json!({"model":"ignored","input":"seed"})).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -177,8 +222,34 @@ async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
         .await
         .expect("body");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: error"));
-    assert!(body_text.contains("upstream_websocket_closed"));
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
+    let payload: Value = serde_json::from_str(data).expect("error json");
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(event, "error");
+    assert_eq!(
+        payload,
+        json!({
+            "error": {
+                "code": "upstream_websocket_closed",
+                "message": "The upstream Codex websocket closed before Threadline finished streaming the response.",
+                "type": "bad_gateway_error"
+            }
+        })
+    );
+    assert_eq!(
+        data,
+        json!({
+            "error": {
+                "code": "upstream_websocket_closed",
+                "message": "The upstream Codex websocket closed before Threadline finished streaming the response.",
+                "type": "bad_gateway_error"
+            }
+        })
+        .to_string()
+    );
+    assert!(!body_text.contains("data: [DONE]"));
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 1);
@@ -274,7 +345,21 @@ async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstre
         .expect("body timeout")
         .expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: response.completed"));
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("completed frame"));
+    let payload: Value = serde_json::from_str(data).expect("completed json");
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(event, "response.completed");
+    assert_eq!(
+        payload,
+        json!({"type":"response.completed","response":{"id":"response-2"}})
+    );
+    assert_eq!(
+        data,
+        json!({"type":"response.completed","response":{"id":"response-2"}}).to_string()
+    );
+    assert!(!body_text.contains("data: [DONE]"));
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 3);
@@ -340,9 +425,21 @@ async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
     .expect("body timeout")
     .expect("body");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: response.created"));
-    assert!(body_text.contains("event: error"));
-    assert!(body_text.contains("upstream_websocket_closed"));
+    let frames = split_sse_frames(&body_text);
+    let (created_event, created_data) = sse_event_and_data(frames.first().expect("created frame"));
+    let (error_event, error_data) = sse_event_and_data(frames.get(1).expect("error frame"));
+    let created_payload: Value = serde_json::from_str(created_data).expect("created json");
+    let error_payload: Value = serde_json::from_str(error_data).expect("error json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(created_event, "response.created");
+    assert_eq!(
+        created_payload,
+        json!({"type":"response.created","response":{"id":"response-created"}})
+    );
+    assert_eq!(error_event, "error");
+    assert_eq!(error_payload["error"]["code"], "upstream_websocket_closed");
+    assert!(!body_text.contains("data: [DONE]"));
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 2);
@@ -425,8 +522,14 @@ async fn reconnect_fallback_attempts_only_once() {
         .expect("body timeout")
         .expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: error"));
-    assert!(body_text.contains("upstream_websocket_closed"));
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
+    let payload: Value = serde_json::from_str(data).expect("error json");
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(event, "error");
+    assert_eq!(payload["error"]["code"], "upstream_websocket_closed");
+    assert!(!body_text.contains("data: [DONE]"));
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 3);
@@ -513,8 +616,34 @@ async fn reconnect_fallback_attempts_only_once_after_pre_stream_send_failure() {
         .expect("body timeout")
         .expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: error"));
-    assert!(body_text.contains("upstream_websocket_closed"));
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
+    let payload: Value = serde_json::from_str(data).expect("error json");
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(event, "error");
+    assert_eq!(
+        payload,
+        json!({
+            "error": {
+                "code": "upstream_websocket_closed",
+                "message": "The upstream Codex websocket closed before Threadline finished streaming the response.",
+                "type": "bad_gateway_error"
+            }
+        })
+    );
+    assert_eq!(
+        data,
+        json!({
+            "error": {
+                "code": "upstream_websocket_closed",
+                "message": "The upstream Codex websocket closed before Threadline finished streaming the response.",
+                "type": "bad_gateway_error"
+            }
+        })
+        .to_string()
+    );
+    assert!(!body_text.contains("data: [DONE]"));
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 3);

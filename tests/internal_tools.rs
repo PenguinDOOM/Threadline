@@ -266,7 +266,10 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let parsed_frames: Vec<_> = frames.iter().map(|frame| sse_event_and_data(frame)).collect();
+    let parsed_frames: Vec<_> = frames
+        .iter()
+        .map(|frame| sse_event_and_data(frame))
+        .collect();
     let delta_payload: Value = serde_json::from_str(parsed_frames[0].1).expect("delta json");
     let completed_payload: Value =
         serde_json::from_str(parsed_frames[1].1).expect("completed json");
@@ -282,9 +285,14 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
         completed_payload,
         json!({"type":"response.completed","response":{"id":"response-final"}})
     );
+    assert_eq!(
+        parsed_frames[1].1,
+        json!({"type":"response.completed","response":{"id":"response-final"}}).to_string()
+    );
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("response-intermediate"));
     assert!(!body_text.contains("event: response.output_item.done"));
+    assert!(!body_text.contains("data: [DONE]"));
     assert!(server.take_pending_client_messages().await.is_empty());
 }
 
@@ -347,9 +355,27 @@ async fn internal_tool_pre_done_events_are_hidden_from_downstream() {
 
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let parsed_frames: Vec<_> = frames
+        .iter()
+        .map(|frame| sse_event_and_data(frame))
+        .collect();
+
+    assert_eq!(parsed_frames.len(), 2);
+    assert_eq!(parsed_frames[0].0, "response.output_text.delta");
+    assert_eq!(
+        serde_json::from_str::<Value>(parsed_frames[0].1).expect("delta json"),
+        json!({"type":"response.output_text.delta","delta":"final answer"})
+    );
+    assert_eq!(parsed_frames[1].0, "response.completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(parsed_frames[1].1).expect("completed json"),
+        json!({"type":"response.completed","response":{"id":"response-final"}})
+    );
     assert!(!body_text.contains("event: response.output_item.added"));
     assert!(!body_text.contains("threadline_echo"));
-    assert!(body_text.contains("final answer"));
+    assert!(!body_text.contains("response-intermediate"));
+    assert!(!body_text.contains("data: [DONE]"));
 }
 
 #[tokio::test]
@@ -388,9 +414,17 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
     let _ = server.recv_client_message().await.expect("initial request");
 
     server
-        .send_text(
-            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-visible","name":"downstream_tool","arguments":"{}"}}"#,
-        )
+        .send_text(concat!(
+            "{\n",
+            "  \"type\": \"response.output_item.done\",\n",
+            "  \"item\": {\n",
+            "    \"type\": \"function_call\",\n",
+            "    \"call_id\": \"call-visible\",\n",
+            "    \"name\": \"downstream_tool\",\n",
+            "    \"arguments\": \"{}\"\n",
+            "  }\n",
+            "}"
+        ))
         .await;
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-visible"}}"#)
@@ -398,9 +432,40 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
 
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: response.output_item.done"));
-    assert!(body_text.contains("downstream_tool"));
-    assert!(body_text.contains("response-visible"));
+    let frames = split_sse_frames(&body_text);
+    let parsed_frames: Vec<_> = frames
+        .iter()
+        .map(|frame| sse_event_and_data(frame))
+        .collect();
+    let tool_payload = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-visible",
+            "name": "downstream_tool",
+            "arguments": "{}"
+        }
+    });
+    let completed_payload = json!({
+        "type": "response.completed",
+        "response": {"id": "response-visible"}
+    });
+
+    assert_eq!(parsed_frames.len(), 2);
+    assert_eq!(parsed_frames[0].0, "response.output_item.done");
+    assert_eq!(parsed_frames[0].1, tool_payload.to_string());
+    assert_eq!(
+        serde_json::from_str::<Value>(parsed_frames[0].1).expect("tool payload json"),
+        tool_payload
+    );
+    assert_eq!(parsed_frames[1].0, "response.completed");
+    assert_eq!(parsed_frames[1].1, completed_payload.to_string());
+    assert_eq!(
+        serde_json::from_str::<Value>(parsed_frames[1].1).expect("completed payload json"),
+        completed_payload
+    );
+    assert!(!body_text.contains("data: [DONE]"));
+    assert!(!body_text.contains("  \"type\": \"response.output_item.done\""));
     assert!(server.take_pending_client_messages().await.is_empty());
 }
 
