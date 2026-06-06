@@ -205,6 +205,14 @@ fn sse_event_and_data(frame: &str) -> (&str, &str) {
     )
 }
 
+fn assert_done_frame(frame: &str) {
+    assert_eq!(
+        frame,
+        "data: [DONE]",
+        "expected a bare downstream DONE frame without an event line"
+    );
+}
+
 #[tokio::test]
 async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -494,8 +502,8 @@ async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse()
     let frames = split_sse_frames(&body_text);
     assert_eq!(
         frames.len(),
-        1,
-        "expected exactly one completed SSE frame, got body: {body_text}"
+        2,
+        "expected completed SSE plus bare DONE frame, got body: {body_text}"
     );
 
     let (event, data) = sse_event_and_data(frames[0]);
@@ -506,6 +514,8 @@ async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse()
         payload,
         json!({"type":"response.completed","response":{"id":"response-1"}})
     );
+
+    assert_done_frame(frames[1]);
 }
 
 #[tokio::test]
