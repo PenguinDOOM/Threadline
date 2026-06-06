@@ -1,6 +1,6 @@
 # Threadline
 
-Threadline is a Rust service that will bridge VS Code Copilot BYOK Responses API traffic to the Codex backend WebSocket protocol.
+Threadline is a Rust service that will bridge VSCode Copilot BYOK Responses API traffic to the Codex backend WebSocket protocol.
 
 The current implementation provides the initial HTTP surface only:
 

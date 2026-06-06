@@ -2,13 +2,13 @@
 
 ## Project
 
-Threadline is a full-Rust bridge between VS Code Copilot BYOK Custom Endpoint requests and the Codex backend WebSocket protocol.
+Threadline is a full-Rust bridge between VSCode Copilot BYOK Custom Endpoint requests and the Codex backend WebSocket protocol.
 
 Threadline is inspired by lessons learned from ChatMock experiments, but it must not copy, port, or reuse ChatMock source code. Implementations, module boundaries, names, tests, and comments must be original to this repository.
 
 ## Primary goals
 
-* Provide a stable `/v1/responses` endpoint for VS Code BYOK.
+* Provide a stable `/v1/responses` endpoint for VSCode BYOK.
 * Bridge HTTP/SSE requests to Codex backend WebSocket sessions.
 * Preserve `previous_response_id` continuity through retained WebSocket sessions.
 * Keep retained upstream WebSockets alive with a pump-based Ping/Pong design.
@@ -22,7 +22,7 @@ Do not turn Threadline into a general-purpose OpenAI-compatible proxy.
 
 Avoid adding compatibility for unrelated providers, historical ChatMock behavior, prompt-file injection, or Python ChatMock behavior unless explicitly requested.
 
-Do not implement `/v1/chat/completions` unless it is needed for VS Code BYOK compatibility. `/v1/responses` is the primary API.
+Do not implement `/v1/chat/completions` unless it is needed for VSCode BYOK compatibility. `/v1/responses` is the primary API.
 
 ## Source independence rule
 
@@ -99,7 +99,7 @@ Avoid:
 Use these terms consistently:
 
 * `upstream`: Codex backend WebSocket side.
-* `downstream`: VS Code BYOK HTTP/SSE client side.
+* `downstream`: VSCode BYOK HTTP/SSE client side.
 * `response marker`: a `previous_response_id` / completed response id used for continuation.
 * `retained session`: a stored upstream WebSocket plus session metadata.
 * `internal tool`: a Threadline-handled tool hidden from downstream clients.
@@ -201,7 +201,7 @@ Log event names should be stable and grep-friendly:
 
 Prefer typed errors internally.
 
-Public HTTP/SSE errors should be stable and VS Code compatible.
+Public HTTP/SSE errors should be stable and VSCode compatible.
 
 Use clear error codes for expected states:
 
@@ -256,7 +256,7 @@ Do not delete a response marker merely because a socket close was observed after
 
 Threadline internal tools must use the `threadline_*` prefix.
 
-Internal tool calls must never be forwarded downstream to VS Code.
+Internal tool calls must never be forwarded downstream to VSCode.
 
 When an upstream response emits a Threadline internal tool call:
 
