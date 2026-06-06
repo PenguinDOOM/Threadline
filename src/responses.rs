@@ -340,7 +340,25 @@ pub async fn responses_handler(
                         ));
                     }
                     "error" => {
-                        debug!(event_type, "upstream_error_event");
+                        let error = parsed.get("error");
+                        let error_code = error
+                            .and_then(|value| value.get("code"))
+                            .and_then(safe_scalar_field);
+                        let error_message = error
+                            .and_then(|value| value.get("message"))
+                            .and_then(safe_scalar_field);
+                        let status = parsed
+                            .get("status")
+                            .or_else(|| parsed.get("status_code"))
+                            .and_then(safe_scalar_field);
+
+                        debug!(
+                            event_type,
+                            error_code,
+                            error_message,
+                            status,
+                            "upstream_error_event"
+                        );
                         state.lease.mark_upstream_terminal().await;
                         state.done = true;
                         return Some((
@@ -524,6 +542,15 @@ fn sse_payload_chunk(event: &str, payload: &str) -> Bytes {
 fn sse_json_chunk(event: &str, payload: &Value) -> Bytes {
     let payload = serde_json::to_string(payload).expect("serialize downstream sse payload");
     sse_payload_chunk(event, &payload)
+}
+
+fn safe_scalar_field(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 fn sse_error_chunk(error: &ThreadlineError) -> Bytes {

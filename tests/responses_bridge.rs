@@ -535,7 +535,9 @@ async fn upstream_error_event_emits_a_single_compact_sse_error() {
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("error request");
     server
-        .send_text(r#"{"type":"error","error":{"message":"boom"}}"#)
+        .send_text(
+            r#"{"type":"error","error":{"code":"upstream_boom","message":"boom"},"status":502}"#,
+        )
         .await;
 
     let body = to_bytes(response.into_body(), usize::MAX)
