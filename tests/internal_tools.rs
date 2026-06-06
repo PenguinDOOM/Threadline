@@ -122,6 +122,51 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
     }
 }
 
+fn split_sse_frames(body: &str) -> Vec<&str> {
+    body.split("\n\n")
+        .filter(|frame| !frame.trim().is_empty())
+        .collect()
+}
+
+fn sse_event_and_data(frame: &str) -> (&str, &str) {
+    let mut event = None;
+    let mut data = None;
+    let mut unexpected_lines = Vec::new();
+
+    for (index, line) in frame.lines().enumerate() {
+        if let Some(value) = line.strip_prefix("event: ") {
+            assert!(
+                event.replace(value).is_none(),
+                "expected exactly one event line in SSE frame, found duplicate at line {}: {frame}",
+                index + 1
+            );
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("data: ") {
+            assert!(
+                data.replace(value).is_none(),
+                "expected compact single-line SSE data payload, found duplicate data line at line {}: {frame}",
+                index + 1
+            );
+            continue;
+        }
+
+        unexpected_lines.push(format!("line {}: {line}", index + 1));
+    }
+
+    assert!(
+        unexpected_lines.is_empty(),
+        "expected exactly one event line and one compact data line in SSE frame; unexpected lines: {}. Frame: {frame}",
+        unexpected_lines.join(" | ")
+    );
+
+    (
+        event.unwrap_or_else(|| panic!("missing event line in SSE frame: {frame}")),
+        data.unwrap_or_else(|| panic!("missing data line in SSE frame: {frame}")),
+    )
+}
+
 #[tokio::test]
 async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -220,11 +265,26 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
 
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: response.output_text.delta"));
-    assert!(body_text.contains("final answer"));
-    assert!(body_text.contains("response-final"));
+    let frames = split_sse_frames(&body_text);
+    let parsed_frames: Vec<_> = frames.iter().map(|frame| sse_event_and_data(frame)).collect();
+    let delta_payload: Value = serde_json::from_str(parsed_frames[0].1).expect("delta json");
+    let completed_payload: Value =
+        serde_json::from_str(parsed_frames[1].1).expect("completed json");
+
+    assert_eq!(parsed_frames.len(), 2);
+    assert_eq!(parsed_frames[0].0, "response.output_text.delta");
+    assert_eq!(
+        delta_payload,
+        json!({"type":"response.output_text.delta","delta":"final answer"})
+    );
+    assert_eq!(parsed_frames[1].0, "response.completed");
+    assert_eq!(
+        completed_payload,
+        json!({"type":"response.completed","response":{"id":"response-final"}})
+    );
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("response-intermediate"));
+    assert!(!body_text.contains("event: response.output_item.done"));
     assert!(server.take_pending_client_messages().await.is_empty());
 }
 

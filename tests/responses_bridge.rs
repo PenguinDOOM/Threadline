@@ -146,6 +146,51 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
     }
 }
 
+fn split_sse_frames(body: &str) -> Vec<&str> {
+    body.split("\n\n")
+        .filter(|frame| !frame.trim().is_empty())
+        .collect()
+}
+
+fn sse_event_and_data(frame: &str) -> (&str, &str) {
+    let mut event = None;
+    let mut data = None;
+    let mut unexpected_lines = Vec::new();
+
+    for (index, line) in frame.lines().enumerate() {
+        if let Some(value) = line.strip_prefix("event: ") {
+            assert!(
+                event.replace(value).is_none(),
+                "expected exactly one event line in SSE frame, found duplicate at line {}: {frame}",
+                index + 1
+            );
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("data: ") {
+            assert!(
+                data.replace(value).is_none(),
+                "expected compact single-line SSE data payload, found duplicate data line at line {}: {frame}",
+                index + 1
+            );
+            continue;
+        }
+
+        unexpected_lines.push(format!("line {}: {line}", index + 1));
+    }
+
+    assert!(
+        unexpected_lines.is_empty(),
+        "expected exactly one event line and one compact data line in SSE frame; unexpected lines: {}. Frame: {frame}",
+        unexpected_lines.join(" | ")
+    );
+
+    (
+        event.unwrap_or_else(|| panic!("missing event line in SSE frame: {frame}")),
+        data.unwrap_or_else(|| panic!("missing data line in SSE frame: {frame}")),
+    )
+}
+
 #[tokio::test]
 async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -360,6 +405,98 @@ async fn upstream_connect_failure_returns_502() {
 }
 
 #[tokio::test]
+async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"ignored","input":"pretty-delta"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("pretty delta request");
+    server
+        .send_text(
+            "{\n  \"type\": \"response.output_text.delta\",\n  \"delta\": \"hello\"\n}",
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    assert_eq!(
+        frames.len(),
+        2,
+        "expected delta and completed SSE frames, got body: {body_text}"
+    );
+
+    let (event, data) = sse_event_and_data(frames[0]);
+    let payload: Value = serde_json::from_str(data).expect("delta json");
+    let (completed_event, completed_data) = sse_event_and_data(frames[1]);
+    let completed_payload: Value =
+        serde_json::from_str(completed_data).expect("completed json");
+
+    assert_eq!(event, "response.output_text.delta");
+    assert_eq!(
+        payload,
+        json!({"type":"response.output_text.delta","delta":"hello"})
+    );
+    assert_eq!(completed_event, "response.completed");
+    assert_eq!(
+        completed_payload,
+        json!({"type":"response.completed","response":{"id":"response-1"}})
+    );
+}
+
+#[tokio::test]
+async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"ignored","input":"pretty-completed"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("pretty completed request");
+    server
+        .send_text(
+            "{\n  \"type\": \"response.completed\",\n  \"response\": {\n    \"id\": \"response-1\"\n  }\n}",
+        )
+        .await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    assert_eq!(
+        frames.len(),
+        1,
+        "expected exactly one completed SSE frame, got body: {body_text}"
+    );
+
+    let (event, data) = sse_event_and_data(frames[0]);
+    let payload: Value = serde_json::from_str(data).expect("completed json");
+
+    assert_eq!(event, "response.completed");
+    assert_eq!(
+        payload,
+        json!({"type":"response.completed","response":{"id":"response-1"}})
+    );
+}
+
+#[tokio::test]
 async fn upstream_response_failed_emits_a_stable_sse_error() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -379,12 +516,16 @@ async fn upstream_response_failed_emits_a_stable_sse_error() {
         .await
         .expect("body");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: error"));
-    assert!(body_text.contains("upstream_response_failed"));
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
+    let payload: Value = serde_json::from_str(data).expect("error json");
+
+    assert_eq!(event, "error");
+    assert_eq!(payload["error"]["code"], "upstream_response_failed");
 }
 
 #[tokio::test]
-async fn upstream_error_event_emits_a_stable_sse_error() {
+async fn upstream_error_event_emits_a_single_compact_sse_error() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -403,8 +544,40 @@ async fn upstream_error_event_emits_a_stable_sse_error() {
         .await
         .expect("body");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: error"));
-    assert!(body_text.contains("upstream_error_event"));
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
+    let payload: Value = serde_json::from_str(data).expect("error json");
+
+    assert_eq!(event, "error");
+    assert_eq!(payload["error"]["code"], "upstream_error_event");
+}
+
+#[tokio::test]
+async fn done_sentinel_is_not_forwarded_as_downstream_data() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"ignored","input":"done"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("done request");
+    server.send_text("[DONE]").await;
+    server.send_close(1000, "done").await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
+    let payload: Value = serde_json::from_str(data).expect("error json");
+
+    assert_eq!(event, "error");
+    assert_eq!(payload["error"]["code"], "upstream_invalid_json");
+    assert!(!body_text.contains("data: [DONE]"));
 }
 
 #[tokio::test]
@@ -445,8 +618,12 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
         .await
         .expect("body");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    assert!(body_text.contains("event: error"));
-    assert!(body_text.contains("upstream_invalid_json"));
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
+    let payload: Value = serde_json::from_str(data).expect("error json");
+
+    assert_eq!(event, "error");
+    assert_eq!(payload["error"]["code"], "upstream_invalid_json");
 
     sleep(Duration::from_millis(50)).await;
     let retried = post_responses(
