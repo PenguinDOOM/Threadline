@@ -1,0 +1,467 @@
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, Response, StatusCode};
+use futures_util::future::BoxFuture;
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+#[path = "support/scripted_ws.rs"]
+mod scripted_ws;
+
+use scripted_ws::ScriptedWebSocketServer;
+use threadline::auth::{AuthSource, LoadedUpstreamAuth, RefreshBoundary};
+use threadline::codex_ws::UpstreamSessionDescriptor;
+use threadline::config::ThreadlineConfig;
+use threadline::errors::ThreadlineError;
+use threadline::http::build_router_with_services;
+use threadline::responses::{
+    ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
+};
+use threadline::ws_pump::LiveUpstreamWebSocket;
+
+#[derive(Clone)]
+struct StaticAuthProvider;
+
+impl UpstreamAuthProvider for StaticAuthProvider {
+    fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
+        Ok(LoadedUpstreamAuth {
+            bearer_token: "test-token".to_string(),
+            source: AuthSource::ExplicitOverride,
+            refresh_boundary: RefreshBoundary::NotAvailable,
+        })
+    }
+}
+
+struct PlannedConnection {
+    server: Arc<ScriptedWebSocketServer>,
+    turn_state: Option<String>,
+}
+
+#[derive(Clone)]
+struct RecordingConnector {
+    plans: Arc<Mutex<VecDeque<PlannedConnection>>>,
+    sessions: Arc<Mutex<Vec<UpstreamSessionDescriptor>>>,
+}
+
+impl RecordingConnector {
+    fn new(plans: Vec<PlannedConnection>) -> Self {
+        Self {
+            plans: Arc::new(Mutex::new(plans.into())),
+            sessions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    async fn recorded_sessions(&self) -> Vec<UpstreamSessionDescriptor> {
+        self.sessions.lock().await.clone()
+    }
+}
+
+impl UpstreamConnector for RecordingConnector {
+    fn connect(
+        &self,
+        _auth: LoadedUpstreamAuth,
+        session: Option<UpstreamSessionDescriptor>,
+    ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+        let plans = Arc::clone(&self.plans);
+        let sessions = Arc::clone(&self.sessions);
+        Box::pin(async move {
+            let session = session.unwrap_or_else(new_session_descriptor);
+            let plan = plans
+                .lock()
+                .await
+                .pop_front()
+                .expect("planned websocket connection");
+            sessions.lock().await.push(session.clone());
+
+            let (stream, _) = connect_async(plan.server.url())
+                .await
+                .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
+
+            Ok(ConnectedUpstream {
+                websocket: Arc::new(LiveUpstreamWebSocket::from_stream(stream)),
+                session,
+                turn_state: plan.turn_state,
+            })
+        })
+    }
+}
+
+#[derive(Clone)]
+struct FailingConnector;
+
+impl UpstreamConnector for FailingConnector {
+    fn connect(
+        &self,
+        _auth: LoadedUpstreamAuth,
+        _session: Option<UpstreamSessionDescriptor>,
+    ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+        Box::pin(async { Err(ThreadlineError::UpstreamWebSocketConnectFailed) })
+    }
+}
+
+fn build_test_router(
+    config: ThreadlineConfig,
+    connector: Arc<dyn UpstreamConnector>,
+) -> axum::Router {
+    build_router_with_services(
+        config,
+        ThreadlineServices::new(Arc::new(StaticAuthProvider), connector),
+    )
+}
+
+async fn post_responses(app: axum::Router, payload: Value) -> Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("request"),
+    )
+    .await
+    .expect("response")
+}
+
+fn message_text(message: Message) -> String {
+    match message {
+        Message::Text(text) => text.to_string(),
+        other => panic!("expected text message, got {other:?}"),
+    }
+}
+
+fn new_session_descriptor() -> UpstreamSessionDescriptor {
+    UpstreamSessionDescriptor {
+        session_id: Uuid::now_v7().to_string(),
+        thread_id: Uuid::now_v7().to_string(),
+        window_id: Uuid::now_v7().to_string(),
+        turn_state: None,
+    }
+}
+
+#[tokio::test]
+async fn response_marker_continuity_reconnects_with_saved_turn_state() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let second_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: Some("turn-state-1".to_string()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&second_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let first_response =
+        post_responses(app.clone(), json!({"model":"ignored","input":"first"})).await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let first_payload: Value = serde_json::from_str(&message_text(
+        first_server
+            .recv_client_message()
+            .await
+            .expect("first request message"),
+    ))
+    .expect("first request json");
+    assert_eq!(first_payload["type"], "response.create");
+
+    first_server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-1"}}"#)
+        .await;
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let first_body = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+    let first_body_text = String::from_utf8(first_body.to_vec()).expect("utf8 body");
+    assert!(first_body_text.contains("event: response.created"));
+    assert!(first_body_text.contains("event: response.completed"));
+
+    first_server.send_close(1000, "done").await;
+    sleep(Duration::from_millis(50)).await;
+
+    let second_response = post_responses(
+        app,
+        json!({
+            "model":"ignored",
+            "input":"second",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+
+    let second_payload: Value = serde_json::from_str(&message_text(
+        second_server
+            .recv_client_message()
+            .await
+            .expect("second request message"),
+    ))
+    .expect("second request json");
+    assert_eq!(second_payload["type"], "response.create");
+    assert_eq!(
+        second_payload["response"]["previous_response_id"],
+        "response-1"
+    );
+
+    let sessions = connector.recorded_sessions().await;
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].session_id, sessions[1].session_id);
+    assert_eq!(sessions[0].thread_id, sessions[1].thread_id);
+    assert_eq!(sessions[1].turn_state.as_deref(), Some("turn-state-1"));
+
+    second_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .await;
+    let _ = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .expect("second body");
+}
+
+#[tokio::test]
+async fn missing_previous_response_id_returns_stable_not_found() {
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(FailingConnector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"ignored",
+            "input":"missing",
+            "previous_response_id":"response-missing"
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let payload: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
+}
+
+#[tokio::test]
+async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_lease() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"ignored",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let conflict = post_responses(
+        app.clone(),
+        json!({
+            "model":"ignored",
+            "input":"conflict",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    drop(active);
+    sleep(Duration::from_millis(50)).await;
+
+    let retried = post_responses(
+        app,
+        json!({
+            "model":"ignored",
+            "input":"retry",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn retained_session_capacity_exhaustion_returns_503() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server,
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let active = post_responses(app.clone(), json!({"model":"ignored","input":"first"})).await;
+    assert_eq!(active.status(), StatusCode::OK);
+
+    let exhausted = post_responses(app, json!({"model":"ignored","input":"second"})).await;
+    assert_eq!(exhausted.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(exhausted.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let payload: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        payload["error"]["code"],
+        "retained_session_capacity_exceeded"
+    );
+
+    drop(active);
+}
+
+#[tokio::test]
+async fn upstream_connect_failure_returns_502() {
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(FailingConnector));
+
+    let response = post_responses(app, json!({"model":"ignored","input":"connect"})).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let payload: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        payload["error"]["code"],
+        "upstream_websocket_connect_failed"
+    );
+}
+
+#[tokio::test]
+async fn upstream_response_failed_emits_a_stable_sse_error() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"ignored","input":"failure"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("failure request");
+    server
+        .send_text(r#"{"type":"response.failed","response":{"id":"response-1"},"error":{"message":"failed"}}"#)
+        .await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(body_text.contains("event: error"));
+    assert!(body_text.contains("upstream_response_failed"));
+}
+
+#[tokio::test]
+async fn upstream_error_event_emits_a_stable_sse_error() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"ignored","input":"error"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("error request");
+    server
+        .send_text(r#"{"type":"error","error":{"message":"boom"}}"#)
+        .await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(body_text.contains("event: error"));
+    assert!(body_text.contains("upstream_error_event"));
+}
+
+#[tokio::test]
+async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let response = post_responses(
+        app.clone(),
+        json!({
+            "model":"ignored",
+            "input":"malformed",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("malformed request");
+    server.send_text("not-json").await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(body_text.contains("event: error"));
+    assert!(body_text.contains("upstream_invalid_json"));
+
+    sleep(Duration::from_millis(50)).await;
+    let retried = post_responses(
+        app,
+        json!({
+            "model":"ignored",
+            "input":"retry",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(retried.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(retried.into_body(), usize::MAX)
+        .await
+        .expect("retry body");
+    let payload: Value = serde_json::from_slice(&body).expect("retry json body");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
+}

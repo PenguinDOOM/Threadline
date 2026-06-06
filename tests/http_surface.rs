@@ -59,7 +59,7 @@ async fn models_endpoint_returns_configured_model() {
 }
 
 #[tokio::test]
-async fn responses_endpoint_returns_stable_placeholder_error() {
+async fn responses_endpoint_reports_configuration_error_when_upstream_url_is_missing() {
     let app = build_router(ThreadlineConfig::default());
 
     let response = app
@@ -74,15 +74,15 @@ async fn responses_endpoint_returns_stable_placeholder_error() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(payload["error"]["code"], "responses_not_ready");
-    assert_eq!(payload["error"]["type"], "not_implemented_error");
+    assert_eq!(payload["error"]["code"], "configuration_error");
+    assert_eq!(payload["error"]["type"], "configuration_error");
     assert_eq!(
         payload["error"]["message"],
-        "The /v1/responses bridge is not available yet."
+        "Threadline is missing THREADLINE_UPSTREAM_URL for upstream websocket connections."
     );
 }

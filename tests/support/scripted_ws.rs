@@ -23,6 +23,7 @@ pub struct ScriptedWebSocketServer {
     reader_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
+#[allow(dead_code)]
 impl ScriptedWebSocketServer {
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
