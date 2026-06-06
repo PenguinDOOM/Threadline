@@ -619,6 +619,55 @@ async fn downstream_completed_and_done_are_separate_body_chunks_before_eof() {
 }
 
 #[tokio::test]
+async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_done_and_eof() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({"model":"ignored","input":"live-shaped-completed"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("live-shaped-completed request");
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-1","output":[{"type":"function_call","name":"threadline_echo","call_id":"call-1"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}}"#,
+        )
+        .await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(
+        frames.len(),
+        2,
+        "expected completed SSE plus bare DONE frame, got body: {body_text}"
+    );
+
+    let (event, data) = sse_event_and_data(frames[0]);
+    let payload: Value = serde_json::from_str(data).expect("completed json");
+    assert_eq!(event, "response.completed");
+    assert_eq!(payload["response"]["id"], "response-1");
+    assert_eq!(
+        payload["response"]["output"][0]["name"],
+        "threadline_echo",
+        "expected payload normalization to stay unchanged for response.completed"
+    );
+    assert_done_frame(frames[1]);
+}
+
+#[tokio::test]
 async fn upstream_response_failed_emits_a_stable_sse_error() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {

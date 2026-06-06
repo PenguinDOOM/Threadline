@@ -285,7 +285,9 @@ pub async fn responses_handler(
 
                 debug!(event_type, "upstream_event_received");
 
-                if event_contains_internal_tool_name(&parsed) {
+                if event_type.starts_with("response.output_item.")
+                    && event_contains_internal_tool_name(&parsed)
+                {
                     continue;
                 }
 
