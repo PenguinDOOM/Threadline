@@ -25,6 +25,55 @@ Threadline reads configuration from CLI flags or environment variables:
 - `--jobs-enabled` / `THREADLINE_JOBS_ENABLED`
 - `--log-level` / `THREADLINE_LOG_LEVEL`
 
+Running `threadline` without a subcommand starts the server. Authentication commands live under the `login` subcommand group.
+
+## Login And Credential Discovery
+
+Threadline exposes these login commands:
+
+```bash
+threadline login store
+threadline login status
+threadline login logout
+```
+
+`threadline login store` reads the bearer token from stdin and stores it in Threadline's own OS credential-manager entry by default. It does not silently downgrade to file storage. If the OS credential manager is unavailable, the command fails instead of writing credentials somewhere else.
+
+`threadline login status` reports whether Threadline-owned credentials are available and whether a refresh token is present, without printing token values.
+
+`threadline login logout` deletes only Threadline-owned credentials from the OS credential manager. It does not delete, mutate, or log out Codex credentials.
+
+Threadline's runtime auth lookup uses this precedence order:
+
+1. An explicit bearer-token override, when one is provided by configuration.
+2. The Threadline-owned OS credential-manager entry.
+3. The Codex OS credential-manager entry, read-only.
+4. Existing `auth.json` file fallbacks.
+
+The Threadline-owned keyring entry is separate from Codex and is the default destination for `threadline login store`.
+
+For Codex interoperability, Threadline can read the same OS credential-manager entry Codex uses: service `Codex Auth` with an account derived from `CODEX_HOME`. Normal Threadline command output does not print that derived account value. Threadline treats the Codex entry as a compatibility input only: it can read those credentials at runtime, but it does not write, rewrite, or delete them.
+
+`CODEX_HOME` affects two runtime compatibility paths:
+
+- It selects the Codex home directory used to derive the Codex keyring account for read-only interoperability.
+- It is also one of the file fallback roots for `auth.json` discovery.
+
+If `CODEX_HOME` is unset, Threadline skips the Codex keyring lookup and continues with the remaining supported sources.
+
+When runtime auth checks the OS credential manager, keyring service failures are not always terminal. If the Threadline-owned keyring lookup or Codex keyring lookup cannot be used at runtime, Threadline may fall through to later supported sources, including existing file fallbacks.
+
+The file fallback search keeps existing compatibility behavior and checks these roots in order:
+
+1. `CHATGPT_LOCAL_HOME`
+2. `CODEX_HOME`
+3. The default per-user `.chatgpt-local` directory
+4. The default per-user `.codex` directory
+
+`auth.json` file fallbacks are read for compatibility, but `threadline login store` does not write them.
+
+Warning: `--refresh-token` is optional, but if you use it, the refresh token remains visible in process arguments on shared systems and in local process inspection tools. Prefer stdin for the bearer token and use `--refresh-token` only when that tradeoff is acceptable.
+
 ## Local validation
 
 Run these commands from the Threadline directory:
