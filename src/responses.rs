@@ -322,9 +322,9 @@ pub async fn responses_handler(
                         state.done = true;
                         debug!(response_id, "final_response_completed");
                         return Some((
-                            Ok::<Bytes, std::convert::Infallible>(sse_data_chunk(
+                            Ok::<Bytes, std::convert::Infallible>(sse_json_chunk(
                                 &event_type,
-                                &next,
+                                &parsed,
                             )),
                             state,
                         ));
@@ -352,9 +352,9 @@ pub async fn responses_handler(
                     }
                     _ => {
                         return Some((
-                            Ok::<Bytes, std::convert::Infallible>(sse_data_chunk(
+                            Ok::<Bytes, std::convert::Infallible>(sse_json_chunk(
                                 &event_type,
-                                &next,
+                                &parsed,
                             )),
                             state,
                         ));
@@ -516,12 +516,17 @@ fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError {
     }
 }
 
-fn sse_data_chunk(event: &str, payload: &str) -> Bytes {
+fn sse_payload_chunk(event: &str, payload: &str) -> Bytes {
     Bytes::from(format!("event: {event}\ndata: {payload}\n\n"))
 }
 
+fn sse_json_chunk(event: &str, payload: &Value) -> Bytes {
+    let payload = serde_json::to_string(payload).expect("serialize downstream sse payload");
+    sse_payload_chunk(event, &payload)
+}
+
 fn sse_error_chunk(error: &ThreadlineError) -> Bytes {
-    let payload = serde_json::to_string(&error.public_error_document())
-        .expect("serialize threadline error payload");
-    sse_data_chunk("error", &payload)
+    let payload = serde_json::to_value(error.public_error_document())
+        .expect("convert threadline error payload to json value");
+    sse_json_chunk("error", &payload)
 }
