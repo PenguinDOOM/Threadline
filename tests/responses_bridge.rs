@@ -838,7 +838,10 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
     ))
     .expect("missing request json");
     assert_eq!(missing_payload["type"], "response.create");
-    assert_eq!(missing_payload["instructions"], Value::String(String::new()));
+    assert_eq!(
+        missing_payload["instructions"],
+        Value::String(String::new())
+    );
     assert_eq!(missing_payload["max_output_tokens"], Value::from(321));
 
     missing_server
@@ -878,4 +881,48 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
     let _ = to_bytes(null_response.into_body(), usize::MAX)
         .await
         .expect("null body");
+}
+
+#[tokio::test]
+async fn explicit_instructions_are_preserved_in_upstream_response_create() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "type":"wrong.type",
+            "model":"ignored",
+            "input":[{"role":"user","content":[{"type":"input_text","text":"preserve me"}]}],
+            "instructions":"explicit downstream instructions",
+            "max_output_tokens":987
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let payload: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("explicit instructions request message"),
+    ))
+    .expect("explicit instructions request json");
+    assert_eq!(payload["type"], "response.create");
+    assert_eq!(
+        payload["instructions"],
+        Value::String("explicit downstream instructions".to_string())
+    );
+    assert_eq!(payload["max_output_tokens"], Value::from(987));
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-3"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("explicit instructions body");
 }
