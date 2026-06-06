@@ -489,6 +489,7 @@ async fn send_response_create(
     response_payload: &serde_json::Map<String, Value>,
 ) -> Result<(), ThreadlineError> {
     let mut outbound = response_payload.clone();
+    remove_codex_unsupported_response_fields(&mut outbound);
     outbound.insert("store".to_string(), Value::Bool(false));
     match outbound.get("instructions") {
         Some(Value::Null) | None => {
@@ -504,6 +505,19 @@ async fn send_response_create(
         .send_text(Value::Object(outbound).to_string())
         .await
         .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)
+}
+
+const CODEX_UNSUPPORTED_RESPONSE_FIELDS: [&str; 4] = [
+    "max_output_tokens",
+    "max_tokens",
+    "max_completion_tokens",
+    "truncation",
+];
+
+fn remove_codex_unsupported_response_fields(payload: &mut serde_json::Map<String, Value>) {
+    for field_name in CODEX_UNSUPPORTED_RESPONSE_FIELDS {
+        payload.remove(field_name);
+    }
 }
 
 async fn send_followup_tool_outputs(

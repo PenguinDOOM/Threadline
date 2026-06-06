@@ -746,7 +746,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
 }
 
 #[tokio::test]
-async fn byok_request_fields_are_preserved_in_upstream_response_create() {
+async fn supported_request_fields_are_preserved_while_codex_unsupported_fields_are_omitted() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
