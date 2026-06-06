@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamCloseMetadata {
@@ -48,6 +49,7 @@ impl LiveUpstreamWebSocket {
         let task_is_closed = Arc::clone(&is_closed);
 
         let task = tokio::spawn(async move {
+            debug!(outbound_capacity = 32usize, "ws_pump_started");
             loop {
                 tokio::select! {
                     outbound = outbound_rx.recv() => match outbound {
@@ -74,10 +76,13 @@ impl LiveUpstreamWebSocket {
                             let _ = inbound_tx.send(String::from_utf8_lossy(bytes.as_ref()).into_owned());
                         }
                         Some(Ok(Message::Ping(payload))) => {
+                            let payload_len = payload.len();
+                            debug!(payload_len, "ws_pump_ping_received");
                             if let Err(error) = writer.send(Message::Pong(payload)).await {
                                 record_error(&task_close_metadata, error.to_string()).await;
                                 break;
                             }
+                            debug!(payload_len, "ws_pump_pong_sent");
                         }
                         Some(Ok(Message::Pong(_))) => {}
                         Some(Ok(Message::Close(frame))) => {

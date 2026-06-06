@@ -465,3 +465,165 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
     let payload: Value = serde_json::from_slice(&body).expect("retry json body");
     assert_eq!(payload["error"]["code"], "previous_response_not_found");
 }
+
+#[tokio::test]
+async fn nested_response_markers_remain_reusable_without_main_agent_assumptions() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let first = post_responses(app.clone(), json!({"model":"ignored","input":"first"})).await;
+    let _ = server.recv_client_message().await.expect("first request");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-parent"}}"#)
+        .await;
+    let _ = to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+
+    let second = post_responses(
+        app.clone(),
+        json!({
+            "model":"ignored",
+            "input":"second",
+            "previous_response_id":"response-parent"
+        }),
+    )
+    .await;
+    let second_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("second request"),
+    ))
+    .expect("second request json");
+    assert_eq!(
+        second_payload["response"]["previous_response_id"],
+        "response-parent"
+    );
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-child"}}"#)
+        .await;
+    let _ = to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("second body");
+
+    let third = post_responses(
+        app.clone(),
+        json!({
+            "model":"ignored",
+            "input":"third",
+            "previous_response_id":"response-parent"
+        }),
+    )
+    .await;
+    let third_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("third request"),
+    ))
+    .expect("third request json");
+    assert_eq!(
+        third_payload["response"]["previous_response_id"],
+        "response-parent"
+    );
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-third"}}"#)
+        .await;
+    let _ = to_bytes(third.into_body(), usize::MAX)
+        .await
+        .expect("third body");
+
+    let fourth = post_responses(
+        app,
+        json!({
+            "model":"ignored",
+            "input":"fourth",
+            "previous_response_id":"response-child"
+        }),
+    )
+    .await;
+    let fourth_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("fourth request"),
+    ))
+    .expect("fourth request json");
+    assert_eq!(
+        fourth_payload["response"]["previous_response_id"],
+        "response-child"
+    );
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-fourth"}}"#)
+        .await;
+    let _ = to_bytes(fourth.into_body(), usize::MAX)
+        .await
+        .expect("fourth body");
+
+    let sessions = connector.recorded_sessions().await;
+    assert_eq!(sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn byok_request_fields_are_preserved_in_upstream_response_create() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"ignored",
+            "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
+            "tools":[{
+                "type":"function",
+                "name":"user_tool",
+                "description":"User-defined tool",
+                "parameters":{"type":"object","properties":{},"additionalProperties":false}
+            }],
+            "tool_choice":{"type":"function","name":"user_tool"},
+            "parallel_tool_calls":false,
+            "reasoning":{"effort":"high","summary":"auto"},
+            "include":["reasoning.encrypted_content"],
+            "store":true,
+            "prompt_cache_key":"cache-key-1",
+            "max_output_tokens":321
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    let response_payload = &request_payload["response"];
+    let tools = response_payload["tools"].as_array().expect("tools array");
+
+    assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
+    assert_eq!(
+        response_payload["tool_choice"],
+        json!({"type":"function","name":"user_tool"})
+    );
+    assert_eq!(response_payload["parallel_tool_calls"], Value::Bool(false));
+    assert_eq!(
+        response_payload["reasoning"],
+        json!({"effort":"high","summary":"auto"})
+    );
+    assert_eq!(
+        response_payload["include"],
+        json!(["reasoning.encrypted_content"])
+    );
+    assert_eq!(response_payload["store"], Value::Bool(true));
+    assert_eq!(
+        response_payload["prompt_cache_key"],
+        Value::String("cache-key-1".to_string())
+    );
+    assert_eq!(response_payload["max_output_tokens"], Value::from(321));
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}

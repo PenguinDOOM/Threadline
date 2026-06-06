@@ -84,6 +84,13 @@ pub enum ThreadlineError {
 }
 
 impl ThreadlineError {
+    pub fn is_upstream_recoverable_close(&self) -> bool {
+        matches!(
+            self,
+            Self::UpstreamWebSocketClosed | Self::UpstreamWebSocketConnectFailed
+        )
+    }
+
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::ResponsesNotReady => StatusCode::NOT_IMPLEMENTED,

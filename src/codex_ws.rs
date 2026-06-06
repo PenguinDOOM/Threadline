@@ -14,6 +14,12 @@ pub struct UpstreamSessionDescriptor {
     pub turn_state: Option<String>,
 }
 
+impl UpstreamSessionDescriptor {
+    pub fn refresh_window(&mut self) {
+        self.window_id = new_request_id();
+    }
+}
+
 #[derive(Debug)]
 pub struct CodexHandshake {
     pub request: Request<()>,

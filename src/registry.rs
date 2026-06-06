@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crate::codex_ws::UpstreamSessionDescriptor;
 use crate::ws_pump::LiveUpstreamWebSocket;
+use tracing::debug;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +107,13 @@ impl RetainedSessionRegistry {
             },
         );
 
+        debug!(
+            session_id = %session.session_id,
+            thread_id = %session.thread_id,
+            window_id = %session.window_id,
+            "retained_session_acquired"
+        );
+
         Ok(RetainedSessionLease {
             entry_id,
             registry: Arc::clone(&self.inner),
@@ -139,11 +147,19 @@ impl RetainedSessionRegistry {
         {
             entry.upstream = None;
             entry.recoverable = true;
-            entry.window_generation += 1;
+            refresh_entry_window(entry);
         }
 
         entry.in_use = true;
         entry.last_used = Instant::now();
+
+        debug!(
+            response_marker,
+            session_id = %entry.session.session_id,
+            thread_id = %entry.session.thread_id,
+            window_id = %entry.session.window_id,
+            "retained_session_acquired"
+        );
 
         Ok(RetainedSessionLease {
             entry_id,
@@ -211,7 +227,8 @@ impl RetainedSessionLease {
         if let Some(entry) = state.entries.get_mut(&self.entry_id) {
             entry.upstream = None;
             entry.recoverable = true;
-            entry.window_generation += 1;
+            refresh_entry_window(entry);
+            self.session = entry.session.clone();
             entry.last_used = Instant::now();
         }
     }
@@ -235,8 +252,19 @@ impl Drop for RetainedSessionLease {
         {
             entry.in_use = false;
             entry.last_used = Instant::now();
+            debug!(
+                session_id = %entry.session.session_id,
+                thread_id = %entry.session.thread_id,
+                window_id = %entry.session.window_id,
+                "retained_session_released"
+            );
         }
     }
+}
+
+fn refresh_entry_window(entry: &mut RegistryEntry) {
+    entry.window_generation += 1;
+    entry.session.refresh_window();
 }
 
 fn remove_entry(state: &mut RegistryState, entry_id: u64) {

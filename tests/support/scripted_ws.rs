@@ -13,6 +13,12 @@ type ServerSink = futures_util::stream::SplitSink<
     Message,
 >;
 
+#[derive(Clone, Copy)]
+enum StartupBehavior {
+    KeepAlive,
+    DisconnectAfterHandshake,
+}
+
 pub struct ScriptedWebSocketServer {
     url: String,
     writer: Arc<Mutex<Option<ServerSink>>>,
@@ -26,6 +32,14 @@ pub struct ScriptedWebSocketServer {
 #[allow(dead_code)]
 impl ScriptedWebSocketServer {
     pub async fn start() -> Self {
+        Self::start_with_behavior(StartupBehavior::KeepAlive).await
+    }
+
+    pub async fn start_disconnect_after_handshake() -> Self {
+        Self::start_with_behavior(StartupBehavior::DisconnectAfterHandshake).await
+    }
+
+    async fn start_with_behavior(startup_behavior: StartupBehavior) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -44,6 +58,14 @@ impl ScriptedWebSocketServer {
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept client");
             let websocket = accept_async(stream).await.expect("accept websocket");
+
+            if matches!(startup_behavior, StartupBehavior::DisconnectAfterHandshake) {
+                accept_is_connected.store(true, Ordering::SeqCst);
+                accept_connected.notify_waiters();
+                drop(websocket);
+                return;
+            }
+
             let (sink, mut stream) = websocket.split();
             *accept_writer.lock().await = Some(sink);
             accept_is_connected.store(true, Ordering::SeqCst);

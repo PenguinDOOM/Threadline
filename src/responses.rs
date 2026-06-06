@@ -63,10 +63,14 @@ struct DownstreamResponsesRequest {
 }
 
 struct ResponseStreamState {
+    services: ThreadlineServices,
     upstream: Arc<LiveUpstreamWebSocket>,
     lease: RetainedSessionLease,
     base_request: serde_json::Map<String, Value>,
     pending_internal_outputs: Vec<PendingInternalToolOutput>,
+    previous_response_id: Option<String>,
+    upstream_event_seen: bool,
+    reconnect_attempted: bool,
     done: bool,
 }
 
@@ -98,7 +102,7 @@ pub async fn responses_handler(
         .map_err(|_| ThreadlineError::InvalidResponsesRequest)?;
     let mut lease = acquire_lease(&state.registry, request.previous_response_id.as_deref()).await?;
     let auth = state.services.auth_provider().load()?;
-    let upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
+    let mut upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
 
     let mut upstream_request = request.payload;
     if let Some(previous_response_id) = &request.previous_response_id {
@@ -108,14 +112,34 @@ pub async fn responses_handler(
         );
     }
     inject_internal_tools(&mut upstream_request);
-    send_response_create(&upstream, &upstream_request).await?;
+    let mut reconnect_attempted = false;
+    if let Err(error) = send_response_create(&upstream, &upstream_request).await {
+        if let Some(reconnected) = attempt_pre_first_event_reconnect(
+            &state.services,
+            &mut lease,
+            &upstream_request,
+            request.previous_response_id.as_deref(),
+            false,
+            &mut reconnect_attempted,
+        )
+        .await?
+        {
+            upstream = reconnected;
+        } else {
+            return Err(error);
+        }
+    }
 
     let stream = stream::unfold(
         ResponseStreamState {
+            services: state.services.clone(),
             upstream,
             lease,
             base_request: upstream_request,
             pending_internal_outputs: Vec::new(),
+            previous_response_id: request.previous_response_id,
+            upstream_event_seen: false,
+            reconnect_attempted,
             done: false,
         },
         |mut state| async move {
@@ -127,26 +151,76 @@ pub async fn responses_handler(
                 let next = match state.upstream.recv_text().await {
                     Ok(Some(text)) => text,
                     Ok(None) => {
-                        state.lease.mark_upstream_recoverable().await;
-                        state.done = true;
-                        return Some((
-                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
-                                &ThreadlineError::UpstreamWebSocketClosed,
-                            )),
-                            state,
-                        ));
+                        match attempt_pre_first_event_reconnect(
+                            &state.services,
+                            &mut state.lease,
+                            &state.base_request,
+                            state.previous_response_id.as_deref(),
+                            state.upstream_event_seen,
+                            &mut state.reconnect_attempted,
+                        )
+                        .await
+                        {
+                            Ok(Some(reconnected)) => {
+                                state.upstream = reconnected;
+                                continue;
+                            }
+                            Ok(None) => {
+                                state.lease.mark_upstream_recoverable().await;
+                                state.done = true;
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
+                                        &ThreadlineError::UpstreamWebSocketClosed,
+                                    )),
+                                    state,
+                                ));
+                            }
+                            Err(error) => {
+                                state.done = true;
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(&error)),
+                                    state,
+                                ));
+                            }
+                        }
                     }
                     Err(_) => {
-                        state.lease.mark_upstream_recoverable().await;
-                        state.done = true;
-                        return Some((
-                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
-                                &ThreadlineError::UpstreamWebSocketClosed,
-                            )),
-                            state,
-                        ));
+                        match attempt_pre_first_event_reconnect(
+                            &state.services,
+                            &mut state.lease,
+                            &state.base_request,
+                            state.previous_response_id.as_deref(),
+                            state.upstream_event_seen,
+                            &mut state.reconnect_attempted,
+                        )
+                        .await
+                        {
+                            Ok(Some(reconnected)) => {
+                                state.upstream = reconnected;
+                                continue;
+                            }
+                            Ok(None) => {
+                                state.lease.mark_upstream_recoverable().await;
+                                state.done = true;
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
+                                        &ThreadlineError::UpstreamWebSocketClosed,
+                                    )),
+                                    state,
+                                ));
+                            }
+                            Err(error) => {
+                                state.done = true;
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(&error)),
+                                    state,
+                                ));
+                            }
+                        }
                     }
                 };
+
+                state.upstream_event_seen = true;
 
                 let parsed = match serde_json::from_str::<Value>(&next) {
                     Ok(parsed) => parsed,
@@ -197,6 +271,8 @@ pub async fn responses_handler(
                     .unwrap_or("message")
                     .to_string();
 
+                debug!(event_type, "upstream_event_received");
+
                 if event_contains_internal_tool_name(&parsed) {
                     continue;
                 }
@@ -244,6 +320,7 @@ pub async fn responses_handler(
                         }
 
                         state.done = true;
+                        debug!(response_id, "final_response_completed");
                         return Some((
                             Ok::<Bytes, std::convert::Infallible>(sse_data_chunk(
                                 &event_type,
@@ -263,6 +340,7 @@ pub async fn responses_handler(
                         ));
                     }
                     "error" => {
+                        debug!(event_type, "upstream_error_event");
                         state.lease.mark_upstream_terminal().await;
                         state.done = true;
                         return Some((
@@ -298,6 +376,59 @@ pub async fn responses_handler(
     Ok(response)
 }
 
+async fn attempt_pre_first_event_reconnect(
+    services: &ThreadlineServices,
+    lease: &mut RetainedSessionLease,
+    request_payload: &serde_json::Map<String, Value>,
+    previous_response_id: Option<&str>,
+    upstream_event_seen: bool,
+    reconnect_attempted: &mut bool,
+) -> Result<Option<Arc<LiveUpstreamWebSocket>>, ThreadlineError> {
+    let Some(previous_response_id) = previous_response_id else {
+        return Ok(None);
+    };
+
+    if upstream_event_seen || *reconnect_attempted {
+        return Ok(None);
+    }
+
+    *reconnect_attempted = true;
+    lease.mark_upstream_recoverable().await;
+    debug!(
+        previous_response_id,
+        session_id = %lease.session().session_id,
+        thread_id = %lease.session().thread_id,
+        window_id = %lease.session().window_id,
+        "reconnect_continuation_attempt"
+    );
+
+    let auth = services.auth_provider().load()?;
+    let upstream = match ensure_upstream(services, lease, auth).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            debug!(
+                previous_response_id,
+                session_id = %lease.session().session_id,
+                thread_id = %lease.session().thread_id,
+                "reconnect_continuation_failed"
+            );
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = send_response_create(&upstream, request_payload).await {
+        debug!(
+            previous_response_id,
+            session_id = %lease.session().session_id,
+            thread_id = %lease.session().thread_id,
+            "reconnect_continuation_failed"
+        );
+        return Err(error);
+    }
+
+    Ok(Some(upstream))
+}
+
 async fn acquire_lease(
     registry: &RetainedSessionRegistry,
     previous_response_id: Option<&str>,
@@ -328,7 +459,11 @@ async fn ensure_upstream(
         .connector()
         .connect(auth, Some(lease.session().clone()))
         .await?;
-    lease.update_turn_state(connected.turn_state.clone()).await;
+    let turn_state = connected
+        .turn_state
+        .clone()
+        .or_else(|| lease.session().turn_state.clone());
+    lease.update_turn_state(turn_state).await;
     lease
         .replace_upstream(Some(Arc::clone(&connected.websocket)))
         .await;

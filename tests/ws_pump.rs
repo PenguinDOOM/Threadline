@@ -128,3 +128,30 @@ async fn websocket_pump_records_error_metadata_when_connection_drops() {
     assert!(metadata.reason.is_none());
     assert!(metadata.error.is_some());
 }
+
+#[tokio::test]
+async fn websocket_pump_replies_to_server_ping_after_a_retained_idle_gap() {
+    let server = ScriptedWebSocketServer::start().await;
+    let pump = connect_pump(&server).await;
+
+    server.send_text("response-completed").await;
+    assert_eq!(
+        pump.recv_text().await.expect("recv completed event"),
+        Some("response-completed".to_string())
+    );
+
+    sleep(Duration::from_millis(100)).await;
+    server.send_ping(b"retained-idle-check").await;
+
+    let message = timeout(Duration::from_secs(1), server.recv_client_message())
+        .await
+        .expect("pong timeout")
+        .expect("client message");
+
+    match message {
+        Message::Pong(payload) => assert_eq!(payload.as_slice(), b"retained-idle-check"),
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    assert!(!pump.is_closed());
+}
