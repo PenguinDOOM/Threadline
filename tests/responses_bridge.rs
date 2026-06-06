@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, Response, StatusCode};
-use futures_util::future::BoxFuture;
+use futures_util::{future::BoxFuture, stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -210,6 +210,16 @@ fn assert_done_frame(frame: &str) {
         frame, "data: [DONE]",
         "expected a bare downstream DONE frame without an event line"
     );
+}
+
+async fn next_body_chunk(
+    body_stream: &mut (impl futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin),
+) -> Bytes {
+    body_stream
+        .next()
+        .await
+        .expect("expected body chunk before EOF")
+        .expect("body chunk")
 }
 
 #[tokio::test]
@@ -476,6 +486,41 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
 }
 
 #[tokio::test]
+async fn downstream_body_stream_exposes_route_chunk_boundaries() {
+    let app = axum::Router::new().route(
+        "/chunks",
+        axum::routing::get(|| async {
+            Body::from_stream(stream::iter([
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(b"first")),
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(b"second")),
+            ]))
+        }),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/chunks")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body_stream = response.into_body().into_data_stream();
+    let first = next_body_chunk(&mut body_stream).await;
+    let second = next_body_chunk(&mut body_stream).await;
+    let third = body_stream.next().await;
+
+    assert_eq!(first, Bytes::from_static(b"first"));
+    assert_eq!(second, Bytes::from_static(b"second"));
+    assert!(third.is_none(), "expected EOF after the second body chunk");
+}
+
+#[tokio::test]
 async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -517,6 +562,60 @@ async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse()
     );
 
     assert_done_frame(frames[1]);
+}
+
+#[tokio::test]
+async fn downstream_completed_and_done_are_separate_body_chunks_before_eof() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"ignored","input":"chunk-boundary"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("chunk-boundary request");
+    server
+        .send_text(
+            "{\n  \"type\": \"response.completed\",\n  \"response\": {\n    \"id\": \"response-1\"\n  }\n}",
+        )
+        .await;
+
+    let mut body_stream = response.into_body().into_data_stream();
+    let first = next_body_chunk(&mut body_stream).await;
+    let first_text = String::from_utf8(first.to_vec()).expect("utf8 first chunk");
+    assert!(
+        !first_text.contains("data: [DONE]"),
+        "expected the completed chunk to exclude the bare DONE sentinel"
+    );
+    let (event, data) = sse_event_and_data(first_text.trim_end());
+    let payload: Value = serde_json::from_str(data).expect("completed json");
+    assert_eq!(event, "response.completed");
+    assert_eq!(
+        payload,
+        json!({"type":"response.completed","response":{"id":"response-1"}}),
+        "expected the first chunk to contain only the compact response.completed SSE frame"
+    );
+
+    let second = match body_stream.next().await {
+        Some(Ok(chunk)) => chunk,
+        Some(Err(error)) => panic!("expected a bare DONE chunk, got body error: {error}"),
+        None => panic!(
+            "expected a separate bare DONE chunk after the completed chunk, but reached EOF after first chunk: {first_text:?}"
+        ),
+    };
+    let third = body_stream.next().await;
+
+    assert_eq!(
+        second,
+        Bytes::from_static(b"data: [DONE]\n\n"),
+        "expected the second chunk to be exactly the bare downstream DONE sentinel"
+    );
+    assert!(third.is_none(), "expected EOF after the bare DONE chunk");
 }
 
 #[tokio::test]
