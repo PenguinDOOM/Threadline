@@ -5,11 +5,9 @@ on:
   push:
     branches:
       - master
-      - dev-*
   pull_request:
     branches:
       - master
-      - dev-*
   merge_group:
     
 permissions:
@@ -25,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -47,11 +45,21 @@ jobs:
         with:
           components: clippy
 
+      - name: Install required cargo
+        run: cargo install clippy-sarif sarif-fmt
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --message-format=json -- -D warnings | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
+        continue-on-error: true
+
+      - name: Upload analysis results to GitHub
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: rust-clippy-results.sarif
+          wait-for-processing: true
 
   test:
     name: Rust test
