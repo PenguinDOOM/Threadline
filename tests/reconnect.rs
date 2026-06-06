@@ -304,10 +304,8 @@ async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstre
         .expect("first continuation request"),
     ))
     .expect("first continuation json");
-    assert_eq!(
-        first_attempt_payload["response"]["previous_response_id"],
-        "response-1"
-    );
+    assert!(first_attempt_payload.get("response").is_none());
+    assert_eq!(first_attempt_payload["previous_response_id"], "response-1");
     first_attempt_server
         .send_close(1000, "closed-before-event")
         .await;
@@ -332,10 +330,8 @@ async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstre
     };
     let reconnect_payload: Value =
         serde_json::from_str(&message_text(reconnect_message)).expect("reconnect json");
-    assert_eq!(
-        reconnect_payload["response"]["previous_response_id"],
-        "response-1"
-    );
+    assert!(reconnect_payload.get("response").is_none());
+    assert_eq!(reconnect_payload["previous_response_id"], "response-1");
     reconnect_server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
         .await;
@@ -596,10 +592,8 @@ async fn reconnect_fallback_attempts_only_once_after_pre_stream_send_failure() {
     .expect("reconnect request");
     let reconnect_payload: Value =
         serde_json::from_str(&message_text(reconnect_message)).expect("reconnect json");
-    assert_eq!(
-        reconnect_payload["response"]["previous_response_id"],
-        "response-1"
-    );
+    assert!(reconnect_payload.get("response").is_none());
+    assert_eq!(reconnect_payload["previous_response_id"], "response-1");
     reconnect_server
         .send_close(1000, "closed-before-event-again")
         .await;

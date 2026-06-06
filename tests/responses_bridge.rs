@@ -255,10 +255,8 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     ))
     .expect("second request json");
     assert_eq!(second_payload["type"], "response.create");
-    assert_eq!(
-        second_payload["response"]["previous_response_id"],
-        "response-1"
-    );
+    assert!(second_payload.get("response").is_none());
+    assert_eq!(second_payload["previous_response_id"], "response-1");
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 2);
@@ -674,10 +672,8 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
         server.recv_client_message().await.expect("second request"),
     ))
     .expect("second request json");
-    assert_eq!(
-        second_payload["response"]["previous_response_id"],
-        "response-parent"
-    );
+    assert!(second_payload.get("response").is_none());
+    assert_eq!(second_payload["previous_response_id"], "response-parent");
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-child"}}"#)
         .await;
@@ -698,10 +694,8 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
         server.recv_client_message().await.expect("third request"),
     ))
     .expect("third request json");
-    assert_eq!(
-        third_payload["response"]["previous_response_id"],
-        "response-parent"
-    );
+    assert!(third_payload.get("response").is_none());
+    assert_eq!(third_payload["previous_response_id"], "response-parent");
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-third"}}"#)
         .await;
@@ -722,10 +716,8 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
         server.recv_client_message().await.expect("fourth request"),
     ))
     .expect("fourth request json");
-    assert_eq!(
-        fourth_payload["response"]["previous_response_id"],
-        "response-child"
-    );
+    assert!(fourth_payload.get("response").is_none());
+    assert_eq!(fourth_payload["previous_response_id"], "response-child");
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-fourth"}}"#)
         .await;
@@ -749,6 +741,7 @@ async fn byok_request_fields_are_preserved_in_upstream_response_create() {
     let response = post_responses(
         app,
         json!({
+            "type":"wrong.type",
             "model":"ignored",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
             "tools":[{
@@ -773,7 +766,9 @@ async fn byok_request_fields_are_preserved_in_upstream_response_create() {
         server.recv_client_message().await.expect("request message"),
     ))
     .expect("request json");
-    let response_payload = &request_payload["response"];
+    assert_eq!(request_payload["type"], "response.create");
+    assert!(request_payload.get("response").is_none());
+    let response_payload = &request_payload;
     let tools = response_payload["tools"].as_array().expect("tools array");
 
     assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));

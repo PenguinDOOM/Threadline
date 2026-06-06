@@ -474,12 +474,13 @@ async fn send_response_create(
     upstream: &LiveUpstreamWebSocket,
     response_payload: &serde_json::Map<String, Value>,
 ) -> Result<(), ThreadlineError> {
-    let outbound = json!({
-        "type": "response.create",
-        "response": Value::Object(response_payload.clone()),
-    });
+    let mut outbound = response_payload.clone();
+    outbound.insert(
+        "type".to_string(),
+        Value::String("response.create".to_string()),
+    );
     upstream
-        .send_text(outbound.to_string())
+        .send_text(Value::Object(outbound).to_string())
         .await
         .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)
 }

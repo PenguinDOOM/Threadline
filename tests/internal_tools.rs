@@ -206,8 +206,9 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     ))
     .expect("initial request json");
     assert_eq!(first_request["type"], "response.create");
+    assert!(first_request.get("response").is_none());
 
-    let tools = first_request["response"]["tools"]
+    let tools = first_request["tools"]
         .as_array()
         .expect("tools array");
     assert_eq!(tools[0]["name"], "downstream_tool");
@@ -241,12 +242,10 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     ))
     .expect("followup request json");
     assert_eq!(followup_request["type"], "response.create");
-    assert_eq!(
-        followup_request["response"]["previous_response_id"],
-        "response-intermediate"
-    );
+    assert!(followup_request.get("response").is_none());
+    assert_eq!(followup_request["previous_response_id"], "response-intermediate");
 
-    let followup_input = followup_request["response"]["input"]
+    let followup_input = followup_request["input"]
         .as_array()
         .expect("followup input array");
     assert_eq!(followup_input.len(), 2);
@@ -345,6 +344,7 @@ async fn internal_tool_pre_done_events_are_hidden_from_downstream() {
     ))
     .expect("followup request json");
     assert_eq!(followup_request["type"], "response.create");
+    assert!(followup_request.get("response").is_none());
 
     server
         .send_text(r#"{"type":"response.output_text.delta","delta":"final answer"}"#)
