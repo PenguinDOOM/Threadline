@@ -489,6 +489,7 @@ async fn send_response_create(
     response_payload: &serde_json::Map<String, Value>,
 ) -> Result<(), ThreadlineError> {
     let mut outbound = response_payload.clone();
+    outbound.insert("store".to_string(), Value::Bool(false));
     match outbound.get("instructions") {
         Some(Value::Null) | None => {
             outbound.insert("instructions".to_string(), Value::String(String::new()));

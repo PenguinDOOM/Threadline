@@ -241,6 +241,7 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     ))
     .expect("followup request json");
     assert_eq!(followup_request["type"], "response.create");
+    assert_eq!(followup_request["store"], false);
     assert_eq!(followup_request["instructions"], "");
     assert!(followup_request.get("response").is_none());
     assert_eq!(
