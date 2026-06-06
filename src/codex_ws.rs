@@ -41,6 +41,7 @@ pub enum HandshakeBuildError {
 pub fn build_handshake_request(
     url: &str,
     auth: &LoadedUpstreamAuth,
+    codex_client_version: &str,
     session: Option<UpstreamSessionDescriptor>,
 ) -> Result<CodexHandshake, HandshakeBuildError> {
     let session = session.unwrap_or_else(|| UpstreamSessionDescriptor {
@@ -68,11 +69,11 @@ pub fn build_handshake_request(
     headers.insert(
         "user-agent",
         header_value(&format!(
-            "codex_vscode/0.1.0 Threadline/{}",
+            "codex_vscode/{codex_client_version} Threadline/{}",
             env!("CARGO_PKG_VERSION")
         ))?,
     );
-    headers.insert("version", header_value(env!("CARGO_PKG_VERSION"))?);
+    headers.insert("version", header_value(codex_client_version)?);
     headers.insert("session-id", header_value(&session.session_id)?);
     headers.insert("thread-id", header_value(&session.thread_id)?);
     headers.insert("x-codex-window-id", header_value(&session.window_id)?);
@@ -118,8 +119,13 @@ mod tests {
 
     #[test]
     fn handshake_generates_required_headers_and_identifiers() {
-        let handshake = build_handshake_request("ws://localhost:9001/codex", &test_auth(), None)
-            .expect("handshake should build");
+        let handshake = build_handshake_request(
+            "ws://localhost:9001/codex",
+            &test_auth(),
+            EXPECTED_CODEX_CLIENT_VERSION,
+            None,
+        )
+        .expect("handshake should build");
         let headers = handshake.request.headers();
 
         assert_eq!(
@@ -160,6 +166,7 @@ mod tests {
         let handshake = build_handshake_request(
             "wss://example.invalid/upstream",
             &test_auth(),
+            EXPECTED_CODEX_CLIENT_VERSION,
             Some(session.clone()),
         )
         .expect("handshake should build");
@@ -174,8 +181,13 @@ mod tests {
 
     #[test]
     fn handshake_rejects_invalid_upstream_url() {
-        let error = build_handshake_request("not a websocket url", &test_auth(), None)
-            .expect_err("invalid url should fail");
+        let error = build_handshake_request(
+            "not a websocket url",
+            &test_auth(),
+            EXPECTED_CODEX_CLIENT_VERSION,
+            None,
+        )
+        .expect_err("invalid url should fail");
 
         assert!(matches!(error, HandshakeBuildError::RequestBuildFailed));
     }

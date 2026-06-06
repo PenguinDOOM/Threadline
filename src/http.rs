@@ -49,12 +49,13 @@ struct ModelEntry {
 }
 
 pub fn build_router(config: ThreadlineConfig) -> Router {
+    let connector = DefaultUpstreamConnector {
+        codex_client_version: config.codex_client_version.clone(),
+    };
+
     build_router_with_services(
         config,
-        ThreadlineServices::new(
-            Arc::new(DefaultAuthProvider),
-            Arc::new(DefaultUpstreamConnector),
-        ),
+        ThreadlineServices::new(Arc::new(DefaultAuthProvider), Arc::new(connector)),
     )
 }
 
@@ -114,7 +115,9 @@ impl crate::responses::UpstreamAuthProvider for DefaultAuthProvider {
 }
 
 #[derive(Clone)]
-struct DefaultUpstreamConnector;
+struct DefaultUpstreamConnector {
+    codex_client_version: String,
+}
 
 fn upstream_connect_error_kind(error: &TungsteniteError) -> &'static str {
     match error {
@@ -161,11 +164,14 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
         auth: crate::auth::LoadedUpstreamAuth,
         session: Option<crate::codex_ws::UpstreamSessionDescriptor>,
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+        let codex_client_version = self.codex_client_version.clone();
+
         Box::pin(async move {
             let upstream_url = std::env::var("THREADLINE_UPSTREAM_URL")
                 .map_err(|_| ThreadlineError::UpstreamUrlMissing)?;
-            let handshake = build_handshake_request(&upstream_url, &auth, session)
-                .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
+            let handshake =
+                build_handshake_request(&upstream_url, &auth, &codex_client_version, session)
+                    .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
             let (stream, response) = connect_async(handshake.request)
                 .await
                 .map_err(map_upstream_connect_error)?;

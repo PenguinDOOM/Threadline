@@ -9,6 +9,7 @@ use crate::jobs::ThreadlineJobManagerConfig;
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8100;
 const DEFAULT_MODEL_ID: &str = "codex-mini-latest";
+const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.136.0";
 const DEFAULT_RETAINED_SESSION_CAPACITY: usize = 64;
 const DEFAULT_JOBS_ENABLED: bool = false;
 const DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES: usize = 32 * 1024;
@@ -29,6 +30,13 @@ pub struct ThreadlineConfig {
 
     #[arg(long, env = "THREADLINE_MODEL_ID", default_value = DEFAULT_MODEL_ID)]
     pub model_id: String,
+
+    #[arg(
+        long,
+        env = "THREADLINE_CODEX_CLIENT_VERSION",
+        default_value = DEFAULT_CODEX_CLIENT_VERSION
+    )]
+    pub codex_client_version: String,
 
     #[arg(
         long,
@@ -67,6 +75,7 @@ impl Default for ThreadlineConfig {
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
             model_id: DEFAULT_MODEL_ID.to_string(),
+            codex_client_version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
             retained_session_capacity: DEFAULT_RETAINED_SESSION_CAPACITY,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
             job_output_buffer_limit_bytes: DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,
@@ -168,10 +177,11 @@ fn set_active_job_manager_config(config: ThreadlineJobManagerConfig) {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::ThreadlineConfig;
+    use super::{DEFAULT_CODEX_CLIENT_VERSION, ThreadlineConfig};
 
     #[test]
     fn codex_client_version_defaults_to_installed_version() {
+        let config = ThreadlineConfig::default();
         let command = ThreadlineConfig::command();
         let argument = command
             .get_arguments()
@@ -183,12 +193,16 @@ mod tests {
             .map(|value| value.to_str().expect("utf-8 default value"))
             .collect();
 
-        assert_eq!(default_values, vec!["0.136.0"]);
+        assert_eq!(config.codex_client_version, DEFAULT_CODEX_CLIENT_VERSION);
+        assert_eq!(default_values, vec![DEFAULT_CODEX_CLIENT_VERSION]);
     }
 
     #[test]
     fn codex_client_version_cli_override_wins() {
-        ThreadlineConfig::try_parse_from(["threadline", "--codex-client-version", "9.9.9"])
-            .expect("threadline config should accept a codex client version cli override");
+        let config =
+            ThreadlineConfig::try_parse_from(["threadline", "--codex-client-version", "9.9.9"])
+                .expect("threadline config should accept a codex client version cli override");
+
+        assert_eq!(config.codex_client_version, "9.9.9");
     }
 }
