@@ -7,14 +7,15 @@ use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::Value;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 
-use crate::auth::{AuthDiscoveryOptions, load_upstream_auth};
+use crate::auth::{load_upstream_auth, AuthDiscoveryOptions};
 use crate::codex_ws::build_handshake_request;
 use crate::config::ThreadlineConfig;
 use crate::errors::ThreadlineError;
 use crate::registry::RetainedSessionRegistry;
 use crate::responses::{
-    ConnectedUpstream, ResponsesRouteState, ThreadlineServices, responses_handler,
+    responses_handler, ConnectedUpstream, ResponsesRouteState, ThreadlineServices,
 };
 use crate::ws_pump::LiveUpstreamWebSocket;
 
@@ -114,6 +115,15 @@ impl crate::responses::UpstreamAuthProvider for DefaultAuthProvider {
 #[derive(Clone)]
 struct DefaultUpstreamConnector;
 
+fn map_upstream_connect_error(error: TungsteniteError) -> ThreadlineError {
+    match error {
+        TungsteniteError::Http(response) => ThreadlineError::UpstreamWebSocketHandshakeRejected {
+            status: response.status(),
+        },
+        _ => ThreadlineError::UpstreamWebSocketConnectFailed,
+    }
+}
+
 impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
     fn connect(
         &self,
@@ -127,7 +137,7 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
                 .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
             let (stream, response) = connect_async(handshake.request)
                 .await
-                .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
+                .map_err(map_upstream_connect_error)?;
             let turn_state = response
                 .headers()
                 .get(crate::responses::TURN_STATE_HEADER)
@@ -145,8 +155,8 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
     use axum::http::Response;
+    use axum::http::StatusCode;
     use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 
     use super::*;

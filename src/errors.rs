@@ -1,6 +1,8 @@
-use axum::Json;
+use std::borrow::Cow;
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -11,10 +13,10 @@ pub struct PublicErrorDocument {
 
 #[derive(Debug, Serialize)]
 pub struct PublicErrorPayload {
-    pub code: &'static str,
-    pub message: &'static str,
+    pub code: Cow<'static, str>,
+    pub message: Cow<'static, str>,
     #[serde(rename = "type")]
-    pub error_type: &'static str,
+    pub error_type: Cow<'static, str>,
 }
 
 #[derive(Debug, Error)]
@@ -38,6 +40,9 @@ pub enum ThreadlineError {
 
     #[error("Threadline could not connect to the upstream Codex websocket.")]
     UpstreamWebSocketConnectFailed,
+
+    #[error("The upstream Codex websocket handshake was rejected with HTTP {status}.")]
+    UpstreamWebSocketHandshakeRejected { status: StatusCode },
 
     #[error(
         "The upstream Codex websocket closed before Threadline finished streaming the response."
@@ -99,6 +104,7 @@ impl ThreadlineError {
             Self::RetainedSessionConflict => StatusCode::CONFLICT,
             Self::RetainedSessionCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamWebSocketConnectFailed => StatusCode::BAD_GATEWAY,
+            Self::UpstreamWebSocketHandshakeRejected { status } => *status,
             Self::UpstreamWebSocketClosed => StatusCode::BAD_GATEWAY,
             Self::UpstreamResponseFailed => StatusCode::BAD_GATEWAY,
             Self::UpstreamErrorEvent => StatusCode::BAD_GATEWAY,
@@ -117,101 +123,108 @@ impl ThreadlineError {
 
     pub fn public_error(&self) -> PublicErrorPayload {
         match self {
-            Self::ResponsesNotReady => PublicErrorPayload {
-                code: "responses_not_ready",
-                message: "The /v1/responses bridge is not available yet.",
-                error_type: "not_implemented_error",
+            Self::ResponsesNotReady => borrowed_public_error(
+                "responses_not_ready",
+                "The /v1/responses bridge is not available yet.",
+                "not_implemented_error",
+            ),
+            Self::InvalidResponsesRequest => borrowed_public_error(
+                "invalid_request_error",
+                "The /v1/responses request body must be a JSON object.",
+                "invalid_request_error",
+            ),
+            Self::PreviousResponseNotFound => borrowed_public_error(
+                "previous_response_not_found",
+                "Threadline could not find the retained session for that previous_response_id.",
+                "invalid_request_error",
+            ),
+            Self::RetainedSessionConflict => borrowed_public_error(
+                "retained_session_conflict",
+                "The retained session for that previous_response_id is already active.",
+                "conflict_error",
+            ),
+            Self::RetainedSessionCapacityExceeded => borrowed_public_error(
+                "retained_session_capacity_exceeded",
+                "Threadline has no free retained session capacity for another active response.",
+                "service_unavailable_error",
+            ),
+            Self::UpstreamWebSocketConnectFailed => borrowed_public_error(
+                "upstream_websocket_connect_failed",
+                "Threadline could not connect to the upstream Codex websocket.",
+                "bad_gateway_error",
+            ),
+            Self::UpstreamWebSocketHandshakeRejected { status } => PublicErrorPayload {
+                code: Cow::Borrowed("upstream_websocket_handshake_rejected"),
+                message: Cow::Owned(format_upstream_websocket_handshake_rejected_message(
+                    *status,
+                )),
+                error_type: Cow::Borrowed("bad_gateway_error"),
             },
-            Self::InvalidResponsesRequest => PublicErrorPayload {
-                code: "invalid_request_error",
-                message: "The /v1/responses request body must be a JSON object.",
-                error_type: "invalid_request_error",
-            },
-            Self::PreviousResponseNotFound => PublicErrorPayload {
-                code: "previous_response_not_found",
-                message: "Threadline could not find the retained session for that previous_response_id.",
-                error_type: "invalid_request_error",
-            },
-            Self::RetainedSessionConflict => PublicErrorPayload {
-                code: "retained_session_conflict",
-                message: "The retained session for that previous_response_id is already active.",
-                error_type: "conflict_error",
-            },
-            Self::RetainedSessionCapacityExceeded => PublicErrorPayload {
-                code: "retained_session_capacity_exceeded",
-                message: "Threadline has no free retained session capacity for another active response.",
-                error_type: "service_unavailable_error",
-            },
-            Self::UpstreamWebSocketConnectFailed => PublicErrorPayload {
-                code: "upstream_websocket_connect_failed",
-                message: "Threadline could not connect to the upstream Codex websocket.",
-                error_type: "bad_gateway_error",
-            },
-            Self::UpstreamWebSocketClosed => PublicErrorPayload {
-                code: "upstream_websocket_closed",
-                message: "The upstream Codex websocket closed before Threadline finished streaming the response.",
-                error_type: "bad_gateway_error",
-            },
-            Self::UpstreamResponseFailed => PublicErrorPayload {
-                code: "upstream_response_failed",
-                message: "The upstream response.failed event cannot be streamed as a successful downstream response.",
-                error_type: "bad_gateway_error",
-            },
-            Self::UpstreamErrorEvent => PublicErrorPayload {
-                code: "upstream_error_event",
-                message: "The upstream websocket emitted an error event.",
-                error_type: "bad_gateway_error",
-            },
-            Self::UpstreamInvalidJson => PublicErrorPayload {
-                code: "upstream_invalid_json",
-                message: "The upstream websocket emitted malformed JSON.",
-                error_type: "bad_gateway_error",
-            },
-            Self::InternalToolFailed => PublicErrorPayload {
-                code: "internal_tool_failed",
-                message: "Threadline failed while executing an internal tool.",
-                error_type: "internal_server_error",
-            },
-            Self::JobNotFound => PublicErrorPayload {
-                code: "job_not_found",
-                message: "Threadline could not find a job with that job_id.",
-                error_type: "invalid_request_error",
-            },
-            Self::JobsDisabled => PublicErrorPayload {
-                code: "jobs_disabled",
-                message: "Threadline jobs are disabled.",
-                error_type: "forbidden_error",
-            },
-            Self::JobCommandNotAllowed => PublicErrorPayload {
-                code: "job_command_not_allowed",
-                message: "The requested job command is not allowed by Threadline policy.",
-                error_type: "forbidden_error",
-            },
-            Self::JobCommandFailed => PublicErrorPayload {
-                code: "job_command_failed",
-                message: "The Threadline job command failed.",
-                error_type: "internal_server_error",
-            },
-            Self::JobCancelled => PublicErrorPayload {
-                code: "job_cancelled",
-                message: "The Threadline job was cancelled.",
-                error_type: "conflict_error",
-            },
-            Self::UpstreamCredentialsUnavailable => PublicErrorPayload {
-                code: "upstream_credentials_unavailable",
-                message: "Threadline could not load upstream credentials.",
-                error_type: "configuration_error",
-            },
-            Self::UpstreamUrlMissing => PublicErrorPayload {
-                code: "configuration_error",
-                message: "Threadline is missing THREADLINE_UPSTREAM_URL for upstream websocket connections.",
-                error_type: "configuration_error",
-            },
-            Self::InvalidBindHost(_) => PublicErrorPayload {
-                code: "configuration_error",
-                message: "Threadline failed to resolve its configured bind address.",
-                error_type: "configuration_error",
-            },
+            Self::UpstreamWebSocketClosed => borrowed_public_error(
+                "upstream_websocket_closed",
+                "The upstream Codex websocket closed before Threadline finished streaming the response.",
+                "bad_gateway_error",
+            ),
+            Self::UpstreamResponseFailed => borrowed_public_error(
+                "upstream_response_failed",
+                "The upstream response.failed event cannot be streamed as a successful downstream response.",
+                "bad_gateway_error",
+            ),
+            Self::UpstreamErrorEvent => borrowed_public_error(
+                "upstream_error_event",
+                "The upstream websocket emitted an error event.",
+                "bad_gateway_error",
+            ),
+            Self::UpstreamInvalidJson => borrowed_public_error(
+                "upstream_invalid_json",
+                "The upstream websocket emitted malformed JSON.",
+                "bad_gateway_error",
+            ),
+            Self::InternalToolFailed => borrowed_public_error(
+                "internal_tool_failed",
+                "Threadline failed while executing an internal tool.",
+                "internal_server_error",
+            ),
+            Self::JobNotFound => borrowed_public_error(
+                "job_not_found",
+                "Threadline could not find a job with that job_id.",
+                "invalid_request_error",
+            ),
+            Self::JobsDisabled => borrowed_public_error(
+                "jobs_disabled",
+                "Threadline jobs are disabled.",
+                "forbidden_error",
+            ),
+            Self::JobCommandNotAllowed => borrowed_public_error(
+                "job_command_not_allowed",
+                "The requested job command is not allowed by Threadline policy.",
+                "forbidden_error",
+            ),
+            Self::JobCommandFailed => borrowed_public_error(
+                "job_command_failed",
+                "The Threadline job command failed.",
+                "internal_server_error",
+            ),
+            Self::JobCancelled => borrowed_public_error(
+                "job_cancelled",
+                "The Threadline job was cancelled.",
+                "conflict_error",
+            ),
+            Self::UpstreamCredentialsUnavailable => borrowed_public_error(
+                "upstream_credentials_unavailable",
+                "Threadline could not load upstream credentials.",
+                "configuration_error",
+            ),
+            Self::UpstreamUrlMissing => borrowed_public_error(
+                "configuration_error",
+                "Threadline is missing THREADLINE_UPSTREAM_URL for upstream websocket connections.",
+                "configuration_error",
+            ),
+            Self::InvalidBindHost(_) => borrowed_public_error(
+                "configuration_error",
+                "Threadline failed to resolve its configured bind address.",
+                "configuration_error",
+            ),
         }
     }
 
@@ -219,6 +232,32 @@ impl ThreadlineError {
         PublicErrorDocument {
             error: self.public_error(),
         }
+    }
+}
+
+fn borrowed_public_error(
+    code: &'static str,
+    message: &'static str,
+    error_type: &'static str,
+) -> PublicErrorPayload {
+    PublicErrorPayload {
+        code: Cow::Borrowed(code),
+        message: Cow::Borrowed(message),
+        error_type: Cow::Borrowed(error_type),
+    }
+}
+
+fn format_upstream_websocket_handshake_rejected_message(status: StatusCode) -> String {
+    match status.canonical_reason() {
+        Some(reason) => format!(
+            "The upstream Codex websocket handshake was rejected with HTTP {} {}.",
+            status.as_u16(),
+            reason
+        ),
+        None => format!(
+            "The upstream Codex websocket handshake was rejected with HTTP {}.",
+            status.as_u16()
+        ),
     }
 }
 
@@ -245,11 +284,15 @@ mod tests {
 
         let document = error.public_error_document();
 
-        assert_eq!(document.error.code, "upstream_websocket_handshake_rejected");
         assert_eq!(
-            document.error.message,
+            document.error.code.as_ref(),
+            "upstream_websocket_handshake_rejected"
+        );
+        assert_eq!(
+            document.error.message.as_ref(),
             "The upstream Codex websocket handshake was rejected with HTTP 403 Forbidden."
         );
+        assert_eq!(document.error.error_type.as_ref(), "bad_gateway_error");
     }
 
     #[test]
@@ -259,5 +302,9 @@ mod tests {
         };
 
         assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.public_error_document().error.message.as_ref(),
+            "The upstream Codex websocket handshake was rejected with HTTP 503 Service Unavailable."
+        );
     }
 }
