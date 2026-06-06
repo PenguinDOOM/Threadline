@@ -10,13 +10,13 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tracing::warn;
 
-use crate::auth::{load_upstream_auth, AuthDiscoveryOptions};
+use crate::auth::{AuthDiscoveryOptions, load_upstream_auth};
 use crate::codex_ws::build_handshake_request;
 use crate::config::ThreadlineConfig;
 use crate::errors::ThreadlineError;
 use crate::registry::RetainedSessionRegistry;
 use crate::responses::{
-    responses_handler, ConnectedUpstream, ResponsesRouteState, ThreadlineServices,
+    ConnectedUpstream, ResponsesRouteState, ThreadlineServices, responses_handler,
 };
 use crate::ws_pump::LiveUpstreamWebSocket;
 
@@ -147,6 +147,7 @@ fn map_upstream_connect_error(error: TungsteniteError) -> ThreadlineError {
         other => {
             warn!(
                 error_kind = upstream_connect_error_kind(&other),
+                error = %other,
                 "upstream_websocket_connect_failed"
             );
             ThreadlineError::UpstreamWebSocketConnectFailed
