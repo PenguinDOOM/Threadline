@@ -660,8 +660,7 @@ async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_do
     assert_eq!(event, "response.completed");
     assert_eq!(payload["response"]["id"], "response-1");
     assert_eq!(
-        payload["response"]["output"][0]["name"],
-        "threadline_echo",
+        payload["response"]["output"][0]["name"], "threadline_echo",
         "expected payload normalization to stay unchanged for response.completed"
     );
     assert_done_frame(frames[1]);
