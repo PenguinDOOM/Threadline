@@ -1,5 +1,12 @@
 use std::process::ExitCode;
+use std::{io, io::Read};
 
+use clap::Parser;
+use threadline::auth::{
+    AuthCommandError, ThreadlineLoginInput, logout_threadline_credentials,
+    store_threadline_credentials, threadline_login_status,
+};
+use threadline::cli::{LoginStoreCommand, ThreadlineCli, ThreadlineCliAction};
 use threadline::config::ThreadlineConfig;
 use threadline::errors::ThreadlineError;
 use threadline::http::build_router;
@@ -17,8 +24,35 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), ThreadlineError> {
-    let config = ThreadlineConfig::from_env();
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = ThreadlineCli::parse();
+
+    match cli.into_action() {
+        ThreadlineCliAction::StartServer(config) => run_server(config).await.map_err(Into::into),
+        ThreadlineCliAction::LoginStore(command) => {
+            let input = read_login_input(command, &mut io::stdin())?;
+            let _status = store_threadline_credentials(&input)?;
+            println!("Stored Threadline credentials in the OS credential manager.");
+            Ok(())
+        }
+        ThreadlineCliAction::LoginStatus => {
+            let status = threadline_login_status()?;
+            println!("{}", status.render());
+            Ok(())
+        }
+        ThreadlineCliAction::LoginLogout => {
+            let removed = logout_threadline_credentials()?;
+            if removed {
+                println!("Removed Threadline credentials from the OS credential manager.");
+            } else {
+                println!("Threadline credentials were not present.");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_server(config: ThreadlineConfig) -> Result<(), ThreadlineError> {
     init_tracing(&config);
 
     let bind_address = config
@@ -46,4 +80,58 @@ fn init_tracing(config: &ThreadlineConfig) {
         .with_target(false)
         .compact()
         .init();
+}
+
+fn read_login_input(
+    command: LoginStoreCommand,
+    reader: &mut impl Read,
+) -> Result<ThreadlineLoginInput, Box<dyn std::error::Error>> {
+    let bearer_token = read_login_token_from_reader(reader)?;
+
+    Ok(ThreadlineLoginInput {
+        bearer_token,
+        refresh_token: command.refresh_token,
+    })
+}
+
+fn read_login_token_from_reader(reader: &mut impl Read) -> Result<String, AuthCommandError> {
+    let mut buffer = String::new();
+    reader
+        .read_to_string(&mut buffer)
+        .map_err(|_| AuthCommandError::MissingToken)?;
+
+    let token = buffer.trim();
+    if token.is_empty() {
+        return Err(AuthCommandError::MissingToken);
+    }
+
+    Ok(token.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use threadline::auth::AuthCommandError;
+
+    use super::read_login_token_from_reader;
+
+    #[test]
+    fn login_store_reads_token_from_stdin_and_trims_outer_whitespace() {
+        let mut reader = Cursor::new(b"  stdin-token\n");
+
+        let token = read_login_token_from_reader(&mut reader).expect("stdin token should load");
+
+        assert_eq!(token, "stdin-token");
+    }
+
+    #[test]
+    fn login_store_rejects_empty_stdin_token() {
+        let mut reader = Cursor::new(b"   \n");
+
+        let error = read_login_token_from_reader(&mut reader)
+            .expect_err("empty stdin token should be rejected");
+
+        assert_eq!(error, AuthCommandError::MissingToken);
+    }
 }

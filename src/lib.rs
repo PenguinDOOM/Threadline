@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod cli;
 pub mod codex_ws;
 pub mod config;
 pub mod errors;

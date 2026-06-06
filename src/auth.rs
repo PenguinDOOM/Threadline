@@ -123,6 +123,8 @@ trait CredentialStore {
         account: &str,
         secret: &str,
     ) -> Result<(), CredentialStoreError>;
+
+    fn delete_secret(&self, service: &str, account: &str) -> Result<bool, CredentialStoreError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -169,6 +171,162 @@ impl CredentialStore for OsKeyringCredentialStore {
             )
         })
     }
+
+    fn delete_secret(&self, service: &str, account: &str) -> Result<bool, CredentialStoreError> {
+        let entry = keyring::Entry::new(service, account).map_err(|error| {
+            CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                format!("failed to open OS credential entry: {error}"),
+            )
+        })?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(true),
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(error) => Err(CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                format!("failed to delete OS credential entry: {error}"),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ThreadlineLoginInput {
+    pub bearer_token: String,
+    pub refresh_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadlineCredentialSource {
+    Keyring,
+}
+
+impl ThreadlineCredentialSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyring => "threadline-keyring",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadlineCredentialStatus {
+    pub available: bool,
+    pub source: Option<ThreadlineCredentialSource>,
+    pub refresh_boundary: RefreshBoundary,
+}
+
+impl ThreadlineCredentialStatus {
+    pub fn render(&self) -> String {
+        if !self.available {
+            return "Threadline credentials: unavailable".to_string();
+        }
+
+        let source = self
+            .source
+            .map(ThreadlineCredentialSource::label)
+            .unwrap_or("unknown");
+        let refresh = match self.refresh_boundary {
+            RefreshBoundary::NotAvailable => "not-available",
+            RefreshBoundary::RefreshTokenPresent => "present",
+        };
+
+        format!("Threadline credentials: available (source: {source}, refresh: {refresh})")
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AuthCommandError {
+    #[error("Threadline credentials could not be stored in the OS credential manager.")]
+    CredentialStoreUnavailable,
+
+    #[error("Threadline credentials did not contain a usable token.")]
+    MissingToken,
+}
+
+impl fmt::Debug for ThreadlineLoginInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadlineLoginInput")
+            .field("bearer_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+pub fn store_threadline_credentials(
+    input: &ThreadlineLoginInput,
+) -> Result<ThreadlineCredentialStatus, AuthCommandError> {
+    store_threadline_credentials_with_store(input, &OsKeyringCredentialStore)
+}
+
+pub fn threadline_login_status() -> Result<ThreadlineCredentialStatus, AuthCommandError> {
+    threadline_login_status_with_store(&OsKeyringCredentialStore)
+}
+
+pub fn logout_threadline_credentials() -> Result<bool, AuthCommandError> {
+    logout_threadline_credentials_with_store(&OsKeyringCredentialStore)
+}
+
+fn store_threadline_credentials_with_store(
+    input: &ThreadlineLoginInput,
+    store: &impl CredentialStore,
+) -> Result<ThreadlineCredentialStatus, AuthCommandError> {
+    let Some(token) = non_empty(Some(input.bearer_token.as_str())) else {
+        return Err(AuthCommandError::MissingToken);
+    };
+
+    let payload = ThreadlineKeyringPayload {
+        bearer_token: token.to_string(),
+        refresh_token: input
+            .refresh_token
+            .as_deref()
+            .and_then(|refresh_token| non_empty(Some(refresh_token)))
+            .map(str::to_string),
+        metadata: std::collections::BTreeMap::new(),
+    };
+
+    write_threadline_keyring_payload(store, &payload)
+        .map_err(|_| AuthCommandError::CredentialStoreUnavailable)?;
+    threadline_login_status_with_store(store)
+}
+
+fn threadline_login_status_with_store(
+    store: &impl CredentialStore,
+) -> Result<ThreadlineCredentialStatus, AuthCommandError> {
+    let payload = read_threadline_keyring_payload(store)
+        .map_err(|_| AuthCommandError::CredentialStoreUnavailable)?;
+    let Some(payload) = payload else {
+        return Ok(ThreadlineCredentialStatus {
+            available: false,
+            source: None,
+            refresh_boundary: RefreshBoundary::NotAvailable,
+        });
+    };
+
+    let Some(_) = non_empty(Some(payload.bearer_token.as_str())) else {
+        return Err(AuthCommandError::MissingToken);
+    };
+
+    Ok(ThreadlineCredentialStatus {
+        available: true,
+        source: Some(ThreadlineCredentialSource::Keyring),
+        refresh_boundary: if non_empty(payload.refresh_token.as_deref()).is_some() {
+            RefreshBoundary::RefreshTokenPresent
+        } else {
+            RefreshBoundary::NotAvailable
+        },
+    })
+}
+
+fn logout_threadline_credentials_with_store(
+    store: &impl CredentialStore,
+) -> Result<bool, AuthCommandError> {
+    store
+        .delete_secret(THREADLINE_KEYRING_SERVICE, THREADLINE_KEYRING_ACCOUNT)
+        .map_err(|_| AuthCommandError::CredentialStoreUnavailable)
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -548,6 +706,14 @@ impl CredentialStore for FakeCredentialStore {
         ));
         Ok(())
     }
+
+    fn delete_secret(&self, service: &str, account: &str) -> Result<bool, CredentialStoreError> {
+        let mut state = self.state.lock().expect("fake credential store poisoned");
+        Ok(state
+            .secrets
+            .remove(&(service.to_string(), account.to_string()))
+            .is_some())
+    }
 }
 
 #[cfg(test)]
@@ -560,10 +726,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AuthDiscoveryOptions, AuthLoadError, AuthSource, CredentialStoreError,
-        CredentialStoreErrorKind, FakeCredentialStore, RefreshBoundary, ThreadlineKeyringPayload,
-        codex_keyring_service_and_account, load_codex_keyring_auth, load_upstream_auth,
-        load_upstream_auth_with_store, read_threadline_keyring_payload,
+        AuthCommandError, AuthDiscoveryOptions, AuthLoadError, AuthSource, CredentialStoreError,
+        CredentialStoreErrorKind, FakeCredentialStore, RefreshBoundary, ThreadlineCredentialSource,
+        ThreadlineKeyringPayload, ThreadlineLoginInput, codex_keyring_service_and_account,
+        load_codex_keyring_auth, load_upstream_auth, load_upstream_auth_with_store,
+        logout_threadline_credentials_with_store, read_threadline_keyring_payload,
+        store_threadline_credentials_with_store, threadline_login_status_with_store,
         write_threadline_keyring_payload,
     };
 
@@ -603,6 +771,120 @@ mod tests {
             }),
         };
         store.seed_secret(&service, &account, &payload.to_string());
+    }
+
+    #[test]
+    fn login_command_defaults_to_keyring_store() {
+        let store = FakeCredentialStore::default();
+
+        let status = store_threadline_credentials_with_store(
+            &ThreadlineLoginInput {
+                bearer_token: "threadline-access-token".to_string(),
+                refresh_token: Some("threadline-refresh-token".to_string()),
+            },
+            &store,
+        )
+        .expect("threadline login should store credentials in keyring by default");
+
+        assert!(status.available);
+        assert_eq!(status.source, Some(ThreadlineCredentialSource::Keyring));
+        assert_eq!(
+            status.refresh_boundary,
+            RefreshBoundary::RefreshTokenPresent
+        );
+        assert!(
+            store.read_raw("Threadline Auth", "default").is_some(),
+            "threadline keyring entry should be written"
+        );
+    }
+
+    #[test]
+    fn login_status_reports_source_without_token_values() {
+        let store = FakeCredentialStore::default();
+        store_threadline_credentials_with_store(
+            &ThreadlineLoginInput {
+                bearer_token: "threadline-access-token".to_string(),
+                refresh_token: Some("threadline-refresh-token".to_string()),
+            },
+            &store,
+        )
+        .expect("threadline login should store credentials");
+
+        let status = threadline_login_status_with_store(&store)
+            .expect("threadline status should read keyring");
+        let rendered = status.render();
+
+        assert_eq!(status.source, Some(ThreadlineCredentialSource::Keyring));
+        assert_eq!(
+            status.refresh_boundary,
+            RefreshBoundary::RefreshTokenPresent
+        );
+        assert!(rendered.contains("threadline-keyring"));
+        assert!(rendered.contains("present"));
+        assert!(!rendered.contains("threadline-access-token"));
+        assert!(!rendered.contains("threadline-refresh-token"));
+        assert!(!rendered.contains("default"));
+    }
+
+    #[test]
+    fn logout_removes_only_threadline_owned_credentials() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FakeCredentialStore::default();
+        let codex_home = temp.path().join("codex-home");
+
+        store_threadline_credentials_with_store(
+            &ThreadlineLoginInput {
+                bearer_token: "threadline-access-token".to_string(),
+                refresh_token: None,
+            },
+            &store,
+        )
+        .expect("threadline login should store credentials");
+        seed_codex_keyring_payload(
+            &store,
+            &codex_home,
+            "codex-access-token",
+            Some("codex-refresh-token"),
+        );
+
+        let removed = logout_threadline_credentials_with_store(&store)
+            .expect("threadline logout should remove only threadline credentials");
+        let (codex_service, codex_account) =
+            codex_keyring_service_and_account(&codex_home).expect("codex key should compute");
+
+        assert!(removed);
+        assert!(store.read_raw("Threadline Auth", "default").is_none());
+        assert!(store.read_raw(&codex_service, &codex_account).is_some());
+    }
+
+    #[test]
+    fn login_store_rejects_empty_tokens() {
+        let store = FakeCredentialStore::default();
+
+        let error = store_threadline_credentials_with_store(
+            &ThreadlineLoginInput {
+                bearer_token: "   ".to_string(),
+                refresh_token: None,
+            },
+            &store,
+        )
+        .expect_err("empty token should be rejected");
+
+        assert_eq!(error, AuthCommandError::MissingToken);
+    }
+
+    #[test]
+    fn login_input_debug_redacts_secret_values() {
+        let input = ThreadlineLoginInput {
+            bearer_token: "threadline-access-token".to_string(),
+            refresh_token: Some("threadline-refresh-token".to_string()),
+        };
+
+        let debug = format!("{input:?}");
+
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("threadline-access-token"));
+        assert!(!debug.contains("threadline-refresh-token"));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Args, Parser};
 
 use crate::jobs::ThreadlineJobManagerConfig;
 
@@ -19,8 +19,7 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 static ACTIVE_JOB_MANAGER_CONFIG: LazyLock<Mutex<ThreadlineJobManagerConfig>> =
     LazyLock::new(|| Mutex::new(ThreadlineJobManagerConfig::default()));
 
-#[derive(Debug, Clone, Parser)]
-#[command(name = "threadline", about = "Threadline BYOK bridge")]
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct ThreadlineConfig {
     #[arg(long, env = "THREADLINE_HOST", default_value = DEFAULT_HOST)]
     pub host: String,
@@ -90,7 +89,7 @@ impl Default for ThreadlineConfig {
 
 impl ThreadlineConfig {
     pub fn from_env() -> Self {
-        let config = Self::parse();
+        let config = crate::cli::ThreadlineCli::parse().server;
         set_active_job_manager_config(config.job_manager_config());
         config
     }
@@ -177,12 +176,14 @@ fn set_active_job_manager_config(config: ThreadlineJobManagerConfig) {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{DEFAULT_CODEX_CLIENT_VERSION, ThreadlineConfig};
+    use crate::cli::ThreadlineCli;
+
+    use super::DEFAULT_CODEX_CLIENT_VERSION;
 
     #[test]
     fn codex_client_version_defaults_to_installed_version() {
-        let config = ThreadlineConfig::default();
-        let command = ThreadlineConfig::command();
+        let config = ThreadlineCli::parse_from(["threadline"]).server;
+        let command = ThreadlineCli::command();
         let argument = command
             .get_arguments()
             .find(|arg| arg.get_long() == Some("codex-client-version"))
@@ -200,8 +201,9 @@ mod tests {
     #[test]
     fn codex_client_version_cli_override_wins() {
         let config =
-            ThreadlineConfig::try_parse_from(["threadline", "--codex-client-version", "9.9.9"])
-                .expect("threadline config should accept a codex client version cli override");
+            ThreadlineCli::try_parse_from(["threadline", "--codex-client-version", "9.9.9"])
+                .expect("threadline config should accept a codex client version cli override")
+                .server;
 
         assert_eq!(config.codex_client_version, "9.9.9");
     }
