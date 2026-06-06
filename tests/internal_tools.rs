@@ -181,6 +181,10 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
         json!({
             "model": "ignored",
             "input": "run internal tool loop",
+            "max_output_tokens": 512,
+            "max_tokens": 256,
+            "max_completion_tokens": 128,
+            "truncation": "auto",
             "tools": [
                 {
                     "type": "function",
@@ -208,6 +212,10 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     assert_eq!(first_request["type"], "response.create");
     assert_eq!(first_request["instructions"], "");
     assert!(first_request.get("response").is_none());
+    assert!(first_request.get("max_output_tokens").is_none());
+    assert!(first_request.get("max_tokens").is_none());
+    assert!(first_request.get("max_completion_tokens").is_none());
+    assert!(first_request.get("truncation").is_none());
 
     let tools = first_request["tools"].as_array().expect("tools array");
     assert_eq!(tools[0]["name"], "downstream_tool");
@@ -244,6 +252,10 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     assert_eq!(followup_request["store"], false);
     assert_eq!(followup_request["instructions"], "");
     assert!(followup_request.get("response").is_none());
+    assert!(followup_request.get("max_output_tokens").is_none());
+    assert!(followup_request.get("max_tokens").is_none());
+    assert!(followup_request.get("max_completion_tokens").is_none());
+    assert!(followup_request.get("truncation").is_none());
     assert_eq!(
         followup_request["previous_response_id"],
         "response-intermediate"
