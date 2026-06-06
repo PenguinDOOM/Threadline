@@ -320,8 +320,9 @@ pub async fn responses_handler(
 
                         state.done = true;
                         debug!(response_id, "final_response_completed");
+                        debug!(response_id, "downstream_response_completed_and_done_sent");
                         return Some((
-                            Ok::<Bytes, std::convert::Infallible>(sse_json_chunk(
+                            Ok::<Bytes, std::convert::Infallible>(sse_json_done_chunk(
                                 &event_type,
                                 &parsed,
                             )),
@@ -559,6 +560,11 @@ fn sse_payload_chunk(event: &str, payload: &str) -> Bytes {
 fn sse_json_chunk(event: &str, payload: &Value) -> Bytes {
     let payload = serde_json::to_string(payload).expect("serialize downstream sse payload");
     sse_payload_chunk(event, &payload)
+}
+
+fn sse_json_done_chunk(event: &str, payload: &Value) -> Bytes {
+    let payload = serde_json::to_string(payload).expect("serialize downstream sse payload");
+    Bytes::from(format!("event: {event}\ndata: {payload}\n\ndata: [DONE]\n\n"))
 }
 
 fn safe_scalar_field(value: &Value) -> Option<String> {
