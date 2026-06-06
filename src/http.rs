@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+use tracing::warn;
 
 use crate::auth::{load_upstream_auth, AuthDiscoveryOptions};
 use crate::codex_ws::build_handshake_request;
@@ -115,12 +116,41 @@ impl crate::responses::UpstreamAuthProvider for DefaultAuthProvider {
 #[derive(Clone)]
 struct DefaultUpstreamConnector;
 
+fn upstream_connect_error_kind(error: &TungsteniteError) -> &'static str {
+    match error {
+        TungsteniteError::ConnectionClosed => "connection_closed",
+        TungsteniteError::AlreadyClosed => "already_closed",
+        TungsteniteError::Io(_) => "io",
+        TungsteniteError::Tls(_) => "tls",
+        TungsteniteError::Capacity(_) => "capacity",
+        TungsteniteError::Protocol(_) => "protocol",
+        TungsteniteError::WriteBufferFull(_) => "write_buffer_full",
+        TungsteniteError::Utf8 => "utf8",
+        TungsteniteError::AttackAttempt => "attack_attempt",
+        TungsteniteError::Url(_) => "url",
+        TungsteniteError::HttpFormat(_) => "http_format",
+        _ => unreachable!("http errors are handled before upstream_connect_error_kind"),
+    }
+}
+
 fn map_upstream_connect_error(error: TungsteniteError) -> ThreadlineError {
     match error {
-        TungsteniteError::Http(response) => ThreadlineError::UpstreamWebSocketHandshakeRejected {
-            status: response.status(),
-        },
-        _ => ThreadlineError::UpstreamWebSocketConnectFailed,
+        TungsteniteError::Http(response) => {
+            let status = response.status();
+            warn!(
+                upstream_status = status.as_u16(),
+                upstream_status_reason = status.canonical_reason().unwrap_or("unknown"),
+                "upstream_websocket_handshake_rejected"
+            );
+            ThreadlineError::UpstreamWebSocketHandshakeRejected { status }
+        }
+        other => {
+            warn!(
+                error_kind = upstream_connect_error_kind(&other),
+                "upstream_websocket_connect_failed"
+            );
+            ThreadlineError::UpstreamWebSocketConnectFailed
+        }
     }
 }
 
@@ -190,5 +220,20 @@ mod tests {
             ThreadlineError::UpstreamWebSocketConnectFailed
         ));
         assert_eq!(mapped.status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn upstream_connect_error_kind_uses_coarse_io_bucket() {
+        let error = TungsteniteError::Io(std::io::Error::other("dial failed"));
+
+        assert_eq!(upstream_connect_error_kind(&error), "io");
+    }
+
+    #[test]
+    fn upstream_connect_error_kind_distinguishes_closed_connections() {
+        assert_eq!(
+            upstream_connect_error_kind(&TungsteniteError::ConnectionClosed),
+            "connection_closed"
+        );
     }
 }
