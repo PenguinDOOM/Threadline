@@ -70,6 +70,7 @@ struct ResponseStreamState {
     previous_response_id: Option<String>,
     upstream_event_seen: bool,
     reconnect_attempted: bool,
+    final_done_pending: bool,
     done: bool,
 }
 
@@ -139,11 +140,23 @@ pub async fn responses_handler(
             previous_response_id: request.previous_response_id,
             upstream_event_seen: false,
             reconnect_attempted,
+            final_done_pending: false,
             done: false,
         },
         |mut state| async move {
             loop {
+                if state.final_done_pending {
+                    state.final_done_pending = false;
+                    state.done = true;
+                    debug!("downstream_sse_done_sent");
+                    return Some((
+                        Ok::<Bytes, std::convert::Infallible>(sse_done_chunk()),
+                        state,
+                    ));
+                }
+
                 if state.done {
+                    debug!("downstream_sse_stream_finished");
                     return None;
                 }
 
@@ -318,11 +331,10 @@ pub async fn responses_handler(
                             continue;
                         }
 
-                        state.done = true;
                         debug!(response_id, "final_response_completed");
-                        debug!(response_id, "downstream_response_completed_and_done_sent");
+                        state.final_done_pending = true;
                         return Some((
-                            Ok::<Bytes, std::convert::Infallible>(sse_json_done_chunk(
+                            Ok::<Bytes, std::convert::Infallible>(sse_json_chunk(
                                 &event_type,
                                 &parsed,
                             )),
@@ -562,9 +574,8 @@ fn sse_json_chunk(event: &str, payload: &Value) -> Bytes {
     sse_payload_chunk(event, &payload)
 }
 
-fn sse_json_done_chunk(event: &str, payload: &Value) -> Bytes {
-    let payload = serde_json::to_string(payload).expect("serialize downstream sse payload");
-    Bytes::from(format!("event: {event}\ndata: {payload}\n\ndata: [DONE]\n\n"))
+fn sse_done_chunk() -> Bytes {
+    Bytes::from_static(b"data: [DONE]\n\n")
 }
 
 fn safe_scalar_field(value: &Value) -> Option<String> {

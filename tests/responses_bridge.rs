@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, Response, StatusCode};
-use futures_util::{future::BoxFuture, stream, StreamExt};
+use futures_util::{StreamExt, future::BoxFuture, stream};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
