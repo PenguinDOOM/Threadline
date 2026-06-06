@@ -7,7 +7,7 @@ use clap::Parser;
 use crate::jobs::ThreadlineJobManagerConfig;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: u16 = 8787;
+const DEFAULT_PORT: u16 = 8100;
 const DEFAULT_MODEL_ID: &str = "codex-mini-latest";
 const DEFAULT_RETAINED_SESSION_CAPACITY: usize = 64;
 const DEFAULT_JOBS_ENABLED: bool = false;
