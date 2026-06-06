@@ -1,10 +1,15 @@
 use std::env;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+const CODEX_KEYRING_SERVICE: &str = "Codex Auth";
+const THREADLINE_KEYRING_SERVICE: &str = "Threadline Auth";
+const THREADLINE_KEYRING_ACCOUNT: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthDiscoveryOptions {
@@ -28,6 +33,8 @@ impl AuthDiscoveryOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthSource {
     ExplicitOverride,
+    ThreadlineKeyring,
+    CodexKeyring,
     ChatgptLocalAuth,
     CodexHomeAuth,
 }
@@ -52,6 +59,115 @@ impl fmt::Debug for LoadedUpstreamAuth {
             .field("source", &self.source)
             .field("refresh_boundary", &self.refresh_boundary)
             .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ThreadlineKeyringPayload {
+    bearer_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    metadata: std::collections::BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ThreadlineKeyringPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadlineKeyringPayload")
+            .field("bearer_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialStoreErrorKind {
+    ServiceUnavailable,
+    MalformedPayload,
+    SerializationFailed,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("{message}")]
+struct CredentialStoreError {
+    kind: CredentialStoreErrorKind,
+    message: String,
+}
+
+impl CredentialStoreError {
+    fn new(kind: CredentialStoreErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    fn kind(&self) -> CredentialStoreErrorKind {
+        self.kind
+    }
+}
+
+trait CredentialStore {
+    fn get_secret(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<String>, CredentialStoreError>;
+    fn set_secret(
+        &self,
+        service: &str,
+        account: &str,
+        secret: &str,
+    ) -> Result<(), CredentialStoreError>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct OsKeyringCredentialStore;
+
+impl CredentialStore for OsKeyringCredentialStore {
+    fn get_secret(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<String>, CredentialStoreError> {
+        let entry = keyring::Entry::new(service, account).map_err(|error| {
+            CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                format!("failed to open OS credential entry: {error}"),
+            )
+        })?;
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                format!("failed to read OS credential entry: {error}"),
+            )),
+        }
+    }
+
+    fn set_secret(
+        &self,
+        service: &str,
+        account: &str,
+        secret: &str,
+    ) -> Result<(), CredentialStoreError> {
+        let entry = keyring::Entry::new(service, account).map_err(|error| {
+            CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                format!("failed to open OS credential entry: {error}"),
+            )
+        })?;
+        entry.set_password(secret).map_err(|error| {
+            CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                format!("failed to write OS credential entry: {error}"),
+            )
+        })
     }
 }
 
@@ -83,6 +199,111 @@ struct StoredAuthFile {
 struct StoredTokens {
     access_token: Option<String>,
     refresh_token: Option<String>,
+}
+
+fn codex_keyring_service_and_account(codex_home: &Path) -> std::io::Result<(String, String)> {
+    Ok((
+        CODEX_KEYRING_SERVICE.to_string(),
+        compute_codex_store_key(codex_home),
+    ))
+}
+
+fn load_codex_keyring_auth(
+    store: &impl CredentialStore,
+    codex_home: &Path,
+) -> Result<Option<LoadedUpstreamAuth>, CredentialStoreError> {
+    let (service, account) = codex_keyring_service_and_account(codex_home).map_err(|_| {
+        CredentialStoreError::new(
+            CredentialStoreErrorKind::ServiceUnavailable,
+            "failed to compute Codex keyring account",
+        )
+    })?;
+    let Some(secret) = store.get_secret(&service, &account)? else {
+        return Ok(None);
+    };
+
+    let file = serde_json::from_str::<StoredAuthFile>(&secret).map_err(|_| {
+        CredentialStoreError::new(
+            CredentialStoreErrorKind::MalformedPayload,
+            "Codex keyring payload could not be parsed.",
+        )
+    })?;
+
+    let token = file
+        .tokens
+        .as_ref()
+        .and_then(|tokens| non_empty(tokens.access_token.as_deref()))
+        .or_else(|| non_empty(file.openai_api_key.as_deref()));
+
+    let Some(token) = token else {
+        return Err(CredentialStoreError::new(
+            CredentialStoreErrorKind::MalformedPayload,
+            "Codex keyring payload did not contain a usable upstream token.",
+        ));
+    };
+
+    let refresh_boundary = if file
+        .tokens
+        .as_ref()
+        .and_then(|tokens| non_empty(tokens.refresh_token.as_deref()))
+        .is_some()
+    {
+        RefreshBoundary::RefreshTokenPresent
+    } else {
+        RefreshBoundary::NotAvailable
+    };
+
+    Ok(Some(LoadedUpstreamAuth {
+        bearer_token: token.to_string(),
+        source: AuthSource::CodexKeyring,
+        refresh_boundary,
+    }))
+}
+
+fn read_threadline_keyring_payload(
+    store: &impl CredentialStore,
+) -> Result<Option<ThreadlineKeyringPayload>, CredentialStoreError> {
+    let Some(secret) = store.get_secret(THREADLINE_KEYRING_SERVICE, THREADLINE_KEYRING_ACCOUNT)?
+    else {
+        return Ok(None);
+    };
+
+    serde_json::from_str(&secret).map(Some).map_err(|_| {
+        CredentialStoreError::new(
+            CredentialStoreErrorKind::MalformedPayload,
+            "Threadline keyring payload could not be parsed.",
+        )
+    })
+}
+
+fn write_threadline_keyring_payload(
+    store: &impl CredentialStore,
+    payload: &ThreadlineKeyringPayload,
+) -> Result<(), CredentialStoreError> {
+    let serialized = serde_json::to_string(payload).map_err(|_| {
+        CredentialStoreError::new(
+            CredentialStoreErrorKind::SerializationFailed,
+            "Threadline keyring payload could not be serialized.",
+        )
+    })?;
+
+    store.set_secret(
+        THREADLINE_KEYRING_SERVICE,
+        THREADLINE_KEYRING_ACCOUNT,
+        &serialized,
+    )
+}
+
+fn compute_codex_store_key(codex_home: &Path) -> String {
+    let canonical = codex_home
+        .canonicalize()
+        .unwrap_or_else(|_| codex_home.to_path_buf());
+    let path_str = canonical.to_string_lossy();
+    let mut hasher = Sha256::new();
+    hasher.update(path_str.as_bytes());
+    let digest = hasher.finalize();
+    let hex = format!("{digest:x}");
+    format!("cli|{}", &hex[..16])
 }
 
 pub fn load_upstream_auth(
@@ -186,15 +407,216 @@ fn non_empty_path(path: Option<&PathBuf>) -> Option<&PathBuf> {
 }
 
 #[cfg(test)]
+#[derive(Default, Debug, Clone)]
+struct FakeCredentialStore {
+    state: std::sync::Arc<std::sync::Mutex<FakeCredentialStoreState>>,
+}
+
+#[cfg(test)]
+#[derive(Default, Debug)]
+struct FakeCredentialStoreState {
+    secrets: std::collections::BTreeMap<(String, String), String>,
+    writes: Vec<((String, String), String)>,
+    read_errors: std::collections::BTreeMap<(String, String), CredentialStoreError>,
+    write_errors: std::collections::BTreeMap<(String, String), CredentialStoreError>,
+}
+
+#[cfg(test)]
+impl FakeCredentialStore {
+    fn seed_secret(&self, service: &str, account: &str, secret: &str) {
+        let mut state = self.state.lock().expect("fake credential store poisoned");
+        state.secrets.insert(
+            (service.to_string(), account.to_string()),
+            secret.to_string(),
+        );
+    }
+
+    fn read_raw(&self, service: &str, account: &str) -> Option<String> {
+        let state = self.state.lock().expect("fake credential store poisoned");
+        state
+            .secrets
+            .get(&(service.to_string(), account.to_string()))
+            .cloned()
+    }
+
+    fn writes(&self) -> Vec<((String, String), String)> {
+        let state = self.state.lock().expect("fake credential store poisoned");
+        state.writes.clone()
+    }
+
+    fn with_service_error(service: &str, account: &str, error: CredentialStoreError) -> Self {
+        let store = Self::default();
+        let mut state = store.state.lock().expect("fake credential store poisoned");
+        state
+            .read_errors
+            .insert((service.to_string(), account.to_string()), error);
+        drop(state);
+        store
+    }
+}
+
+#[cfg(test)]
+impl CredentialStore for FakeCredentialStore {
+    fn get_secret(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<String>, CredentialStoreError> {
+        let state = self.state.lock().expect("fake credential store poisoned");
+        if let Some(error) = state
+            .read_errors
+            .get(&(service.to_string(), account.to_string()))
+        {
+            return Err(error.clone());
+        }
+
+        Ok(state
+            .secrets
+            .get(&(service.to_string(), account.to_string()))
+            .cloned())
+    }
+
+    fn set_secret(
+        &self,
+        service: &str,
+        account: &str,
+        secret: &str,
+    ) -> Result<(), CredentialStoreError> {
+        let mut state = self.state.lock().expect("fake credential store poisoned");
+        if let Some(error) = state
+            .write_errors
+            .get(&(service.to_string(), account.to_string()))
+        {
+            return Err(error.clone());
+        }
+
+        state.secrets.insert(
+            (service.to_string(), account.to_string()),
+            secret.to_string(),
+        );
+        state.writes.push((
+            (service.to_string(), account.to_string()),
+            secret.to_string(),
+        ));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
+    use std::path::Path;
 
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
-        AuthDiscoveryOptions, AuthLoadError, AuthSource, RefreshBoundary, load_upstream_auth,
+        AuthDiscoveryOptions, AuthLoadError, AuthSource, CredentialStoreError,
+        CredentialStoreErrorKind, FakeCredentialStore, RefreshBoundary, ThreadlineKeyringPayload,
+        codex_keyring_service_and_account, load_codex_keyring_auth, load_upstream_auth,
+        read_threadline_keyring_payload, write_threadline_keyring_payload,
     };
+
+    #[test]
+    fn codex_store_key_matches_known_codex_home() {
+        let (service, account) = codex_keyring_service_and_account(Path::new("~/.codex"))
+            .expect("codex key should compute");
+
+        assert_eq!(service, "Codex Auth");
+        assert_eq!(account, "cli|940db7b1d0e4eb40");
+    }
+
+    #[test]
+    fn codex_keyring_payload_is_read_without_rewriting_unknown_fields() {
+        let store = FakeCredentialStore::default();
+        let (service, account) = codex_keyring_service_and_account(Path::new("~/.codex"))
+            .expect("codex key should compute");
+        let original_payload = json!({
+            "OPENAI_API_KEY": "",
+            "tokens": {
+                "access_token": "codex-access-token",
+                "refresh_token": "codex-refresh-token",
+                "unknown_nested": "keep-me"
+            },
+            "last_refresh": "2026-06-07T00:00:00Z",
+            "unknown_top_level": {
+                "still": "here"
+            }
+        })
+        .to_string();
+        store.seed_secret(&service, &account, &original_payload);
+
+        let auth = load_codex_keyring_auth(&store, Path::new("~/.codex"))
+            .expect("codex payload should load")
+            .expect("codex auth should exist");
+
+        assert_eq!(auth.bearer_token, "codex-access-token");
+        assert_eq!(auth.source, AuthSource::CodexKeyring);
+        assert_eq!(auth.refresh_boundary, RefreshBoundary::RefreshTokenPresent);
+        assert!(
+            store.writes().is_empty(),
+            "codex payload must remain read-only"
+        );
+        assert_eq!(
+            store.read_raw(&service, &account).as_deref(),
+            Some(original_payload.as_str())
+        );
+    }
+
+    #[test]
+    fn threadline_keyring_payload_round_trips_without_exposing_secret_debug() {
+        let store = FakeCredentialStore::default();
+        let payload = ThreadlineKeyringPayload {
+            bearer_token: "threadline-access-token".to_string(),
+            refresh_token: Some("threadline-refresh-token".to_string()),
+            metadata: BTreeMap::from([("profile".to_string(), "default".to_string())]),
+        };
+
+        write_threadline_keyring_payload(&store, &payload)
+            .expect("threadline payload should write");
+        let round_tripped = read_threadline_keyring_payload(&store)
+            .expect("threadline payload should read")
+            .expect("threadline payload should exist");
+
+        assert_eq!(round_tripped, payload);
+        let debug = format!("{payload:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("profile"));
+        assert!(!debug.contains("threadline-access-token"));
+        assert!(!debug.contains("threadline-refresh-token"));
+
+        let writes = store.writes();
+        let ((written_service, written_account), _) =
+            writes.last().expect("write should be recorded");
+        let (codex_service, codex_account) =
+            codex_keyring_service_and_account(Path::new("~/.codex"))
+                .expect("codex key should compute");
+        assert_ne!(written_service, &codex_service);
+        assert_ne!(written_account, &codex_account);
+    }
+
+    #[test]
+    fn keyring_service_errors_are_distinguishable_from_missing_entries() {
+        let missing = read_threadline_keyring_payload(&FakeCredentialStore::default())
+            .expect("missing keyring entry should not be an error");
+        assert!(missing.is_none());
+
+        let store = FakeCredentialStore::with_service_error(
+            "Threadline Auth",
+            "default",
+            CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                "keyring backend unavailable",
+            ),
+        );
+
+        let error = read_threadline_keyring_payload(&store)
+            .expect_err("service failure should surface distinctly");
+
+        assert_eq!(error.kind(), CredentialStoreErrorKind::ServiceUnavailable);
+        assert!(!error.to_string().contains("threadline-access-token"));
+    }
 
     #[test]
     fn explicit_token_override_wins_without_touching_auth_files() {
