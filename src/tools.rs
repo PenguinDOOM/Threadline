@@ -1,10 +1,19 @@
+use std::sync::OnceLock;
+
 use serde_json::{Map, Value, json};
 use tracing::debug;
 
+use crate::config::active_job_manager_config;
 use crate::errors::ThreadlineError;
+use crate::jobs::ThreadlineJobManager;
 
 pub const INTERNAL_TOOL_PREFIX: &str = "threadline_";
 const ECHO_TOOL_NAME: &str = "threadline_echo";
+const START_JOB_TOOL_NAME: &str = "threadline_start_job";
+const POLL_JOB_TOOL_NAME: &str = "threadline_poll_job";
+const READ_JOB_OUTPUT_TOOL_NAME: &str = "threadline_read_job_output";
+const GET_JOB_RESULT_TOOL_NAME: &str = "threadline_get_job_result";
+const CANCEL_JOB_TOOL_NAME: &str = "threadline_cancel_job";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInternalToolOutput {
@@ -75,10 +84,37 @@ impl InternalToolCall {
     }
 
     pub fn execute(self) -> Result<PendingInternalToolOutput, ThreadlineError> {
+        self.execute_with_job_manager(&global_job_manager())
+    }
+
+    pub fn execute_with_job_manager(
+        self,
+        job_manager: &ThreadlineJobManager,
+    ) -> Result<PendingInternalToolOutput, ThreadlineError> {
         match self.name.as_str() {
             ECHO_TOOL_NAME => Ok(PendingInternalToolOutput::new(
                 self.call_id,
                 extract_echo_output(&self.arguments),
+            )),
+            START_JOB_TOOL_NAME => Ok(PendingInternalToolOutput::new(
+                self.call_id,
+                start_job_output(job_manager, &self.arguments).to_string(),
+            )),
+            POLL_JOB_TOOL_NAME => Ok(PendingInternalToolOutput::new(
+                self.call_id,
+                poll_job_output(job_manager, &self.arguments).to_string(),
+            )),
+            READ_JOB_OUTPUT_TOOL_NAME => Ok(PendingInternalToolOutput::new(
+                self.call_id,
+                read_job_output(job_manager, &self.arguments).to_string(),
+            )),
+            GET_JOB_RESULT_TOOL_NAME => Ok(PendingInternalToolOutput::new(
+                self.call_id,
+                get_job_result_output(job_manager, &self.arguments).to_string(),
+            )),
+            CANCEL_JOB_TOOL_NAME => Ok(PendingInternalToolOutput::new(
+                self.call_id,
+                cancel_job_output(job_manager, &self.arguments).to_string(),
             )),
             _ => Err(ThreadlineError::InternalToolFailed),
         }
@@ -157,19 +193,161 @@ fn value_contains_internal_tool_name(value: &Value) -> bool {
 }
 
 fn internal_tool_definitions() -> Vec<Value> {
-    vec![json!({
-        "type": "function",
-        "name": ECHO_TOOL_NAME,
-        "description": "Return the provided value so Threadline can satisfy local tool loops without involving downstream clients.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "value": {
-                    "type": "string"
-                }
-            },
-            "required": ["value"],
-            "additionalProperties": false
-        }
-    })]
+    vec![
+        json!({
+            "type": "function",
+            "name": ECHO_TOOL_NAME,
+            "description": "Return the provided value so Threadline can satisfy local tool loops without involving downstream clients.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "string"
+                    }
+                },
+                "required": ["value"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": START_JOB_TOOL_NAME,
+            "description": "Start a background Threadline job for an allowed local command and return immediately with a job id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": POLL_JOB_TOOL_NAME,
+            "description": "Poll the state of a previously started Threadline job.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"}
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": READ_JOB_OUTPUT_TOOL_NAME,
+            "description": "Read incremental output from a Threadline job using a previous output offset.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0}
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": GET_JOB_RESULT_TOOL_NAME,
+            "description": "Get the current terminal result payload for a Threadline job.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"}
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": CANCEL_JOB_TOOL_NAME,
+            "description": "Cancel a running Threadline job.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"}
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }
+        }),
+    ]
+}
+
+fn global_job_manager() -> ThreadlineJobManager {
+    static JOB_MANAGER: OnceLock<ThreadlineJobManager> = OnceLock::new();
+
+    JOB_MANAGER
+        .get_or_init(|| ThreadlineJobManager::new(active_job_manager_config()))
+        .clone()
+}
+
+fn start_job_output(job_manager: &ThreadlineJobManager, arguments: &Value) -> Value {
+    match extract_string_list(arguments.get("command")) {
+        Some(command) => job_manager.start_command_json(command),
+        None => invalid_job_request("threadline_start_job requires a command array of strings."),
+    }
+}
+
+fn poll_job_output(job_manager: &ThreadlineJobManager, arguments: &Value) -> Value {
+    match extract_job_id(arguments) {
+        Some(job_id) => job_manager.poll_json(&job_id),
+        None => invalid_job_request("threadline_poll_job requires a job_id string."),
+    }
+}
+
+fn read_job_output(job_manager: &ThreadlineJobManager, arguments: &Value) -> Value {
+    match extract_job_id(arguments) {
+        Some(job_id) => job_manager.read_output_json(&job_id, extract_offset(arguments)),
+        None => invalid_job_request("threadline_read_job_output requires a job_id string."),
+    }
+}
+
+fn get_job_result_output(job_manager: &ThreadlineJobManager, arguments: &Value) -> Value {
+    match extract_job_id(arguments) {
+        Some(job_id) => job_manager.get_result_json(&job_id),
+        None => invalid_job_request("threadline_get_job_result requires a job_id string."),
+    }
+}
+
+fn cancel_job_output(job_manager: &ThreadlineJobManager, arguments: &Value) -> Value {
+    match extract_job_id(arguments) {
+        Some(job_id) => job_manager.cancel_json(&job_id),
+        None => invalid_job_request("threadline_cancel_job requires a job_id string."),
+    }
+}
+
+fn extract_string_list(value: Option<&Value>) -> Option<Vec<String>> {
+    let items = value?.as_array()?;
+    items
+        .iter()
+        .map(|item| item.as_str().map(ToString::to_string))
+        .collect()
+}
+
+fn extract_job_id(arguments: &Value) -> Option<String> {
+    arguments
+        .get("job_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn extract_offset(arguments: &Value) -> u64 {
+    arguments.get("offset").and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn invalid_job_request(message: &'static str) -> Value {
+    json!({
+        "ok": false,
+        "code": "invalid_job_request",
+        "message": message,
+    })
 }

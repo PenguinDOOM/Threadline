@@ -58,6 +58,21 @@ pub enum ThreadlineError {
     #[error("Threadline failed while executing an internal tool.")]
     InternalToolFailed,
 
+    #[error("Threadline could not find a job with that job_id.")]
+    JobNotFound,
+
+    #[error("Threadline jobs are disabled.")]
+    JobsDisabled,
+
+    #[error("The requested job command is not allowed by Threadline policy.")]
+    JobCommandNotAllowed,
+
+    #[error("The Threadline job command failed.")]
+    JobCommandFailed,
+
+    #[error("The Threadline job was cancelled.")]
+    JobCancelled,
+
     #[error("Threadline could not load upstream credentials.")]
     UpstreamCredentialsUnavailable,
 
@@ -82,6 +97,11 @@ impl ThreadlineError {
             Self::UpstreamErrorEvent => StatusCode::BAD_GATEWAY,
             Self::UpstreamInvalidJson => StatusCode::BAD_GATEWAY,
             Self::InternalToolFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::JobNotFound => StatusCode::NOT_FOUND,
+            Self::JobsDisabled => StatusCode::FORBIDDEN,
+            Self::JobCommandNotAllowed => StatusCode::FORBIDDEN,
+            Self::JobCommandFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::JobCancelled => StatusCode::CONFLICT,
             Self::UpstreamCredentialsUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
             Self::UpstreamUrlMissing => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidBindHost(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -144,6 +164,31 @@ impl ThreadlineError {
                 code: "internal_tool_failed",
                 message: "Threadline failed while executing an internal tool.",
                 error_type: "internal_server_error",
+            },
+            Self::JobNotFound => PublicErrorPayload {
+                code: "job_not_found",
+                message: "Threadline could not find a job with that job_id.",
+                error_type: "invalid_request_error",
+            },
+            Self::JobsDisabled => PublicErrorPayload {
+                code: "jobs_disabled",
+                message: "Threadline jobs are disabled.",
+                error_type: "forbidden_error",
+            },
+            Self::JobCommandNotAllowed => PublicErrorPayload {
+                code: "job_command_not_allowed",
+                message: "The requested job command is not allowed by Threadline policy.",
+                error_type: "forbidden_error",
+            },
+            Self::JobCommandFailed => PublicErrorPayload {
+                code: "job_command_failed",
+                message: "The Threadline job command failed.",
+                error_type: "internal_server_error",
+            },
+            Self::JobCancelled => PublicErrorPayload {
+                code: "job_cancelled",
+                message: "The Threadline job was cancelled.",
+                error_type: "conflict_error",
             },
             Self::UpstreamCredentialsUnavailable => PublicErrorPayload {
                 code: "upstream_credentials_unavailable",

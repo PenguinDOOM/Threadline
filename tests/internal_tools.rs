@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
@@ -19,9 +20,11 @@ use threadline::codex_ws::UpstreamSessionDescriptor;
 use threadline::config::ThreadlineConfig;
 use threadline::errors::ThreadlineError;
 use threadline::http::build_router_with_services;
+use threadline::jobs::{ThreadlineJobManager, ThreadlineJobManagerConfig};
 use threadline::responses::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
 };
+use threadline::tools::InternalToolCall;
 use threadline::ws_pump::LiveUpstreamWebSocket;
 
 #[derive(Clone)]
@@ -339,4 +342,112 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
     assert!(body_text.contains("downstream_tool"));
     assert!(body_text.contains("response-visible"));
     assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[test]
+fn start_job_tool_returns_stable_disabled_json_by_default() {
+    let event = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-start",
+            "name": "threadline_start_job",
+            "arguments": {
+                "command": ["echo", "hello"]
+            }
+        }
+    });
+
+    let call = InternalToolCall::from_event(&event)
+        .expect("tool parse")
+        .expect("internal tool call");
+    let output = call.execute().expect("tool output").into_followup_input();
+
+    assert_eq!(output["type"], "function_call_output");
+    assert_eq!(output["call_id"], "call-start");
+
+    let payload: Value = serde_json::from_str(output["output"].as_str().expect("output string"))
+        .expect("json payload");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["code"], "jobs_disabled");
+}
+
+#[tokio::test]
+async fn job_tool_outputs_are_serialized_as_function_call_output_json() {
+    let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::from_secs(60),
+        allowed_commands: vec![],
+    });
+    let started = manager.spawn_job("tool-job", move |context| async move {
+        context.mark_running();
+        context.push_stdout("hello\n");
+        context.complete(json!({"summary": "done"}));
+    });
+    let job_id = started["job_id"].as_str().expect("job id").to_string();
+    sleep(Duration::from_millis(20)).await;
+
+    let poll_call = InternalToolCall::from_event(&json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-poll",
+            "name": "threadline_poll_job",
+            "arguments": {"job_id": job_id}
+        }
+    }))
+    .expect("poll parse")
+    .expect("poll call");
+    let poll_output = poll_call
+        .execute_with_job_manager(&manager)
+        .expect("poll output")
+        .into_followup_input();
+    let poll_payload: Value =
+        serde_json::from_str(poll_output["output"].as_str().expect("poll output string"))
+            .expect("poll json");
+    assert_eq!(poll_payload["status"], "completed");
+
+    let read_call = InternalToolCall::from_event(&json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-read",
+            "name": "threadline_read_job_output",
+            "arguments": {"job_id": job_id, "offset": 0}
+        }
+    }))
+    .expect("read parse")
+    .expect("read call");
+    let read_output = read_call
+        .execute_with_job_manager(&manager)
+        .expect("read output")
+        .into_followup_input();
+    let read_payload: Value =
+        serde_json::from_str(read_output["output"].as_str().expect("read output string"))
+            .expect("read json");
+    assert_eq!(read_payload["items"][0]["text"], "hello\n");
+
+    let result_call = InternalToolCall::from_event(&json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-result",
+            "name": "threadline_get_job_result",
+            "arguments": {"job_id": job_id}
+        }
+    }))
+    .expect("result parse")
+    .expect("result call");
+    let result_output = result_call
+        .execute_with_job_manager(&manager)
+        .expect("result output")
+        .into_followup_input();
+    let result_payload: Value = serde_json::from_str(
+        result_output["output"]
+            .as_str()
+            .expect("result output string"),
+    )
+    .expect("result json");
+    assert_eq!(result_payload["result"]["summary"], "done");
 }
