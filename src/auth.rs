@@ -294,6 +294,33 @@ fn write_threadline_keyring_payload(
     )
 }
 
+fn load_threadline_keyring_auth(
+    store: &impl CredentialStore,
+) -> Result<Option<LoadedUpstreamAuth>, CredentialStoreError> {
+    let Some(payload) = read_threadline_keyring_payload(store)? else {
+        return Ok(None);
+    };
+
+    let Some(token) = non_empty(Some(payload.bearer_token.as_str())) else {
+        return Err(CredentialStoreError::new(
+            CredentialStoreErrorKind::MalformedPayload,
+            "Threadline keyring payload did not contain a usable upstream token.",
+        ));
+    };
+
+    let refresh_boundary = if non_empty(payload.refresh_token.as_deref()).is_some() {
+        RefreshBoundary::RefreshTokenPresent
+    } else {
+        RefreshBoundary::NotAvailable
+    };
+
+    Ok(Some(LoadedUpstreamAuth {
+        bearer_token: token.to_string(),
+        source: AuthSource::ThreadlineKeyring,
+        refresh_boundary,
+    }))
+}
+
 fn compute_codex_store_key(codex_home: &Path) -> String {
     let canonical = codex_home
         .canonicalize()
@@ -309,12 +336,33 @@ fn compute_codex_store_key(codex_home: &Path) -> String {
 pub fn load_upstream_auth(
     options: &AuthDiscoveryOptions,
 ) -> Result<LoadedUpstreamAuth, AuthLoadError> {
+    load_upstream_auth_with_store(options, &OsKeyringCredentialStore)
+}
+
+fn load_upstream_auth_with_store(
+    options: &AuthDiscoveryOptions,
+    store: &impl CredentialStore,
+) -> Result<LoadedUpstreamAuth, AuthLoadError> {
     if let Some(token) = non_empty(options.explicit_token.as_deref()) {
         return Ok(LoadedUpstreamAuth {
             bearer_token: token.to_string(),
             source: AuthSource::ExplicitOverride,
             refresh_boundary: RefreshBoundary::NotAvailable,
         });
+    }
+
+    match load_threadline_keyring_auth(store) {
+        Ok(Some(auth)) => return Ok(auth),
+        Ok(None) => {}
+        Err(_) => {}
+    }
+
+    if let Some(codex_home) = non_empty_path(options.codex_home.as_ref()) {
+        match load_codex_keyring_auth(store, codex_home) {
+            Ok(Some(auth)) => return Ok(auth),
+            Ok(None) => {}
+            Err(_) => {}
+        }
     }
 
     for (source, root) in auth_search_roots(options) {
@@ -515,8 +563,47 @@ mod tests {
         AuthDiscoveryOptions, AuthLoadError, AuthSource, CredentialStoreError,
         CredentialStoreErrorKind, FakeCredentialStore, RefreshBoundary, ThreadlineKeyringPayload,
         codex_keyring_service_and_account, load_codex_keyring_auth, load_upstream_auth,
-        read_threadline_keyring_payload, write_threadline_keyring_payload,
+        load_upstream_auth_with_store, read_threadline_keyring_payload,
+        write_threadline_keyring_payload,
     };
+
+    fn seed_threadline_keyring_payload(
+        store: &FakeCredentialStore,
+        bearer_token: &str,
+        refresh_token: Option<&str>,
+    ) {
+        let payload = ThreadlineKeyringPayload {
+            bearer_token: bearer_token.to_string(),
+            refresh_token: refresh_token.map(str::to_string),
+            metadata: BTreeMap::new(),
+        };
+        write_threadline_keyring_payload(store, &payload)
+            .expect("threadline keyring payload should write");
+    }
+
+    fn seed_codex_keyring_payload(
+        store: &FakeCredentialStore,
+        codex_home: &Path,
+        access_token: &str,
+        refresh_token: Option<&str>,
+    ) {
+        let (service, account) =
+            codex_keyring_service_and_account(codex_home).expect("codex key should compute");
+        let payload = match refresh_token {
+            Some(refresh_token) => json!({
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token
+                }
+            }),
+            None => json!({
+                "tokens": {
+                    "access_token": access_token
+                }
+            }),
+        };
+        store.seed_secret(&service, &account, &payload.to_string());
+    }
 
     #[test]
     fn codex_store_key_matches_known_codex_home() {
@@ -619,15 +706,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_token_override_wins_without_touching_auth_files() {
+    fn explicit_token_override_wins_over_keyring_sources() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FakeCredentialStore::default();
+        let codex_home = temp.path().join("codex-home");
+        seed_threadline_keyring_payload(&store, "threadline-token", Some("threadline-refresh"));
+        seed_codex_keyring_payload(&store, &codex_home, "codex-token", Some("codex-refresh"));
+
         let options = AuthDiscoveryOptions {
             explicit_token: Some("override-token".to_string()),
             chatgpt_local_home: None,
-            codex_home: None,
+            codex_home: Some(codex_home),
             user_home: None,
         };
 
-        let auth = load_upstream_auth(&options).expect("explicit token should load");
+        let auth =
+            load_upstream_auth_with_store(&options, &store).expect("explicit token should load");
 
         assert_eq!(auth.bearer_token, "override-token");
         assert_eq!(auth.source, AuthSource::ExplicitOverride);
@@ -635,8 +729,209 @@ mod tests {
     }
 
     #[test]
+    fn threadline_keyring_is_used_before_codex_keyring() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FakeCredentialStore::default();
+        let codex_home = temp.path().join("codex-home");
+        seed_threadline_keyring_payload(&store, "threadline-token", Some("threadline-refresh"));
+        seed_codex_keyring_payload(&store, &codex_home, "codex-token", Some("codex-refresh"));
+
+        let options = AuthDiscoveryOptions {
+            explicit_token: None,
+            chatgpt_local_home: None,
+            codex_home: Some(codex_home),
+            user_home: None,
+        };
+
+        let auth = load_upstream_auth_with_store(&options, &store)
+            .expect("threadline keyring auth should load");
+
+        assert_eq!(auth.bearer_token, "threadline-token");
+        assert_eq!(auth.source, AuthSource::ThreadlineKeyring);
+        assert_eq!(auth.refresh_boundary, RefreshBoundary::RefreshTokenPresent);
+    }
+
+    #[test]
+    fn codex_keyring_is_used_when_threadline_credentials_are_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FakeCredentialStore::default();
+        let codex_home = temp.path().join("codex-home");
+        seed_codex_keyring_payload(&store, &codex_home, "codex-token", Some("codex-refresh"));
+
+        let options = AuthDiscoveryOptions {
+            explicit_token: None,
+            chatgpt_local_home: None,
+            codex_home: Some(codex_home),
+            user_home: None,
+        };
+
+        let auth = load_upstream_auth_with_store(&options, &store)
+            .expect("codex keyring auth should load");
+
+        assert_eq!(auth.bearer_token, "codex-token");
+        assert_eq!(auth.source, AuthSource::CodexKeyring);
+        assert_eq!(auth.refresh_boundary, RefreshBoundary::RefreshTokenPresent);
+        assert!(store.writes().is_empty());
+    }
+
+    #[test]
+    fn codex_auth_file_remains_fallback_when_keyring_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FakeCredentialStore::default();
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec_pretty(&json!({"OPENAI_API_KEY": "codex-file-token"}))
+                .expect("json"),
+        )
+        .expect("auth file");
+
+        let options = AuthDiscoveryOptions {
+            explicit_token: None,
+            chatgpt_local_home: None,
+            codex_home: Some(codex_home),
+            user_home: None,
+        };
+
+        let auth =
+            load_upstream_auth_with_store(&options, &store).expect("codex auth file should load");
+
+        assert_eq!(auth.bearer_token, "codex-file-token");
+        assert_eq!(auth.source, AuthSource::CodexHomeAuth);
+        assert_eq!(auth.refresh_boundary, RefreshBoundary::NotAvailable);
+    }
+
+    #[test]
+    fn codex_keyring_service_failure_falls_through_to_codex_auth_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec_pretty(&json!({"OPENAI_API_KEY": "codex-file-token"}))
+                .expect("json"),
+        )
+        .expect("auth file");
+        let (service, account) =
+            codex_keyring_service_and_account(&codex_home).expect("codex key should compute");
+        let store = FakeCredentialStore::with_service_error(
+            &service,
+            &account,
+            CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                "keyring backend unavailable",
+            ),
+        );
+
+        let options = AuthDiscoveryOptions {
+            explicit_token: None,
+            chatgpt_local_home: None,
+            codex_home: Some(codex_home),
+            user_home: None,
+        };
+
+        let auth = load_upstream_auth_with_store(&options, &store)
+            .expect("codex auth file should load after keyring failure");
+
+        assert_eq!(auth.bearer_token, "codex-file-token");
+        assert_eq!(auth.source, AuthSource::CodexHomeAuth);
+        assert_eq!(auth.refresh_boundary, RefreshBoundary::NotAvailable);
+    }
+
+    #[test]
+    fn keyring_service_unavailable_falls_through_to_next_source() {
+        let temp = TempDir::new().expect("tempdir");
+        let chatgpt_home = temp.path().join("chatgpt-home");
+        fs::create_dir_all(&chatgpt_home).expect("chatgpt home");
+        fs::write(
+            chatgpt_home.join("auth.json"),
+            serde_json::to_vec_pretty(&json!({"OPENAI_API_KEY": "chatgpt-file-token"}))
+                .expect("json"),
+        )
+        .expect("auth file");
+        let store = FakeCredentialStore::with_service_error(
+            "Threadline Auth",
+            "default",
+            CredentialStoreError::new(
+                CredentialStoreErrorKind::ServiceUnavailable,
+                "keyring backend unavailable",
+            ),
+        );
+
+        let options = AuthDiscoveryOptions {
+            explicit_token: None,
+            chatgpt_local_home: Some(chatgpt_home),
+            codex_home: None,
+            user_home: None,
+        };
+
+        let auth = load_upstream_auth_with_store(&options, &store)
+            .expect("file auth should load after keyring failure");
+
+        assert_eq!(auth.bearer_token, "chatgpt-file-token");
+        assert_eq!(auth.source, AuthSource::ChatgptLocalAuth);
+        assert_eq!(auth.refresh_boundary, RefreshBoundary::NotAvailable);
+    }
+
+    #[test]
+    fn threadline_keyring_parse_error_falls_through_without_exposing_secret_values() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FakeCredentialStore::default();
+        let codex_home = temp.path().join("codex-home");
+        store.seed_secret(
+            "Threadline Auth",
+            "default",
+            r#"{"bearer_token":"leaked-secret","refresh_token":}"#,
+        );
+        seed_codex_keyring_payload(&store, &codex_home, "codex-token", None);
+
+        let options = AuthDiscoveryOptions {
+            explicit_token: None,
+            chatgpt_local_home: None,
+            codex_home: Some(codex_home),
+            user_home: None,
+        };
+
+        let auth = load_upstream_auth_with_store(&options, &store)
+            .expect("codex keyring should load after malformed threadline payload");
+
+        assert_eq!(auth.bearer_token, "codex-token");
+        assert_eq!(auth.source, AuthSource::CodexKeyring);
+        assert!(!format!("{auth:?}").contains("leaked-secret"));
+    }
+
+    #[test]
+    fn codex_keyring_is_skipped_when_codex_home_is_unavailable() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FakeCredentialStore::default();
+        let chatgpt_home = temp.path().join("chatgpt-home");
+        fs::create_dir_all(&chatgpt_home).expect("chatgpt home");
+        fs::write(
+            chatgpt_home.join("auth.json"),
+            serde_json::to_vec_pretty(&json!({"OPENAI_API_KEY": "chatgpt-file-token"}))
+                .expect("json"),
+        )
+        .expect("auth file");
+
+        let options = AuthDiscoveryOptions {
+            explicit_token: None,
+            chatgpt_local_home: Some(chatgpt_home),
+            codex_home: None,
+            user_home: None,
+        };
+
+        let auth = load_upstream_auth_with_store(&options, &store)
+            .expect("chatgpt auth should load without codex home");
+
+        assert_eq!(auth.bearer_token, "chatgpt-file-token");
+        assert_eq!(auth.source, AuthSource::ChatgptLocalAuth);
+    }
+
+    #[test]
     fn missing_credentials_return_secret_safe_error() {
         let temp = TempDir::new().expect("tempdir");
+        let store = FakeCredentialStore::default();
         let options = AuthDiscoveryOptions {
             explicit_token: None,
             chatgpt_local_home: Some(temp.path().join("chatgpt-home")),
@@ -644,7 +939,8 @@ mod tests {
             user_home: Some(temp.path().join("user-home")),
         };
 
-        let error = load_upstream_auth(&options).expect_err("missing auth should fail");
+        let error =
+            load_upstream_auth_with_store(&options, &store).expect_err("missing auth should fail");
 
         assert_eq!(error, AuthLoadError::MissingCredentials);
         assert!(!error.to_string().contains("override-token"));
