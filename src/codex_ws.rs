@@ -74,10 +74,7 @@ pub fn build_handshake_request(
     headers.insert("session-id", header_value(&session.session_id)?);
     headers.insert("thread-id", header_value(&session.thread_id)?);
     headers.insert("x-codex-window-id", header_value(&session.window_id)?);
-    headers.insert(
-        "x-client-request-id",
-        header_value(&client_request_id)?,
-    );
+    headers.insert("x-client-request-id", header_value(&client_request_id)?);
 
     if let Some(turn_state) = &session.turn_state {
         headers.insert("x-codex-turn-state", header_value(turn_state)?);
@@ -136,7 +133,10 @@ mod tests {
         assert_eq!(headers["originator"], "codex_vscode");
         assert_eq!(
             headers["user-agent"],
-            format!("codex_vscode/0.1.0 Threadline/{}", env!("CARGO_PKG_VERSION"))
+            format!(
+                "codex_vscode/0.1.0 Threadline/{}",
+                env!("CARGO_PKG_VERSION")
+            )
         );
         assert_eq!(headers["version"], env!("CARGO_PKG_VERSION"));
         Uuid::parse_str(headers["session-id"].to_str().unwrap()).expect("session id uuid");

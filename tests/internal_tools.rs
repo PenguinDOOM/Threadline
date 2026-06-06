@@ -208,9 +208,7 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     assert_eq!(first_request["type"], "response.create");
     assert!(first_request.get("response").is_none());
 
-    let tools = first_request["tools"]
-        .as_array()
-        .expect("tools array");
+    let tools = first_request["tools"].as_array().expect("tools array");
     assert_eq!(tools[0]["name"], "downstream_tool");
     assert_eq!(tools[0]["strict"], true);
     assert!(
@@ -243,7 +241,10 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     .expect("followup request json");
     assert_eq!(followup_request["type"], "response.create");
     assert!(followup_request.get("response").is_none());
-    assert_eq!(followup_request["previous_response_id"], "response-intermediate");
+    assert_eq!(
+        followup_request["previous_response_id"],
+        "response-intermediate"
+    );
 
     let followup_input = followup_request["input"]
         .as_array()

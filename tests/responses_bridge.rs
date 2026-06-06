@@ -413,11 +413,12 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
 
     let response = post_responses(app, json!({"model":"ignored","input":"pretty-delta"})).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let _ = server.recv_client_message().await.expect("pretty delta request");
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("pretty delta request");
     server
-        .send_text(
-            "{\n  \"type\": \"response.output_text.delta\",\n  \"delta\": \"hello\"\n}",
-        )
+        .send_text("{\n  \"type\": \"response.output_text.delta\",\n  \"delta\": \"hello\"\n}")
         .await;
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
@@ -437,8 +438,7 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
     let (event, data) = sse_event_and_data(frames[0]);
     let payload: Value = serde_json::from_str(data).expect("delta json");
     let (completed_event, completed_data) = sse_event_and_data(frames[1]);
-    let completed_payload: Value =
-        serde_json::from_str(completed_data).expect("completed json");
+    let completed_payload: Value = serde_json::from_str(completed_data).expect("completed json");
 
     assert_eq!(event, "response.output_text.delta");
     assert_eq!(

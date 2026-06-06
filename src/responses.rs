@@ -9,7 +9,6 @@ use futures_util::future::BoxFuture;
 use futures_util::stream;
 use serde::Deserialize;
 use serde_json::Value;
-use serde_json::json;
 use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
@@ -354,10 +353,7 @@ pub async fn responses_handler(
 
                         debug!(
                             event_type,
-                            error_code,
-                            error_message,
-                            status,
-                            "upstream_error_event"
+                            error_code, error_message, status, "upstream_error_event"
                         );
                         state.lease.mark_upstream_terminal().await;
                         state.done = true;
