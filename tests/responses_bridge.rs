@@ -146,6 +146,20 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
     }
 }
 
+fn assert_codex_unsupported_response_fields_are_absent(payload: &Value) {
+    for field_name in [
+        "max_output_tokens",
+        "max_tokens",
+        "max_completion_tokens",
+        "truncation",
+    ] {
+        assert!(
+            payload.get(field_name).is_none(),
+            "expected upstream response.create payload to omit {field_name}, got {payload:?}"
+        );
+    }
+}
+
 fn split_sse_frames(body: &str) -> Vec<&str> {
     body.split("\n\n")
         .filter(|frame| !frame.trim().is_empty())
@@ -758,7 +772,10 @@ async fn byok_request_fields_are_preserved_in_upstream_response_create() {
             "include":["reasoning.encrypted_content"],
             "store":true,
             "prompt_cache_key":"cache-key-1",
-            "max_output_tokens":321
+            "max_output_tokens":321,
+            "max_tokens":654,
+            "max_completion_tokens":987,
+            "truncation":"auto"
         }),
     )
     .await;
@@ -792,7 +809,7 @@ async fn byok_request_fields_are_preserved_in_upstream_response_create() {
         response_payload["prompt_cache_key"],
         Value::String("cache-key-1".to_string())
     );
-    assert_eq!(response_payload["max_output_tokens"], Value::from(321));
+    assert_codex_unsupported_response_fields_are_absent(response_payload);
 
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
@@ -824,7 +841,10 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
             "type":"wrong.type",
             "model":"ignored",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
-            "max_output_tokens":321
+            "max_output_tokens":321,
+            "max_tokens":654,
+            "max_completion_tokens":987,
+            "truncation":"auto"
         }),
     )
     .await;
@@ -843,7 +863,7 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
         Value::String(String::new())
     );
     assert_eq!(missing_payload["store"], Value::Bool(false));
-    assert_eq!(missing_payload["max_output_tokens"], Value::from(321));
+    assert_codex_unsupported_response_fields_are_absent(&missing_payload);
 
     missing_server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
@@ -859,7 +879,10 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
             "model":"ignored",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello again"}]}],
             "instructions":null,
-            "max_output_tokens":654
+            "max_output_tokens":654,
+            "max_tokens":321,
+            "max_completion_tokens":111,
+            "truncation":"disabled"
         }),
     )
     .await;
@@ -875,7 +898,7 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
     assert_eq!(null_payload["type"], "response.create");
     assert_eq!(null_payload["instructions"], Value::String(String::new()));
     assert_eq!(null_payload["store"], Value::Bool(false));
-    assert_eq!(null_payload["max_output_tokens"], Value::from(654));
+    assert_codex_unsupported_response_fields_are_absent(&null_payload);
 
     null_server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
@@ -901,7 +924,10 @@ async fn explicit_instructions_are_preserved_in_upstream_response_create() {
             "model":"ignored",
             "input":[{"role":"user","content":[{"type":"input_text","text":"preserve me"}]}],
             "instructions":"explicit downstream instructions",
-            "max_output_tokens":987
+            "max_output_tokens":987,
+            "max_tokens":654,
+            "max_completion_tokens":321,
+            "truncation":"auto"
         }),
     )
     .await;
@@ -919,7 +945,7 @@ async fn explicit_instructions_are_preserved_in_upstream_response_create() {
         payload["instructions"],
         Value::String("explicit downstream instructions".to_string())
     );
-    assert_eq!(payload["max_output_tokens"], Value::from(987));
+    assert_codex_unsupported_response_fields_are_absent(&payload);
 
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-3"}}"#)
