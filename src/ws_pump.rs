@@ -35,13 +35,15 @@ enum OutboundCommand {
     Text(String),
 }
 
+const OUTBOUND_CHANNEL_CAPACITY: usize = 32;
+
 impl LiveUpstreamWebSocket {
     pub fn from_stream<S>(_stream: WebSocketStream<S>) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut writer, mut reader) = _stream.split();
-        let (outbound_tx, mut outbound_rx) = mpsc::channel(32);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let close_metadata = Arc::new(Mutex::new(None));
         let task_close_metadata = Arc::clone(&close_metadata);
@@ -49,7 +51,10 @@ impl LiveUpstreamWebSocket {
         let task_is_closed = Arc::clone(&is_closed);
 
         let task = tokio::spawn(async move {
-            debug!(outbound_capacity = 32usize, "ws_pump_started");
+            debug!(
+                outbound_capacity = OUTBOUND_CHANNEL_CAPACITY,
+                "ws_pump_started"
+            );
             loop {
                 tokio::select! {
                     outbound = outbound_rx.recv() => match outbound {
