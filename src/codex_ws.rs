@@ -8,6 +8,8 @@ use uuid::Uuid;
 use crate::auth::LoadedUpstreamAuth;
 
 pub const RESPONSES_WEBSOCKETS_BETA_HEADER: &str = "responses_websockets=2026-02-06";
+#[cfg(test)]
+const EXPECTED_CODEX_CLIENT_VERSION: &str = "0.136.0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamSessionDescriptor {
@@ -102,8 +104,8 @@ mod tests {
     use crate::auth::{AuthSource, LoadedUpstreamAuth, RefreshBoundary};
 
     use super::{
-        HandshakeBuildError, RESPONSES_WEBSOCKETS_BETA_HEADER, UpstreamSessionDescriptor,
-        build_handshake_request,
+        EXPECTED_CODEX_CLIENT_VERSION, HandshakeBuildError, RESPONSES_WEBSOCKETS_BETA_HEADER,
+        UpstreamSessionDescriptor, build_handshake_request,
     };
 
     fn test_auth() -> LoadedUpstreamAuth {
@@ -134,11 +136,11 @@ mod tests {
         assert_eq!(
             headers["user-agent"],
             format!(
-                "codex_vscode/0.1.0 Threadline/{}",
+                "codex_vscode/{EXPECTED_CODEX_CLIENT_VERSION} Threadline/{}",
                 env!("CARGO_PKG_VERSION")
             )
         );
-        assert_eq!(headers["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(headers["version"], EXPECTED_CODEX_CLIENT_VERSION);
         Uuid::parse_str(headers["session-id"].to_str().unwrap()).expect("session id uuid");
         Uuid::parse_str(headers["thread-id"].to_str().unwrap()).expect("thread id uuid");
         Uuid::parse_str(headers["x-codex-window-id"].to_str().unwrap()).expect("window id uuid");

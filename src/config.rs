@@ -163,3 +163,32 @@ fn set_active_job_manager_config(config: ThreadlineJobManagerConfig) {
         .lock()
         .expect("job manager config lock") = config;
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::ThreadlineConfig;
+
+    #[test]
+    fn codex_client_version_defaults_to_installed_version() {
+        let command = ThreadlineConfig::command();
+        let argument = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("codex-client-version"))
+            .expect("codex client version arg should exist");
+        let default_values: Vec<_> = argument
+            .get_default_values()
+            .iter()
+            .map(|value| value.to_str().expect("utf-8 default value"))
+            .collect();
+
+        assert_eq!(default_values, vec!["0.136.0"]);
+    }
+
+    #[test]
+    fn codex_client_version_cli_override_wins() {
+        ThreadlineConfig::try_parse_from(["threadline", "--codex-client-version", "9.9.9"])
+            .expect("threadline config should accept a codex client version cli override");
+    }
+}
