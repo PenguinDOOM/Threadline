@@ -207,8 +207,7 @@ fn sse_event_and_data(frame: &str) -> (&str, &str) {
 
 fn assert_done_frame(frame: &str) {
     assert_eq!(
-        frame,
-        "data: [DONE]",
+        frame, "data: [DONE]",
         "expected a bare downstream DONE frame without an event line"
     );
 }
@@ -453,8 +452,8 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
     let frames = split_sse_frames(&body_text);
     assert_eq!(
         frames.len(),
-        2,
-        "expected delta and completed SSE frames, got body: {body_text}"
+        3,
+        "expected delta, completed, and bare DONE SSE frames, got body: {body_text}"
     );
 
     let (event, data) = sse_event_and_data(frames[0]);
@@ -472,6 +471,8 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
         completed_payload,
         json!({"type":"response.completed","response":{"id":"response-1"}})
     );
+
+    assert_done_frame(frames[2]);
 }
 
 #[tokio::test]

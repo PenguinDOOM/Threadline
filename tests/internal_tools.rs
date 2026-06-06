@@ -167,6 +167,13 @@ fn sse_event_and_data(frame: &str) -> (&str, &str) {
     )
 }
 
+fn assert_done_frame(frame: &str) {
+    assert_eq!(
+        frame, "data: [DONE]",
+        "expected a bare downstream DONE frame without an event line"
+    );
+}
+
 #[tokio::test]
 async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -281,33 +288,30 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let parsed_frames: Vec<_> = frames
-        .iter()
-        .map(|frame| sse_event_and_data(frame))
-        .collect();
-    let delta_payload: Value = serde_json::from_str(parsed_frames[0].1).expect("delta json");
-    let completed_payload: Value =
-        serde_json::from_str(parsed_frames[1].1).expect("completed json");
+    let (delta_event, delta_data) = sse_event_and_data(frames[0]);
+    let delta_payload: Value = serde_json::from_str(delta_data).expect("delta json");
+    let (completed_event, completed_data) = sse_event_and_data(frames[1]);
+    let completed_payload: Value = serde_json::from_str(completed_data).expect("completed json");
 
-    assert_eq!(parsed_frames.len(), 2);
-    assert_eq!(parsed_frames[0].0, "response.output_text.delta");
+    assert_eq!(frames.len(), 3);
+    assert_eq!(delta_event, "response.output_text.delta");
     assert_eq!(
         delta_payload,
         json!({"type":"response.output_text.delta","delta":"final answer"})
     );
-    assert_eq!(parsed_frames[1].0, "response.completed");
+    assert_eq!(completed_event, "response.completed");
     assert_eq!(
         completed_payload,
         json!({"type":"response.completed","response":{"id":"response-final"}})
     );
     assert_eq!(
-        parsed_frames[1].1,
+        completed_data,
         json!({"type":"response.completed","response":{"id":"response-final"}}).to_string()
     );
+    assert_done_frame(frames[2]);
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("response-intermediate"));
     assert!(!body_text.contains("event: response.output_item.done"));
-    assert!(!body_text.contains("data: [DONE]"));
     assert!(server.take_pending_client_messages().await.is_empty());
 }
 
@@ -372,26 +376,24 @@ async fn internal_tool_pre_done_events_are_hidden_from_downstream() {
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let parsed_frames: Vec<_> = frames
-        .iter()
-        .map(|frame| sse_event_and_data(frame))
-        .collect();
+    let (delta_event, delta_data) = sse_event_and_data(frames[0]);
+    let (completed_event, completed_data) = sse_event_and_data(frames[1]);
 
-    assert_eq!(parsed_frames.len(), 2);
-    assert_eq!(parsed_frames[0].0, "response.output_text.delta");
+    assert_eq!(frames.len(), 3);
+    assert_eq!(delta_event, "response.output_text.delta");
     assert_eq!(
-        serde_json::from_str::<Value>(parsed_frames[0].1).expect("delta json"),
+        serde_json::from_str::<Value>(delta_data).expect("delta json"),
         json!({"type":"response.output_text.delta","delta":"final answer"})
     );
-    assert_eq!(parsed_frames[1].0, "response.completed");
+    assert_eq!(completed_event, "response.completed");
     assert_eq!(
-        serde_json::from_str::<Value>(parsed_frames[1].1).expect("completed json"),
+        serde_json::from_str::<Value>(completed_data).expect("completed json"),
         json!({"type":"response.completed","response":{"id":"response-final"}})
     );
+    assert_done_frame(frames[2]);
     assert!(!body_text.contains("event: response.output_item.added"));
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("response-intermediate"));
-    assert!(!body_text.contains("data: [DONE]"));
 }
 
 #[tokio::test]
@@ -449,10 +451,8 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let parsed_frames: Vec<_> = frames
-        .iter()
-        .map(|frame| sse_event_and_data(frame))
-        .collect();
+    let tool_frame = sse_event_and_data(frames[0]);
+    let completed_frame = sse_event_and_data(frames[1]);
     let tool_payload = json!({
         "type": "response.output_item.done",
         "item": {
@@ -467,20 +467,20 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
         "response": {"id": "response-visible"}
     });
 
-    assert_eq!(parsed_frames.len(), 2);
-    assert_eq!(parsed_frames[0].0, "response.output_item.done");
-    assert_eq!(parsed_frames[0].1, tool_payload.to_string());
+    assert_eq!(frames.len(), 3);
+    assert_eq!(tool_frame.0, "response.output_item.done");
+    assert_eq!(tool_frame.1, tool_payload.to_string());
     assert_eq!(
-        serde_json::from_str::<Value>(parsed_frames[0].1).expect("tool payload json"),
+        serde_json::from_str::<Value>(tool_frame.1).expect("tool payload json"),
         tool_payload
     );
-    assert_eq!(parsed_frames[1].0, "response.completed");
-    assert_eq!(parsed_frames[1].1, completed_payload.to_string());
+    assert_eq!(completed_frame.0, "response.completed");
+    assert_eq!(completed_frame.1, completed_payload.to_string());
     assert_eq!(
-        serde_json::from_str::<Value>(parsed_frames[1].1).expect("completed payload json"),
+        serde_json::from_str::<Value>(completed_frame.1).expect("completed payload json"),
         completed_payload
     );
-    assert!(!body_text.contains("data: [DONE]"));
+    assert_done_frame(frames[2]);
     assert!(!body_text.contains("  \"type\": \"response.output_item.done\""));
     assert!(server.take_pending_client_messages().await.is_empty());
 }

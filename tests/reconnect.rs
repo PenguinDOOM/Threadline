@@ -186,6 +186,13 @@ fn sse_event_and_data(frame: &str) -> (&str, &str) {
     )
 }
 
+fn assert_done_frame(frame: &str) {
+    assert_eq!(
+        frame, "data: [DONE]",
+        "expected a bare downstream DONE frame without an event line"
+    );
+}
+
 async fn seed_marker(app: axum::Router, server: &ScriptedWebSocketServer, marker: &str) {
     let response = post_responses(app, json!({"model":"ignored","input":"seed"})).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -345,7 +352,7 @@ async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstre
     let (event, data) = sse_event_and_data(frames.first().expect("completed frame"));
     let payload: Value = serde_json::from_str(data).expect("completed json");
 
-    assert_eq!(frames.len(), 1);
+    assert_eq!(frames.len(), 2);
     assert_eq!(event, "response.completed");
     assert_eq!(
         payload,
@@ -355,7 +362,7 @@ async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstre
         data,
         json!({"type":"response.completed","response":{"id":"response-2"}}).to_string()
     );
-    assert!(!body_text.contains("data: [DONE]"));
+    assert_done_frame(frames[1]);
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 3);
