@@ -55,6 +55,9 @@ pub enum ThreadlineError {
     #[error("The upstream websocket emitted malformed JSON.")]
     UpstreamInvalidJson,
 
+    #[error("Threadline failed while executing an internal tool.")]
+    InternalToolFailed,
+
     #[error("Threadline could not load upstream credentials.")]
     UpstreamCredentialsUnavailable,
 
@@ -78,6 +81,7 @@ impl ThreadlineError {
             Self::UpstreamResponseFailed => StatusCode::BAD_GATEWAY,
             Self::UpstreamErrorEvent => StatusCode::BAD_GATEWAY,
             Self::UpstreamInvalidJson => StatusCode::BAD_GATEWAY,
+            Self::InternalToolFailed => StatusCode::INTERNAL_SERVER_ERROR,
             Self::UpstreamCredentialsUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
             Self::UpstreamUrlMissing => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidBindHost(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -135,6 +139,11 @@ impl ThreadlineError {
                 code: "upstream_invalid_json",
                 message: "The upstream websocket emitted malformed JSON.",
                 error_type: "bad_gateway_error",
+            },
+            Self::InternalToolFailed => PublicErrorPayload {
+                code: "internal_tool_failed",
+                message: "Threadline failed while executing an internal tool.",
+                error_type: "internal_server_error",
             },
             Self::UpstreamCredentialsUnavailable => PublicErrorPayload {
                 code: "upstream_credentials_unavailable",

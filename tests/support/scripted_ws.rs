@@ -112,6 +112,19 @@ impl ScriptedWebSocketServer {
         receiver.recv().await
     }
 
+    pub async fn take_pending_client_messages(&self) -> Vec<Message> {
+        self.wait_until_connected().await;
+        let mut incoming_rx = self.incoming_rx.lock().await;
+        let receiver = incoming_rx
+            .as_mut()
+            .expect("incoming receiver should remain available");
+        let mut messages = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            messages.push(message);
+        }
+        messages
+    }
+
     pub async fn abort_connection(&self) {
         self.wait_until_connected().await;
         self.writer.lock().await.take();

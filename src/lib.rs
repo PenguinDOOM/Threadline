@@ -5,4 +5,5 @@ pub mod errors;
 pub mod http;
 pub mod registry;
 pub mod responses;
+pub mod tools;
 pub mod ws_pump;

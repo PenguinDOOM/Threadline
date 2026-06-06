@@ -1,3 +1,4 @@
+use std::mem;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -9,11 +10,16 @@ use futures_util::stream;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
+use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
 use crate::codex_ws::UpstreamSessionDescriptor;
 use crate::errors::ThreadlineError;
 use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
+use crate::tools::{
+    InternalToolCall, PendingInternalToolOutput, build_followup_input,
+    event_contains_internal_tool_name, inject_internal_tools,
+};
 use crate::ws_pump::LiveUpstreamWebSocket;
 
 pub const TURN_STATE_HEADER: &str = "x-codex-turn-state";
@@ -59,6 +65,8 @@ struct DownstreamResponsesRequest {
 struct ResponseStreamState {
     upstream: Arc<LiveUpstreamWebSocket>,
     lease: RetainedSessionLease,
+    base_request: serde_json::Map<String, Value>,
+    pending_internal_outputs: Vec<PendingInternalToolOutput>,
     done: bool,
 }
 
@@ -99,109 +107,181 @@ pub async fn responses_handler(
             Value::String(previous_response_id.clone()),
         );
     }
-    let outbound = json!({
-        "type": "response.create",
-        "response": Value::Object(upstream_request),
-    });
-    upstream
-        .send_text(outbound.to_string())
-        .await
-        .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)?;
+    inject_internal_tools(&mut upstream_request);
+    send_response_create(&upstream, &upstream_request).await?;
 
     let stream = stream::unfold(
         ResponseStreamState {
             upstream,
             lease,
+            base_request: upstream_request,
+            pending_internal_outputs: Vec::new(),
             done: false,
         },
         |mut state| async move {
-            if state.done {
-                return None;
-            }
-
-            let next = match state.upstream.recv_text().await {
-                Ok(Some(text)) => text,
-                Ok(None) => {
-                    state.lease.mark_upstream_recoverable().await;
-                    state.done = true;
-                    return Some((
-                        Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
-                            &ThreadlineError::UpstreamWebSocketClosed,
-                        )),
-                        state,
-                    ));
+            loop {
+                if state.done {
+                    return None;
                 }
-                Err(_) => {
-                    state.lease.mark_upstream_recoverable().await;
-                    state.done = true;
-                    return Some((
-                        Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
-                            &ThreadlineError::UpstreamWebSocketClosed,
-                        )),
-                        state,
-                    ));
-                }
-            };
 
-            let parsed = match serde_json::from_str::<Value>(&next) {
-                Ok(parsed) => parsed,
-                Err(_) => {
-                    state.lease.mark_upstream_terminal().await;
-                    state.done = true;
-                    return Some((
-                        Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
-                            &ThreadlineError::UpstreamInvalidJson,
-                        )),
-                        state,
-                    ));
-                }
-            };
-
-            let event_type = parsed
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("message")
-                .to_string();
-
-            match event_type.as_str() {
-                "response.completed" => {
-                    if let Some(response_id) = parsed
-                        .get("response")
-                        .and_then(|response| response.get("id"))
-                        .and_then(Value::as_str)
-                    {
-                        state.lease.record_completed_marker(response_id).await;
+                let next = match state.upstream.recv_text().await {
+                    Ok(Some(text)) => text,
+                    Ok(None) => {
+                        state.lease.mark_upstream_recoverable().await;
+                        state.done = true;
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
+                                &ThreadlineError::UpstreamWebSocketClosed,
+                            )),
+                            state,
+                        ));
                     }
-                    state.done = true;
-                    Some((
-                        Ok::<Bytes, std::convert::Infallible>(sse_data_chunk(&event_type, &next)),
-                        state,
-                    ))
+                    Err(_) => {
+                        state.lease.mark_upstream_recoverable().await;
+                        state.done = true;
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
+                                &ThreadlineError::UpstreamWebSocketClosed,
+                            )),
+                            state,
+                        ));
+                    }
+                };
+
+                let parsed = match serde_json::from_str::<Value>(&next) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        state.lease.mark_upstream_terminal().await;
+                        state.done = true;
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
+                                &ThreadlineError::UpstreamInvalidJson,
+                            )),
+                            state,
+                        ));
+                    }
+                };
+
+                let internal_tool_call = match InternalToolCall::from_event(&parsed) {
+                    Ok(call) => call,
+                    Err(error) => {
+                        state.lease.mark_upstream_terminal().await;
+                        state.done = true;
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(&error)),
+                            state,
+                        ));
+                    }
+                };
+
+                if let Some(call) = internal_tool_call {
+                    match call.execute() {
+                        Ok(output) => {
+                            state.pending_internal_outputs.push(output);
+                            continue;
+                        }
+                        Err(error) => {
+                            state.lease.mark_upstream_terminal().await;
+                            state.done = true;
+                            return Some((
+                                Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(&error)),
+                                state,
+                            ));
+                        }
+                    }
                 }
-                "response.failed" => {
-                    state.lease.mark_upstream_terminal().await;
-                    state.done = true;
-                    Some((
-                        Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
-                            &ThreadlineError::UpstreamResponseFailed,
-                        )),
-                        state,
-                    ))
+
+                let event_type = parsed
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+                    .to_string();
+
+                if event_contains_internal_tool_name(&parsed) {
+                    continue;
                 }
-                "error" => {
-                    state.lease.mark_upstream_terminal().await;
-                    state.done = true;
-                    Some((
-                        Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
-                            &ThreadlineError::UpstreamErrorEvent,
-                        )),
-                        state,
-                    ))
+
+                match event_type.as_str() {
+                    "response.completed" => {
+                        let response_id = parsed
+                            .get("response")
+                            .and_then(|response| response.get("id"))
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+
+                        if let Some(response_id) = response_id.as_deref() {
+                            state.lease.record_completed_marker(response_id).await;
+                        }
+
+                        if !state.pending_internal_outputs.is_empty() {
+                            let Some(response_id) = response_id.as_deref() else {
+                                let error = ThreadlineError::InternalToolFailed;
+                                state.lease.mark_upstream_terminal().await;
+                                state.done = true;
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(&error)),
+                                    state,
+                                ));
+                            };
+
+                            let outputs = mem::take(&mut state.pending_internal_outputs);
+                            if let Err(error) = send_followup_tool_outputs(
+                                &state.upstream,
+                                &state.base_request,
+                                response_id,
+                                outputs,
+                            )
+                            .await
+                            {
+                                state.lease.mark_upstream_terminal().await;
+                                state.done = true;
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(&error)),
+                                    state,
+                                ));
+                            }
+                            continue;
+                        }
+
+                        state.done = true;
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(sse_data_chunk(
+                                &event_type,
+                                &next,
+                            )),
+                            state,
+                        ));
+                    }
+                    "response.failed" => {
+                        state.lease.mark_upstream_terminal().await;
+                        state.done = true;
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
+                                &ThreadlineError::UpstreamResponseFailed,
+                            )),
+                            state,
+                        ));
+                    }
+                    "error" => {
+                        state.lease.mark_upstream_terminal().await;
+                        state.done = true;
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
+                                &ThreadlineError::UpstreamErrorEvent,
+                            )),
+                            state,
+                        ));
+                    }
+                    _ => {
+                        return Some((
+                            Ok::<Bytes, std::convert::Infallible>(sse_data_chunk(
+                                &event_type,
+                                &next,
+                            )),
+                            state,
+                        ));
+                    }
                 }
-                _ => Some((
-                    Ok::<Bytes, std::convert::Infallible>(sse_data_chunk(&event_type, &next)),
-                    state,
-                )),
             }
         },
     );
@@ -253,6 +333,42 @@ async fn ensure_upstream(
         .replace_upstream(Some(Arc::clone(&connected.websocket)))
         .await;
     Ok(connected.websocket)
+}
+
+async fn send_response_create(
+    upstream: &LiveUpstreamWebSocket,
+    response_payload: &serde_json::Map<String, Value>,
+) -> Result<(), ThreadlineError> {
+    let outbound = json!({
+        "type": "response.create",
+        "response": Value::Object(response_payload.clone()),
+    });
+    upstream
+        .send_text(outbound.to_string())
+        .await
+        .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)
+}
+
+async fn send_followup_tool_outputs(
+    upstream: &LiveUpstreamWebSocket,
+    base_request: &serde_json::Map<String, Value>,
+    previous_response_id: &str,
+    outputs: Vec<PendingInternalToolOutput>,
+) -> Result<(), ThreadlineError> {
+    let output_count = outputs.len();
+    let mut response_payload = base_request.clone();
+    response_payload.insert(
+        "previous_response_id".to_string(),
+        Value::String(previous_response_id.to_string()),
+    );
+    response_payload.insert("input".to_string(), build_followup_input(outputs));
+    send_response_create(upstream, &response_payload).await?;
+    debug!(
+        previous_response_id = %previous_response_id,
+        output_count,
+        "internal_tool_followup_sent"
+    );
+    Ok(())
 }
 
 fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError {
