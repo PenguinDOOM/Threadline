@@ -801,3 +801,81 @@ async fn byok_request_fields_are_preserved_in_upstream_response_create() {
         .await
         .expect("body");
 }
+
+#[tokio::test]
+async fn missing_or_null_instructions_are_normalized_for_upstream_response_create() {
+    let missing_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let null_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&missing_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&null_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let missing_response = post_responses(
+        app.clone(),
+        json!({
+            "type":"wrong.type",
+            "model":"ignored",
+            "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
+            "max_output_tokens":321
+        }),
+    )
+    .await;
+    assert_eq!(missing_response.status(), StatusCode::OK);
+
+    let missing_payload: Value = serde_json::from_str(&message_text(
+        missing_server
+            .recv_client_message()
+            .await
+            .expect("missing request message"),
+    ))
+    .expect("missing request json");
+    assert_eq!(missing_payload["type"], "response.create");
+    assert_eq!(missing_payload["instructions"], Value::String(String::new()));
+    assert_eq!(missing_payload["max_output_tokens"], Value::from(321));
+
+    missing_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(missing_response.into_body(), usize::MAX)
+        .await
+        .expect("missing body");
+
+    let null_response = post_responses(
+        app,
+        json!({
+            "type":"wrong.type",
+            "model":"ignored",
+            "input":[{"role":"user","content":[{"type":"input_text","text":"hello again"}]}],
+            "instructions":null,
+            "max_output_tokens":654
+        }),
+    )
+    .await;
+    assert_eq!(null_response.status(), StatusCode::OK);
+
+    let null_payload: Value = serde_json::from_str(&message_text(
+        null_server
+            .recv_client_message()
+            .await
+            .expect("null request message"),
+    ))
+    .expect("null request json");
+    assert_eq!(null_payload["type"], "response.create");
+    assert_eq!(null_payload["instructions"], Value::String(String::new()));
+    assert_eq!(null_payload["max_output_tokens"], Value::from(654));
+
+    null_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .await;
+    let _ = to_bytes(null_response.into_body(), usize::MAX)
+        .await
+        .expect("null body");
+}
