@@ -142,3 +142,43 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use axum::http::Response;
+    use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+
+    use super::*;
+
+    #[test]
+    fn upstream_http_connect_error_maps_to_status_error() {
+        let error = TungsteniteError::Http(
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(None)
+                .unwrap(),
+        );
+
+        let mapped = map_upstream_connect_error(error);
+
+        assert!(matches!(
+            mapped,
+            ThreadlineError::UpstreamWebSocketHandshakeRejected { status }
+                if status == StatusCode::UNAUTHORIZED
+        ));
+    }
+
+    #[test]
+    fn upstream_non_http_connect_error_remains_bad_gateway_failure() {
+        let error = TungsteniteError::Io(std::io::Error::other("dial failed"));
+
+        let mapped = map_upstream_connect_error(error);
+
+        assert!(matches!(
+            mapped,
+            ThreadlineError::UpstreamWebSocketConnectFailed
+        ));
+        assert_eq!(mapped.status_code(), StatusCode::BAD_GATEWAY);
+    }
+}

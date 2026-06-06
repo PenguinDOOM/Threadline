@@ -230,3 +230,34 @@ impl IntoResponse for ThreadlineError {
         (status, Json(payload)).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_websocket_handshake_rejected_uses_upstream_status() {
+        let error = ThreadlineError::UpstreamWebSocketHandshakeRejected {
+            status: StatusCode::FORBIDDEN,
+        };
+
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+
+        let document = error.public_error_document();
+
+        assert_eq!(document.error.code, "upstream_websocket_handshake_rejected");
+        assert_eq!(
+            document.error.message,
+            "The upstream Codex websocket handshake was rejected with HTTP 403 Forbidden."
+        );
+    }
+
+    #[test]
+    fn upstream_websocket_handshake_rejected_propagates_exact_server_error_status() {
+        let error = ThreadlineError::UpstreamWebSocketHandshakeRejected {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+        };
+
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
