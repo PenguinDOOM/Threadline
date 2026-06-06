@@ -787,7 +787,7 @@ async fn byok_request_fields_are_preserved_in_upstream_response_create() {
         response_payload["include"],
         json!(["reasoning.encrypted_content"])
     );
-    assert_eq!(response_payload["store"], Value::Bool(true));
+    assert_eq!(response_payload["store"], Value::Bool(false));
     assert_eq!(
         response_payload["prompt_cache_key"],
         Value::String("cache-key-1".to_string())
@@ -842,6 +842,7 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
         missing_payload["instructions"],
         Value::String(String::new())
     );
+    assert_eq!(missing_payload["store"], Value::Bool(false));
     assert_eq!(missing_payload["max_output_tokens"], Value::from(321));
 
     missing_server
@@ -873,6 +874,7 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
     .expect("null request json");
     assert_eq!(null_payload["type"], "response.create");
     assert_eq!(null_payload["instructions"], Value::String(String::new()));
+    assert_eq!(null_payload["store"], Value::Bool(false));
     assert_eq!(null_payload["max_output_tokens"], Value::from(654));
 
     null_server
