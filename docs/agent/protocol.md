@@ -6,23 +6,13 @@ Root `AGENTS.md` contains the always-on rules. If this file conflicts with root 
 
 ## Scope
 
-Use this file before changing:
-
-* `/v1/responses` request handling
-* SSE response translation
-* Codex backend WebSocket connection behavior
-* WebSocket pump behavior
-* Ping/Pong handling
-* retained session registry behavior
-* `previous_response_id` continuation
-* internal `threadline_*` tool execution
-* job tools
-* public protocol errors
-* reconnect or recovery logic
+Use this file before changing `/v1/responses` handling, SSE translation, Codex backend WebSocket connection behavior, WebSocket pump or Ping/Pong behavior, retained session registry behavior, `previous_response_id` continuation, internal `threadline_*` tool execution, job tools, public protocol errors, reconnect, or recovery logic.
 
 ## Protocol boundaries
 
 `/v1/responses` is the primary API.
+
+Threadline bridges VSCode BYOK requests to Codex backend WebSocket sessions while keeping the implementation focused.
 
 Do not turn Threadline into a general-purpose OpenAI-compatible proxy.
 
@@ -30,16 +20,7 @@ Do not add `/v1/chat/completions` unless it is required for VSCode BYOK compatib
 
 Do not add unrelated provider compatibility unless explicitly requested.
 
-Threadline should bridge VSCode BYOK requests to Codex backend WebSocket sessions while keeping the implementation focused.
-
-## Direction terms
-
-Use these direction terms consistently:
-
-* `downstream`: the VSCode BYOK HTTP/SSE client side
-* `upstream`: the Codex backend WebSocket side
-
-A downstream request may create, continue, or observe an upstream Codex WebSocket session.
+Use `downstream` for the VSCode BYOK HTTP/SSE client side and `upstream` for the Codex backend WebSocket side.
 
 Downstream clients must not see Threadline-only internal tool calls.
 
@@ -49,8 +30,8 @@ These invariants should remain true across refactors:
 
 * Live upstream WebSockets are owned by a pump, not by route handlers.
 * Retained sessions keep enough state to continue from a completed response marker.
-* Idle retained WebSockets must continue reading so Ping frames receive Pong responses.
-* A completed response marker must not be deleted merely because an idle socket later closes.
+* Idle retained WebSockets keep reading so Ping frames receive Pong responses.
+* A completed response marker is not deleted merely because an idle socket later closes.
 * Internal `threadline_*` tool calls are executed locally and hidden from downstream clients.
 * Intermediate completions for internal tool calls are not final downstream completions.
 * Long-running work is represented as jobs, not long blocking tool calls.
@@ -68,9 +49,7 @@ Keep SSE translation separate from upstream WebSocket frame handling.
 
 When a downstream request includes `previous_response_id`, use it as a continuation marker.
 
-A response marker may refer to a retained session that is still open, closed but recoverable, or missing.
-
-Handle each state explicitly.
+A response marker may refer to a retained session that is open, closed but recoverable, missing, or unrecoverable. Handle each state explicitly.
 
 Do not assume that a missing or closed socket means the response marker should be forgotten.
 
@@ -80,19 +59,9 @@ All live upstream WebSockets must be pump-based.
 
 Route handlers must not directly hold and use `WebSocketStream`.
 
-The pump owns continuous socket IO.
+The pump owns continuous socket IO. Other code communicates with the pump through channels or clearly defined handles.
 
-The rest of the code should communicate with the pump through channels or clearly defined handles.
-
-The pump must support:
-
-* reading upstream frames
-* writing outbound upstream messages
-* replying to server Ping frames with Pong
-* forwarding Text and Binary frames into an inbound queue
-* accepting outbound Text, Ping, and Close commands
-* recording close and error metadata
-* running while a session is retained, even when no downstream request is active
+The pump must support reading upstream frames, writing outbound upstream messages, replying to server Ping frames with Pong, forwarding Text/Binary frames into an inbound queue, accepting outbound Text/Ping/Close commands, recording close/error metadata, and running while a session is retained.
 
 ## Idle sessions
 
@@ -100,7 +69,7 @@ A retained session may be idle from the downstream perspective while still needi
 
 The pump must keep reading while idle.
 
-Do not pause the read loop just because no HTTP request is currently waiting.
+Do not pause the read loop just because no HTTP request is waiting.
 
 Do not rely on a future downstream request to read pending Ping frames.
 
@@ -110,13 +79,7 @@ If the upstream sends Ping while the retained session is idle, the pump must rep
 
 When the upstream WebSocket closes, record close metadata.
 
-Close metadata should distinguish at least:
-
-* normal close
-* protocol error
-* transport error
-* recoverable idle close
-* unrecoverable close, if known
+Close metadata should distinguish normal close, protocol error, transport error, recoverable idle close, and unrecoverable close if known.
 
 Do not discard the response marker merely because the socket closed after a successful `response.completed`.
 
@@ -124,7 +87,7 @@ If continuation is possible through stored metadata, preserve that metadata.
 
 If continuation is not possible, keep enough information to produce a clear public error.
 
-## Registry purpose
+## Registry purpose and contents
 
 The retained session registry maps completed response markers to upstream session state.
 
@@ -132,26 +95,13 @@ A response marker is the lookup key for later continuation.
 
 The registry should store enough state to continue, reject, or recover a request deterministically.
 
-## Registry entry contents
-
-A registry entry should store:
-
-* response marker
-* upstream WebSocket pump handle
-* session id
-* thread id
-* window generation
-* turn state
-* in-use flag
-* close state
-* recoverable state
-* last-used timestamp
+A registry entry should store the response marker, upstream WebSocket pump handle, session id, thread id, window generation, turn state, in-use flag, close state, recoverable state, and last-used timestamp.
 
 Store only what is needed for correct continuation, diagnostics, and safe cleanup.
 
 Do not store secrets in registry entries.
 
-## Registry lifecycle
+## Registry lifecycle and conflicts
 
 Create or update registry entries when an upstream response reaches a completed state that can be continued.
 
@@ -165,13 +115,7 @@ Evict entries only through explicit capacity, TTL, or cleanup policy.
 
 Do not remove a marker as a side effect of observing a post-completion idle close.
 
-## Registry conflicts
-
-A retained session should not be used concurrently in incompatible ways.
-
 If a marker is already in use and the new request cannot safely share it, return a stable conflict error.
-
-Prefer explicit conflict handling over races.
 
 A conflict should not corrupt the registry entry.
 
@@ -201,16 +145,7 @@ Do not let downstream clients invoke arbitrary local tools.
 
 ## Internal tool lifecycle
 
-When an upstream response emits a Threadline internal tool call:
-
-1. Detect that the tool is internal.
-2. Execute the tool locally.
-3. Store the output as pending.
-4. Keep reading the upstream response.
-5. Wait for the intermediate response to complete.
-6. Send a follow-up `response.create` with `function_call_output`.
-7. Continue reading the follow-up response.
-8. Forward only the final assistant output downstream.
+When an upstream response emits a Threadline internal tool call, preserve this order: detect the internal tool, execute it locally, store output as pending, keep reading upstream, wait for the intermediate response to complete, send a follow-up `response.create` with `function_call_output`, continue reading the follow-up response, and forward only the final assistant output downstream.
 
 Do not send follow-up tool outputs before the intermediate response completes.
 
@@ -218,7 +153,7 @@ Do not treat the intermediate response completion as the final downstream comple
 
 Do not expose internal tool call details downstream unless explicitly required for diagnostics and safe to expose.
 
-## Pending internal tool output
+## Pending internal tool output and failure
 
 Pending internal tool output should be associated with the response or turn that requested it.
 
@@ -228,11 +163,7 @@ Pending output must not be sent twice.
 
 If local tool execution fails, convert the failure into the expected protocol-level tool output or a stable internal tool error.
 
-## Internal tool failure
-
 Internal tool failures should be handled without panics.
-
-Prefer typed internal failures.
 
 Return stable public errors when the failure affects the downstream request.
 
@@ -240,7 +171,7 @@ Log enough structured metadata to debug the failure without logging secrets.
 
 Use `internal_tool_failed` for expected public error states involving internal tool execution failure.
 
-## Job model
+## Job model and tools
 
 Long-running work should be represented as jobs.
 
@@ -252,37 +183,25 @@ Do not block a single tool call or HTTP request for work that should continue in
 
 Jobs are local Threadline state unless explicitly connected to upstream protocol flow.
 
-## Internal job tools
-
 Internal job tools should use the `threadline_*` prefix.
 
-Expected job tools include:
-
-* `threadline_start_job`
-* `threadline_poll_job`
-* `threadline_read_job_output`
-* `threadline_get_job_result`
-* `threadline_cancel_job`
+Expected job tools include `threadline_start_job`, `threadline_poll_job`, `threadline_read_job_output`, `threadline_get_job_result`, and `threadline_cancel_job`.
 
 These tools are internal and must not be forwarded downstream as normal model-visible tool calls.
 
 ## Job lifecycle
 
-A job should have explicit state.
-
-Useful states include:
-
-* queued
-* running
-* succeeded
-* failed
-* cancelled
+A job should have explicit state such as queued, running, succeeded, failed, or cancelled.
 
 A job should store enough metadata for polling, result retrieval, incremental output, cancellation, and cleanup.
 
 A job must not require the original downstream HTTP request to stay open.
 
-## Job completion
+Cancellation should be best effort. A cancelled job should move to a stable cancelled or failed state and should not corrupt stored output.
+
+Unknown job ids should return `job_not_found`.
+
+## Job completion and output
 
 Job completion must not automatically push a new upstream response.
 
@@ -292,27 +211,11 @@ A later internal tool call or downstream-triggered request may retrieve job stat
 
 Do not invent a background upstream response just because a local job completed.
 
-## Job output
-
-Long job output should be retrievable incrementally.
-
-Use offsets or cursors for large output.
+Long job output should be retrievable incrementally through offsets or cursors.
 
 Do not return unbounded logs in a single response.
 
 Do not expose local paths, credentials, environment secrets, or private machine details through job output.
-
-## Job cancellation
-
-Cancellation should be best effort.
-
-A cancelled job should move to a stable cancelled or failed state.
-
-Cancellation should not corrupt stored output already produced.
-
-Polling a cancelled job should return a stable state.
-
-Unknown job ids should return `job_not_found`.
 
 ## Error handling
 
@@ -322,54 +225,23 @@ Public HTTP/SSE errors should be stable and VSCode compatible.
 
 Use clear error codes for expected states.
 
-Do not panic for:
-
-* protocol errors
-* malformed client input
-* missing markers
-* closed sockets
-* upstream errors
-* internal tool failures
-* unknown job ids
-* registry conflicts
+Do not panic for protocol errors, malformed client input, missing markers, closed sockets, upstream errors, internal tool failures, unknown job ids, or registry conflicts.
 
 Panic only for impossible internal invariants where continuing would be unsafe.
 
-## Public error codes
+## Public error codes and safety
 
-Use stable error codes for expected states, such as:
-
-```txt
-previous_response_not_found
-retained_session_conflict
-retained_session_capacity_exceeded
-upstream_websocket_connect_failed
-upstream_websocket_closed
-internal_tool_failed
-job_not_found
-```
+Use stable error codes for expected states, including `previous_response_not_found`, `retained_session_conflict`, `retained_session_capacity_exceeded`, `upstream_websocket_connect_failed`, `upstream_websocket_closed`, `internal_tool_failed`, and `job_not_found`.
 
 Add new public error codes only when callers can act on them or logs need stable categorization.
 
 Do not expose implementation-only error strings as public contracts.
 
-## Public error safety
-
-Public errors must not include:
-
-* access tokens
-* refresh tokens
-* cookies
-* authorization headers
-* local credential paths
-* full upstream request bodies
-* account identifiers
-* private local machine paths
-* transcript-only debugging context
+Public errors must not include tokens, cookies, authorization headers, credential paths, full upstream request bodies, account identifiers, private local machine paths, or transcript-only debugging context.
 
 Prefer concise user-facing messages plus structured internal logs.
 
-## Upstream error events
+## Upstream error events and SSE
 
 Raw upstream `error` events may contain sensitive or unstable information.
 
@@ -378,8 +250,6 @@ Log them only at debug or trace level after confirming they do not contain secre
 If an upstream error must be forwarded downstream, normalize it into a stable public error shape.
 
 Do not blindly forward raw upstream errors as public API responses.
-
-## SSE translation
 
 Downstream SSE should represent the final client-facing response stream.
 
@@ -393,17 +263,11 @@ Keep SSE event names and payloads stable for VSCode compatibility.
 
 Preserve protocol ordering.
 
-In particular:
-
-* do not send internal tool output before the intermediate response completes
-* do not mark downstream final completion on an intermediate completion
-* do not release a retained session before all required upstream events are processed
-* do not delete a marker before continuation or recovery decisions are complete
-* do not push job completion upstream without an explicit request path
+In particular, do not send internal tool output before the intermediate response completes, mark downstream final completion on an intermediate completion, release a retained session before all required upstream events are processed, delete a marker before continuation/recovery decisions are complete, or push job completion upstream without an explicit request path.
 
 Ordering bugs are likely to create hard-to-debug continuation failures.
 
-## Concurrency rules
+## Concurrency and logging
 
 Treat retained sessions as shared mutable protocol state.
 
@@ -417,22 +281,9 @@ Prefer message passing for pump IO.
 
 Ensure cleanup paths release in-use flags and do not orphan jobs or pumps.
 
-## Logging expectations
-
 Use structured tracing for protocol events.
 
-Useful fields include:
-
-* `response_id`
-* `previous_response_id`
-* `session_id`
-* `thread_id`
-* `job_id`
-* `tool_name`
-* `marker`
-* `generation`
-* `recoverable`
-* `close_code`
+Useful fields include `response_id`, `previous_response_id`, `session_id`, `thread_id`, `job_id`, `tool_name`, `marker`, `generation`, `recoverable`, and `close_code`.
 
 Never log secrets.
 
@@ -440,18 +291,4 @@ Use stable event names as described in `docs/agent/conventions.md`.
 
 ## Protocol change checklist
 
-Before finalizing a protocol change, check:
-
-* Does every live upstream WebSocket remain pump-owned?
-* Does the pump keep reading while sessions are idle?
-* Are Ping frames answered with Pong?
-* Are response markers preserved after successful completion?
-* Are recoverable idle closes represented without deleting markers?
-* Are internal tool calls hidden from downstream clients?
-* Are internal tool outputs sent only after intermediate completion?
-* Are intermediate completions kept separate from final downstream completions?
-* Are long-running operations represented as jobs?
-* Does job completion only update local job state?
-* Are public errors stable and safe?
-* Are malformed inputs and upstream errors handled without panics?
-* Are logs structured and free of secrets?
+Before finalizing a protocol change, check that live upstream WebSockets remain pump-owned, idle pumps keep reading and answer Ping with Pong, response markers survive completion and recoverable idle closes, internal tool calls stay hidden downstream, tool outputs wait for intermediate completion, intermediate and final completions stay separate, long-running work uses jobs, job completion only updates local state, public errors are stable and safe, malformed inputs/upstream errors do not panic, and logs are structured and secret-free.
