@@ -39,6 +39,8 @@ threadline login logout
 
 `threadline login store` reads the bearer token from stdin and stores it in Threadline's own OS credential-manager entry by default. It does not silently downgrade to file storage. If the OS credential manager is unavailable, the command fails instead of writing credentials somewhere else.
 
+Before Threadline can authenticate to Codex, you need Codex credentials that were already obtained outside Threadline, such as by signing in through the Codex Desktop app or Codex CLI. Threadline does not provide its own standalone interactive login or token-acquisition flow, and `threadline login store` only stores a bearer token that you supply on stdin.
+
 Here, stdin means you pass token text into the command by piping it from another command or redirecting it from a file, rather than typing the bearer token as a command-line flag.
 
 ```bash
