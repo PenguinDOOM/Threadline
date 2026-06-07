@@ -667,7 +667,7 @@ async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_do
 }
 
 #[tokio::test]
-async fn upstream_response_failed_emits_a_stable_sse_error() {
+async fn upstream_response_failed_emits_response_failed_terminal_event() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -679,7 +679,7 @@ async fn upstream_response_failed_emits_a_stable_sse_error() {
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("failure request");
     server
-        .send_text(r#"{"type":"response.failed","response":{"id":"response-1"},"error":{"message":"failed"}}"#)
+        .send_text(r#"{"type":"response.failed","response":{"id":"response-1"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
         .await;
 
     let body = to_bytes(response.into_body(), usize::MAX)
@@ -687,11 +687,154 @@ async fn upstream_response_failed_emits_a_stable_sse_error() {
         .expect("body");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
-    let payload: Value = serde_json::from_str(data).expect("error json");
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
 
-    assert_eq!(event, "error");
-    assert_eq!(payload["error"]["code"], "upstream_response_failed");
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_eq!(payload["type"], "response.failed");
+    assert_eq!(payload["response"]["id"], "response-1");
+    assert_eq!(payload["response"]["status"], "failed");
+    assert_eq!(payload["response"]["error"]["code"], "upstream_response_failed");
+    assert_eq!(payload["response"]["error"]["message"], "failed");
+    assert_done_frame(frames[1]);
+}
+
+#[tokio::test]
+async fn response_failed_preserves_prior_completed_marker_for_resume() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: Some("turn-state-1".to_string()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&reconnect_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = first_server.recv_client_message().await.expect("seed request");
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let failed = post_responses(
+        app.clone(),
+        json!({
+            "model":"ignored",
+            "input":"failure",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::OK);
+    let failed_payload: Value = serde_json::from_str(&message_text(
+        first_server
+            .recv_client_message()
+            .await
+            .expect("failed request message"),
+    ))
+    .expect("failed request json");
+    assert!(failed_payload.get("response").is_none());
+    assert_eq!(failed_payload["previous_response_id"], "response-1");
+    first_server
+        .send_text(r#"{"type":"response.failed","response":{"id":"response-failed"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
+        .await;
+    let _ = to_bytes(failed.into_body(), usize::MAX)
+        .await
+        .expect("failed body");
+
+    first_server.send_close(1000, "failed turn complete").await;
+    sleep(Duration::from_millis(50)).await;
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"ignored",
+            "input":"resume",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_payload: Value = serde_json::from_str(&message_text(
+        reconnect_server
+            .recv_client_message()
+            .await
+            .expect("resumed request message"),
+    ))
+    .expect("resumed request json");
+    assert!(resumed_payload.get("response").is_none());
+    assert_eq!(resumed_payload["previous_response_id"], "response-1");
+    reconnect_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .await;
+    let _ = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+}
+
+#[tokio::test]
+async fn response_failed_id_is_not_a_continuation_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let failed = post_responses(
+        app.clone(),
+        json!({
+            "model":"ignored",
+            "input":"failure",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("failed request");
+    server
+        .send_text(r#"{"type":"response.failed","response":{"id":"response-failed"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
+        .await;
+    let _ = to_bytes(failed.into_body(), usize::MAX)
+        .await
+        .expect("failed body");
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model":"ignored",
+            "input":"invalid-resume",
+            "previous_response_id":"response-failed"
+        }),
+    )
+    .await;
+
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("rejected body");
+    let payload: Value = serde_json::from_slice(&body).expect("rejected json body");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
 }
 
 #[tokio::test]
