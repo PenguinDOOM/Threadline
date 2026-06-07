@@ -106,6 +106,7 @@ impl CredentialStoreError {
         }
     }
 
+    #[cfg(test)]
     fn kind(&self) -> CredentialStoreErrorKind {
         self.kind
     }

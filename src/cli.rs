@@ -80,7 +80,7 @@ mod login_cli_tests {
     fn server_starts_by_default_without_subcommand() {
         let cli = ThreadlineCli::try_parse_from(["threadline"]).expect("cli should parse");
 
-        assert!(matches!(cli.command, None));
+        assert!(cli.command.is_none());
         assert!(matches!(
             cli.into_action(),
             ThreadlineCliAction::StartServer(_)
