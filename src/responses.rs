@@ -344,7 +344,7 @@ pub async fn responses_handler(
                         ));
                     }
                     "response.failed" => {
-                        state.lease.mark_upstream_terminal().await;
+                        state.lease.mark_upstream_recoverable().await;
                         state.final_done_pending = true;
                         return Some((
                             Ok::<Bytes, std::convert::Infallible>(
