@@ -39,6 +39,17 @@ threadline login logout
 
 `threadline login store` reads the bearer token from stdin and stores it in Threadline's own OS credential-manager entry by default. It does not silently downgrade to file storage. If the OS credential manager is unavailable, the command fails instead of writing credentials somewhere else.
 
+Here, stdin means you pass token text into the command by piping it from another command or redirecting it from a file, rather than typing the bearer token as a command-line flag.
+
+```bash
+printf '%s' 'YOUR_CODEX_BEARER_TOKEN' | threadline login store
+
+threadline login store < bearer-token.txt
+
+# Optional: include a refresh token only if you accept command-line exposure.
+printf '%s' 'YOUR_CODEX_BEARER_TOKEN' | threadline login store --refresh-token YOUR_REFRESH_TOKEN
+```
+
 `threadline login status` reports whether Threadline-owned credentials are available and whether a refresh token is present, without printing token values.
 
 `threadline login logout` deletes only Threadline-owned credentials from the OS credential manager. It does not delete, mutate, or log out Codex credentials.
