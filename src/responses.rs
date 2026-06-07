@@ -8,7 +8,7 @@ use axum::response::IntoResponse;
 use futures_util::future::BoxFuture;
 use futures_util::stream;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
@@ -345,11 +345,11 @@ pub async fn responses_handler(
                     }
                     "response.failed" => {
                         state.lease.mark_upstream_terminal().await;
-                        state.done = true;
+                        state.final_done_pending = true;
                         return Some((
-                            Ok::<Bytes, std::convert::Infallible>(sse_error_chunk(
-                                &ThreadlineError::UpstreamResponseFailed,
-                            )),
+                            Ok::<Bytes, std::convert::Infallible>(
+                                sse_terminal_response_failed_chunk(&parsed),
+                            ),
                             state,
                         ));
                     }
@@ -578,6 +578,56 @@ fn sse_json_chunk(event: &str, payload: &Value) -> Bytes {
 
 fn sse_done_chunk() -> Bytes {
     Bytes::from_static(b"data: [DONE]\n\n")
+}
+
+fn sse_terminal_response_failed_chunk(payload: &Value) -> Bytes {
+    let fallback = ThreadlineError::UpstreamResponseFailed.public_error();
+    let error = payload.get("error");
+    let mut response = Map::new();
+
+    if let Some(response_id) = payload
+        .get("response")
+        .and_then(|value| value.get("id"))
+        .and_then(safe_scalar_field)
+    {
+        response.insert("id".to_string(), Value::String(response_id));
+    }
+
+    response.insert("status".to_string(), Value::String("failed".to_string()));
+    response.insert(
+        "error".to_string(),
+        Value::Object(Map::from_iter([
+            (
+                "code".to_string(),
+                Value::String(
+                    error
+                        .and_then(|value| value.get("code"))
+                        .and_then(safe_scalar_field)
+                        .unwrap_or_else(|| fallback.code.into_owned()),
+                ),
+            ),
+            (
+                "message".to_string(),
+                Value::String(
+                    error
+                        .and_then(|value| value.get("message"))
+                        .and_then(safe_scalar_field)
+                        .unwrap_or_else(|| fallback.message.into_owned()),
+                ),
+            ),
+        ])),
+    );
+
+    sse_json_chunk(
+        "response.failed",
+        &Value::Object(Map::from_iter([
+            (
+                "type".to_string(),
+                Value::String("response.failed".to_string()),
+            ),
+            ("response".to_string(), Value::Object(response)),
+        ])),
+    )
 }
 
 fn safe_scalar_field(value: &Value) -> Option<String> {

@@ -695,7 +695,10 @@ async fn upstream_response_failed_emits_response_failed_terminal_event() {
     assert_eq!(payload["type"], "response.failed");
     assert_eq!(payload["response"]["id"], "response-1");
     assert_eq!(payload["response"]["status"], "failed");
-    assert_eq!(payload["response"]["error"]["code"], "upstream_response_failed");
+    assert_eq!(
+        payload["response"]["error"]["code"],
+        "upstream_response_failed"
+    );
     assert_eq!(payload["response"]["error"]["message"], "failed");
     assert_done_frame(frames[1]);
 }
@@ -718,7 +721,10 @@ async fn response_failed_preserves_prior_completed_marker_for_resume() {
 
     let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
-    let _ = first_server.recv_client_message().await.expect("seed request");
+    let _ = first_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
     first_server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
         .await;
@@ -863,8 +869,17 @@ async fn upstream_error_event_emits_a_single_compact_sse_error() {
     let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
     let payload: Value = serde_json::from_str(data).expect("error json");
 
+    assert_eq!(
+        frames.len(),
+        1,
+        "raw upstream error must not emit terminal response.failed plus DONE frames: {body_text}"
+    );
     assert_eq!(event, "error");
     assert_eq!(payload["error"]["code"], "upstream_error_event");
+    assert!(
+        payload.get("response").is_none(),
+        "raw upstream error must not be rewritten into a response.failed payload: {payload:?}"
+    );
 }
 
 #[tokio::test]
