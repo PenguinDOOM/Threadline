@@ -49,6 +49,10 @@ Keep SSE translation separate from upstream WebSocket frame handling.
 
 When a downstream request includes `previous_response_id`, use it as a continuation marker.
 
+`response.completed.id` is the continuation-safe marker for later `previous_response_id` requests.
+
+If a later turn fails upstream, do not reinterpret that failed turn as a new continuation marker.
+
 A response marker may refer to a retained session that is open, closed but recoverable, missing, or unrecoverable. Handle each state explicitly.
 
 Do not assume that a missing or closed socket means the response marker should be forgotten.
@@ -105,6 +109,10 @@ Do not store secrets in registry entries.
 
 Create or update registry entries when an upstream response reaches a completed state that can be continued.
 
+Do not register upstream failed response ids as continuation markers.
+
+A failed response id may still be emitted downstream for diagnostics when the upstream payload provides one.
+
 Mark entries in use while a downstream request is actively continuing through them.
 
 Release the in-use flag when the request finishes, fails, or is cancelled.
@@ -124,6 +132,8 @@ A conflict should not corrupt the registry entry.
 When continuing from `previous_response_id`, first resolve the marker in the registry.
 
 If the session is open and usable, continue through the retained pump.
+
+If a later upstream turn ends with a recoverable `response.failed`, preserve any earlier completed marker that still identifies the retained session.
 
 If the socket is closed but recoverable metadata exists, attempt recovery or reconnect according to the current protocol implementation.
 
@@ -247,9 +257,25 @@ Raw upstream `error` events may contain sensitive or unstable information.
 
 Log them only at debug or trace level after confirming they do not contain secrets.
 
+Upstream `response.failed` is a separate downstream terminal path from raw upstream `error` events.
+
+When Threadline receives an upstream `response.failed`, forward it downstream as terminal SSE `event: response.failed`.
+
+The downstream payload should keep stable Responses-style fields: top-level `type` set to `response.failed`, `response.status` set to `failed`, and `response.error.code` plus `response.error.message` populated from stable public error wording.
+
+Include `response.id` when the upstream failure payload provides one.
+
+After emitting the terminal `response.failed` event, terminate the stream with downstream `[DONE]`.
+
+Emitting a failed `response.id` downstream does not make that id continuation-safe. Only previously completed markers remain valid for later `previous_response_id` requests.
+
+If a prior completed marker exists and the upstream `response.failed` is recoverable, preserve that earlier marker for later resume or retry.
+
 If an upstream error must be forwarded downstream, normalize it into a stable public error shape.
 
 Do not blindly forward raw upstream errors as public API responses.
+
+Keep raw upstream `error` handling and malformed protocol handling separate from the `response.failed` terminal path unless the protocol implementation is intentionally changed.
 
 Downstream SSE should represent the final client-facing response stream.
 
