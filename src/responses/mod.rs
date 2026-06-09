@@ -7,8 +7,7 @@ use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use futures_util::future::BoxFuture;
 use futures_util::stream;
-use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
@@ -20,6 +19,13 @@ use crate::tools::{
     event_contains_internal_tool_name, inject_internal_tools,
 };
 use crate::ws_pump::LiveUpstreamWebSocket;
+
+mod downstream;
+
+use self::downstream::{
+    parse_downstream_request, safe_scalar_field, sse_done_chunk, sse_error_chunk, sse_json_chunk,
+    sse_terminal_response_failed_chunk,
+};
 
 pub const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
@@ -51,14 +57,6 @@ pub struct ConnectedUpstream {
 pub struct ResponsesRouteState {
     pub registry: Arc<RetainedSessionRegistry>,
     pub services: ThreadlineServices,
-}
-
-#[derive(Debug, Deserialize)]
-struct DownstreamResponsesRequest {
-    #[serde(default)]
-    previous_response_id: Option<String>,
-    #[serde(flatten)]
-    payload: serde_json::Map<String, Value>,
 }
 
 struct ResponseStreamState {
@@ -98,8 +96,7 @@ pub async fn responses_handler(
     State(state): State<ResponsesRouteState>,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<impl IntoResponse, ThreadlineError> {
-    let request = serde_json::from_value::<DownstreamResponsesRequest>(payload)
-        .map_err(|_| ThreadlineError::InvalidResponsesRequest)?;
+    let request = parse_downstream_request(payload)?;
     let mut lease = acquire_lease(&state.registry, request.previous_response_id.as_deref()).await?;
     let auth = state.services.auth_provider().load()?;
     let mut upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
@@ -565,82 +562,4 @@ fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError {
             ThreadlineError::RetainedSessionCapacityExceeded
         }
     }
-}
-
-fn sse_payload_chunk(event: &str, payload: &str) -> Bytes {
-    Bytes::from(format!("event: {event}\ndata: {payload}\n\n"))
-}
-
-fn sse_json_chunk(event: &str, payload: &Value) -> Bytes {
-    let payload = serde_json::to_string(payload).expect("serialize downstream sse payload");
-    sse_payload_chunk(event, &payload)
-}
-
-fn sse_done_chunk() -> Bytes {
-    Bytes::from_static(b"data: [DONE]\n\n")
-}
-
-fn sse_terminal_response_failed_chunk(payload: &Value) -> Bytes {
-    let fallback = ThreadlineError::UpstreamResponseFailed.public_error();
-    let error = payload.get("error");
-    let mut response = Map::new();
-
-    if let Some(response_id) = payload
-        .get("response")
-        .and_then(|value| value.get("id"))
-        .and_then(safe_scalar_field)
-    {
-        response.insert("id".to_string(), Value::String(response_id));
-    }
-
-    response.insert("status".to_string(), Value::String("failed".to_string()));
-    response.insert(
-        "error".to_string(),
-        Value::Object(Map::from_iter([
-            (
-                "code".to_string(),
-                Value::String(
-                    error
-                        .and_then(|value| value.get("code"))
-                        .and_then(safe_scalar_field)
-                        .unwrap_or_else(|| fallback.code.into_owned()),
-                ),
-            ),
-            (
-                "message".to_string(),
-                Value::String(
-                    error
-                        .and_then(|value| value.get("message"))
-                        .and_then(safe_scalar_field)
-                        .unwrap_or_else(|| fallback.message.into_owned()),
-                ),
-            ),
-        ])),
-    );
-
-    sse_json_chunk(
-        "response.failed",
-        &Value::Object(Map::from_iter([
-            (
-                "type".to_string(),
-                Value::String("response.failed".to_string()),
-            ),
-            ("response".to_string(), Value::Object(response)),
-        ])),
-    )
-}
-
-fn safe_scalar_field(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        Value::Bool(flag) => Some(flag.to_string()),
-        _ => None,
-    }
-}
-
-fn sse_error_chunk(error: &ThreadlineError) -> Bytes {
-    let payload = serde_json::to_value(error.public_error_document())
-        .expect("convert threadline error payload to json value");
-    sse_json_chunk("error", &payload)
 }
