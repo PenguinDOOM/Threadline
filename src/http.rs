@@ -110,7 +110,7 @@ struct DefaultAuthProvider;
 
 impl crate::responses::UpstreamAuthProvider for DefaultAuthProvider {
     fn load(&self) -> Result<crate::auth::LoadedUpstreamAuth, ThreadlineError> {
-        load_upstream_auth(&AuthDiscoveryOptions::from_env(None))
+        load_upstream_auth(&AuthDiscoveryOptions::from_env())
             .map_err(|_| ThreadlineError::UpstreamCredentialsUnavailable)
     }
 }

@@ -112,7 +112,7 @@ mod tests {
     fn test_auth() -> LoadedUpstreamAuth {
         LoadedUpstreamAuth {
             bearer_token: "top-secret-token".to_string(),
-            source: AuthSource::ExplicitOverride,
+            source: AuthSource::CodexKeyring,
             refresh_boundary: RefreshBoundary::NotAvailable,
         }
     }
