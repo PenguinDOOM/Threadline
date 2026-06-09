@@ -65,6 +65,5 @@ Run these commands from the Threadline directory:
 ```bash
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --test http_surface
-cargo test --all-targets --all-features
+cargo test --locked --all-targets --all-features
 ```
