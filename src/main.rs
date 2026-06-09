@@ -8,8 +8,7 @@ use threadline::http::build_router;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-const LOGIN_INSTRUCTIONS_MESSAGE: &str =
-    "Threadline does not store credentials. Sign in with Codex Desktop or Codex CLI, then run Threadline again.";
+const LOGIN_INSTRUCTIONS_MESSAGE: &str = "Threadline does not store credentials. Sign in with Codex Desktop or Codex CLI, then run Threadline again.";
 
 #[tokio::main]
 async fn main() -> ExitCode {

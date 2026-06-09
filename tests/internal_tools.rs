@@ -34,7 +34,7 @@ impl UpstreamAuthProvider for StaticAuthProvider {
     fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
         Ok(LoadedUpstreamAuth {
             bearer_token: "test-token".to_string(),
-            source: AuthSource::ExplicitOverride,
+            source: AuthSource::CodexKeyring,
             refresh_boundary: RefreshBoundary::NotAvailable,
         })
     }
