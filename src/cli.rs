@@ -74,7 +74,7 @@ impl ThreadlineCli {
 mod login_cli_tests {
     use clap::Parser;
 
-    use super::{LoginSubcommand, ThreadlineCli, ThreadlineCliAction, ThreadlineCommand};
+    use super::{ThreadlineCli, ThreadlineCliAction, ThreadlineCommand};
 
     #[test]
     fn server_starts_by_default_without_subcommand() {
@@ -111,65 +111,25 @@ mod login_cli_tests {
     }
 
     #[test]
-    fn login_command_parses_store_status_and_logout_actions() {
-        let store = ThreadlineCli::try_parse_from([
-            "threadline",
-            "login",
-            "store",
-            "--refresh-token",
-            "refresh-value",
-        ])
-        .expect("store command should parse");
-        let status = ThreadlineCli::try_parse_from(["threadline", "login", "status"])
-            .expect("status command should parse");
-        let logout = ThreadlineCli::try_parse_from(["threadline", "login", "logout"])
-            .expect("logout command should parse");
+    fn login_command_accepts_bare_login_only() {
+        let cli =
+            ThreadlineCli::try_parse_from(["threadline", "login"]).expect("login should parse");
 
         assert!(matches!(
-            store.command,
-            Some(ThreadlineCommand::Login(command))
-                if matches!(command.action, LoginSubcommand::Store(_))
-        ));
-        assert!(matches!(
-            status.command,
-            Some(ThreadlineCommand::Login(command))
-                if matches!(command.action, LoginSubcommand::Status)
-        ));
-        assert!(matches!(
-            logout.command,
-            Some(ThreadlineCommand::Login(command))
-                if matches!(command.action, LoginSubcommand::Logout)
+            cli.command,
+            Some(ThreadlineCommand::Login(_))
         ));
     }
 
     #[test]
-    fn login_store_rejects_visible_token_flag() {
-        let error = ThreadlineCli::try_parse_from([
-            "threadline",
-            "login",
-            "store",
-            "--token",
-            "token-value",
-        ])
-        .expect_err("visible token flag should no longer parse");
-
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn login_store_command_debug_redacts_refresh_token() {
-        let store = ThreadlineCli::try_parse_from([
-            "threadline",
-            "login",
-            "store",
-            "--refresh-token",
-            "refresh-value",
-        ])
-        .expect("store command should parse");
-
-        let debug = format!("{store:?}");
-
-        assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains("refresh-value"));
+    fn login_command_rejects_removed_nested_subcommands() {
+        for command in [
+            ["threadline", "login", "store"],
+            ["threadline", "login", "status"],
+            ["threadline", "login", "logout"],
+        ] {
+            ThreadlineCli::try_parse_from(command)
+                .expect_err("removed login subcommand should not parse");
+        }
     }
 }

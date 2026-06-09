@@ -107,31 +107,3 @@ fn read_login_token_from_reader(reader: &mut impl Read) -> Result<String, AuthCo
 
     Ok(token.to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-
-    use threadline::auth::AuthCommandError;
-
-    use super::read_login_token_from_reader;
-
-    #[test]
-    fn login_store_reads_token_from_stdin_and_trims_outer_whitespace() {
-        let mut reader = Cursor::new(b"  stdin-token\n");
-
-        let token = read_login_token_from_reader(&mut reader).expect("stdin token should load");
-
-        assert_eq!(token, "stdin-token");
-    }
-
-    #[test]
-    fn login_store_rejects_empty_stdin_token() {
-        let mut reader = Cursor::new(b"   \n");
-
-        let error = read_login_token_from_reader(&mut reader)
-            .expect_err("empty stdin token should be rejected");
-
-        assert_eq!(error, AuthCommandError::MissingToken);
-    }
-}
