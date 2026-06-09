@@ -1,6 +1,4 @@
-use std::fmt;
-
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 
 use crate::config::ThreadlineConfig;
 
@@ -16,56 +14,20 @@ pub struct ThreadlineCli {
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum ThreadlineCommand {
-    Login(LoginCommand),
-}
-
-#[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct LoginCommand {
-    #[command(subcommand)]
-    pub action: LoginSubcommand,
-}
-
-#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
-pub enum LoginSubcommand {
-    Store(LoginStoreCommand),
-    Status,
-    Logout,
-}
-
-#[derive(Clone, Args, PartialEq, Eq)]
-pub struct LoginStoreCommand {
-    #[arg(long)]
-    pub refresh_token: Option<String>,
-}
-
-impl fmt::Debug for LoginStoreCommand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LoginStoreCommand")
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "[redacted]"),
-            )
-            .finish()
-    }
+    Login,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadlineCliAction {
     StartServer(ThreadlineConfig),
-    LoginStore(LoginStoreCommand),
-    LoginStatus,
-    LoginLogout,
+    LoginInstructions,
 }
 
 impl ThreadlineCli {
     pub fn into_action(self) -> ThreadlineCliAction {
         match self.command {
             None => ThreadlineCliAction::StartServer(self.server),
-            Some(ThreadlineCommand::Login(command)) => match command.action {
-                LoginSubcommand::Store(command) => ThreadlineCliAction::LoginStore(command),
-                LoginSubcommand::Status => ThreadlineCliAction::LoginStatus,
-                LoginSubcommand::Logout => ThreadlineCliAction::LoginLogout,
-            },
+            Some(ThreadlineCommand::Login) => ThreadlineCliAction::LoginInstructions,
         }
     }
 }
@@ -115,10 +77,8 @@ mod login_cli_tests {
         let cli =
             ThreadlineCli::try_parse_from(["threadline", "login"]).expect("login should parse");
 
-        assert!(matches!(
-            cli.command,
-            Some(ThreadlineCommand::Login(_))
-        ));
+        assert!(matches!(cli.command, Some(ThreadlineCommand::Login)));
+        assert_eq!(cli.into_action(), ThreadlineCliAction::LoginInstructions);
     }
 
     #[test]
