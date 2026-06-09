@@ -100,7 +100,7 @@ impl ThreadlineError {
         match self {
             Self::ResponsesNotReady => StatusCode::NOT_IMPLEMENTED,
             Self::InvalidResponsesRequest => StatusCode::BAD_REQUEST,
-            Self::PreviousResponseNotFound => StatusCode::NOT_FOUND,
+            Self::PreviousResponseNotFound => StatusCode::BAD_REQUEST,
             Self::RetainedSessionConflict => StatusCode::CONFLICT,
             Self::RetainedSessionCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamWebSocketConnectFailed => StatusCode::BAD_GATEWAY,

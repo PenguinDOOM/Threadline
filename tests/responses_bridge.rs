@@ -317,7 +317,7 @@ async fn missing_previous_response_id_returns_stable_not_found() {
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
@@ -835,7 +835,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
     )
     .await;
 
-    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(rejected.into_body(), usize::MAX)
         .await
         .expect("rejected body");
@@ -965,7 +965,7 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
         }),
     )
     .await;
-    assert_eq!(retried.status(), StatusCode::NOT_FOUND);
+    assert_eq!(retried.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(retried.into_body(), usize::MAX)
         .await
         .expect("retry body");
