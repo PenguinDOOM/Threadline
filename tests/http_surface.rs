@@ -1,10 +1,41 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use futures_util::future::BoxFuture;
 use serde_json::Value;
+use std::sync::Arc;
 use tower::ServiceExt;
 
+use threadline::auth::LoadedUpstreamAuth;
+use threadline::codex_ws::UpstreamSessionDescriptor;
 use threadline::config::ThreadlineConfig;
+use threadline::errors::ThreadlineError;
 use threadline::http::build_router;
+use threadline::http::build_router_with_services;
+use threadline::responses::{
+    ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
+};
+
+#[derive(Clone)]
+struct MissingAuthProvider;
+
+impl UpstreamAuthProvider for MissingAuthProvider {
+    fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
+        Err(ThreadlineError::UpstreamCredentialsUnavailable)
+    }
+}
+
+#[derive(Clone)]
+struct UnusedConnector;
+
+impl UpstreamConnector for UnusedConnector {
+    fn connect(
+        &self,
+        _auth: LoadedUpstreamAuth,
+        _session: Option<UpstreamSessionDescriptor>,
+    ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+        Box::pin(async { panic!("connector should not be called when auth loading fails") })
+    }
+}
 
 #[tokio::test]
 async fn health_endpoint_reports_ok() {
@@ -59,8 +90,12 @@ async fn models_endpoint_returns_configured_model() {
 }
 
 #[tokio::test]
-async fn responses_endpoint_reports_configuration_error_when_upstream_url_is_missing() {
-    let app = build_router(ThreadlineConfig::default());
+async fn responses_endpoint_reports_configuration_error_when_upstream_credentials_are_unavailable()
+{
+    let app = build_router_with_services(
+        ThreadlineConfig::default(),
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
 
     let response = app
         .oneshot(
@@ -79,10 +114,10 @@ async fn responses_endpoint_reports_configuration_error_when_upstream_url_is_mis
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(payload["error"]["code"], "configuration_error");
+    assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
     assert_eq!(payload["error"]["type"], "configuration_error");
     assert_eq!(
         payload["error"]["message"],
-        "Threadline is missing THREADLINE_UPSTREAM_URL for upstream websocket connections."
+        "Threadline could not load upstream credentials."
     );
 }

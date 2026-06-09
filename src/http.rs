@@ -21,6 +21,7 @@ use crate::responses::{
 use crate::ws_pump::LiveUpstreamWebSocket;
 
 const MODEL_CREATED_UNSPECIFIED: u64 = 0;
+const DEFAULT_UPSTREAM_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
 
 #[derive(Clone)]
 struct AppState {
@@ -119,6 +120,13 @@ struct DefaultUpstreamConnector {
     codex_client_version: String,
 }
 
+impl DefaultUpstreamConnector {
+    fn upstream_url() -> String {
+        std::env::var("THREADLINE_UPSTREAM_URL")
+            .unwrap_or_else(|_| DEFAULT_UPSTREAM_URL.to_string())
+    }
+}
+
 fn upstream_connect_error_kind(error: &TungsteniteError) -> &'static str {
     match error {
         TungsteniteError::ConnectionClosed => "connection_closed",
@@ -167,8 +175,7 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
         let codex_client_version = self.codex_client_version.clone();
 
         Box::pin(async move {
-            let upstream_url = std::env::var("THREADLINE_UPSTREAM_URL")
-                .map_err(|_| ThreadlineError::UpstreamUrlMissing)?;
+            let upstream_url = Self::upstream_url();
             let handshake =
                 build_handshake_request(&upstream_url, &auth, &codex_client_version, session)
                     .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
@@ -194,9 +201,33 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
 mod tests {
     use axum::http::Response;
     use axum::http::StatusCode;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
     use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 
     use super::*;
+
+    static UPSTREAM_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct UpstreamUrlEnvGuard {
+        original: Option<OsString>,
+    }
+
+    impl UpstreamUrlEnvGuard {
+        fn acquire() -> Self {
+            let original = std::env::var_os("THREADLINE_UPSTREAM_URL");
+            Self { original }
+        }
+    }
+
+    impl Drop for UpstreamUrlEnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe { std::env::set_var("THREADLINE_UPSTREAM_URL", value) },
+                None => unsafe { std::env::remove_var("THREADLINE_UPSTREAM_URL") },
+            }
+        }
+    }
 
     #[test]
     fn upstream_http_connect_error_maps_to_status_error() {
@@ -241,6 +272,35 @@ mod tests {
         assert_eq!(
             upstream_connect_error_kind(&TungsteniteError::ConnectionClosed),
             "connection_closed"
+        );
+    }
+
+    #[test]
+    fn upstream_url_uses_default_when_env_is_unset() {
+        let _lock = UPSTREAM_URL_ENV_LOCK.lock().unwrap();
+        let _guard = UpstreamUrlEnvGuard::acquire();
+        unsafe { std::env::remove_var("THREADLINE_UPSTREAM_URL") };
+
+        assert_eq!(
+            DefaultUpstreamConnector::upstream_url(),
+            DEFAULT_UPSTREAM_URL
+        );
+    }
+
+    #[test]
+    fn upstream_url_prefers_env_override_when_present() {
+        let _lock = UPSTREAM_URL_ENV_LOCK.lock().unwrap();
+        let _guard = UpstreamUrlEnvGuard::acquire();
+        unsafe {
+            std::env::set_var(
+                "THREADLINE_UPSTREAM_URL",
+                "wss://example.invalid/backend-api/codex/responses",
+            )
+        };
+
+        assert_eq!(
+            DefaultUpstreamConnector::upstream_url(),
+            "wss://example.invalid/backend-api/codex/responses"
         );
     }
 }
