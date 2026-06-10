@@ -27,6 +27,9 @@ pub enum ThreadlineError {
     #[error("The /v1/responses request body was not a valid JSON object.")]
     InvalidResponsesRequest,
 
+    #[error("The /v1/responses request must include a supported string model.")]
+    InvalidModel,
+
     #[error(
         "Threadline could not find the retained session for the supplied previous_response_id."
     )]
@@ -100,6 +103,7 @@ impl ThreadlineError {
         match self {
             Self::ResponsesNotReady => StatusCode::NOT_IMPLEMENTED,
             Self::InvalidResponsesRequest => StatusCode::BAD_REQUEST,
+            Self::InvalidModel => StatusCode::BAD_REQUEST,
             Self::PreviousResponseNotFound => StatusCode::BAD_REQUEST,
             Self::RetainedSessionConflict => StatusCode::CONFLICT,
             Self::RetainedSessionCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
@@ -131,6 +135,11 @@ impl ThreadlineError {
             Self::InvalidResponsesRequest => borrowed_public_error(
                 "invalid_request_error",
                 "The /v1/responses request body must be a JSON object.",
+                "invalid_request_error",
+            ),
+            Self::InvalidModel => borrowed_public_error(
+                "invalid_model",
+                "The /v1/responses request must include a supported string model.",
                 "invalid_request_error",
             ),
             Self::PreviousResponseNotFound => borrowed_public_error(

@@ -9,6 +9,7 @@ use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
 use crate::errors::ThreadlineError;
+use crate::models::validate_request_model;
 use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
 use crate::tools::inject_internal_tools;
 use crate::ws_pump::LiveUpstreamWebSocket;
@@ -38,6 +39,7 @@ pub async fn responses_handler(
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<impl IntoResponse, ThreadlineError> {
     let request = parse_downstream_request(payload)?;
+    validate_request_model(&request.payload)?;
     let mut lease = acquire_lease(&state.registry, request.previous_response_id.as_deref()).await?;
     let auth = state.services.auth_provider().load()?;
     let mut upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
