@@ -20,47 +20,93 @@ static ACTIVE_JOB_MANAGER_CONFIG: LazyLock<Mutex<ThreadlineJobManagerConfig>> =
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct ThreadlineConfig {
-    #[arg(long, env = "THREADLINE_HOST", default_value = DEFAULT_HOST)]
+    #[arg(
+        long,
+        env = "THREADLINE_HOST",
+        default_value = DEFAULT_HOST,
+        value_name = "IP_ADDRESS",
+        help = "Listen address for the downstream HTTP server.",
+        long_help = "Listen address for the downstream HTTP server. Use an IP address that Threadline should bind for local /v1/responses requests."
+    )]
     pub host: String,
 
-    #[arg(long, env = "THREADLINE_PORT", default_value_t = DEFAULT_PORT)]
+    #[arg(
+        long,
+        env = "THREADLINE_PORT",
+        default_value_t = DEFAULT_PORT,
+        value_name = "PORT",
+        help = "Listen port for the downstream HTTP server.",
+        long_help = "Listen port for the downstream HTTP server. This controls which local TCP port accepts /v1/responses requests."
+    )]
     pub port: u16,
 
     #[arg(
         long,
         env = "THREADLINE_CODEX_CLIENT_VERSION",
-        default_value = DEFAULT_CODEX_CLIENT_VERSION
+        default_value = DEFAULT_CODEX_CLIENT_VERSION,
+        value_name = "VERSION",
+        help = "Codex client version sent to the upstream backend.",
+        long_help = "Codex client version sent to the upstream backend. Set this when Threadline must match the Codex client version expected by the backend."
     )]
     pub codex_client_version: String,
 
     #[arg(
         long,
         env = "THREADLINE_RETAINED_SESSION_CAPACITY",
-        default_value_t = DEFAULT_RETAINED_SESSION_CAPACITY
+        default_value_t = DEFAULT_RETAINED_SESSION_CAPACITY,
+        value_name = "COUNT",
+        help = "Maximum retained session capacity for response continuation.",
+        long_help = "Maximum retained session capacity for response continuation. Higher values allow more completed response markers to keep a retained session available for follow-up requests."
     )]
     pub retained_session_capacity: usize,
 
-    #[arg(long, env = "THREADLINE_JOBS_ENABLED", default_value_t = DEFAULT_JOBS_ENABLED)]
+    #[arg(
+        long,
+        env = "THREADLINE_JOBS_ENABLED",
+        default_value_t = DEFAULT_JOBS_ENABLED,
+        value_name = "BOOL",
+        help = "Enable local job execution support.",
+        long_help = "Enable local job execution support. When enabled, Threadline may expose job tools for long-running local work instead of blocking a response."
+    )]
     pub jobs_enabled: bool,
 
     #[arg(
         long,
         env = "THREADLINE_JOB_OUTPUT_BUFFER_LIMIT_BYTES",
-        default_value_t = DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES
+        default_value_t = DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,
+        value_name = "BYTES",
+        help = "Maximum buffered job output in bytes.",
+        long_help = "Maximum buffered job output in bytes. Older job output is dropped once the retained in-memory job output buffer reaches this byte limit."
     )]
     pub job_output_buffer_limit_bytes: usize,
 
     #[arg(
         long,
         env = "THREADLINE_JOB_RETENTION_TTL_SECS",
-        default_value_t = DEFAULT_JOB_RETENTION_TTL_SECS
+        default_value_t = DEFAULT_JOB_RETENTION_TTL_SECS,
+        value_name = "SECONDS",
+        help = "Job retention time in seconds after completion.",
+        long_help = "Job retention time in seconds after completion. Finished job metadata and buffered output remain available until this retention window expires."
     )]
     pub job_retention_ttl_secs: u64,
 
-    #[arg(long, env = "THREADLINE_JOB_ALLOWED_COMMANDS")]
+    #[arg(
+        long,
+        env = "THREADLINE_JOB_ALLOWED_COMMANDS",
+        value_name = "PROGRAMS",
+        help = "Comma-separated exact program names allowed for jobs.",
+        long_help = "Comma-separated exact executable or program names allowed for jobs. Each configured entry is matched against the requested program name exactly."
+    )]
     pub job_allowed_commands: Option<String>,
 
-    #[arg(long, env = "THREADLINE_LOG_LEVEL", default_value = DEFAULT_LOG_LEVEL)]
+    #[arg(
+        long,
+        env = "THREADLINE_LOG_LEVEL",
+        default_value = DEFAULT_LOG_LEVEL,
+        value_name = "LEVEL",
+        help = "Log verbosity for Threadline diagnostics.",
+        long_help = "Log verbosity for Threadline diagnostics. Use standard Rust tracing levels such as error, warn, info, debug, or trace."
+    )]
     pub log_level: String,
 }
 

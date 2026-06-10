@@ -16,13 +16,19 @@ It does not implement unrelated providers or historical compatibility layers.
 
 ## Configuration
 
-Threadline reads configuration from CLI flags or environment variables:
+Threadline reads configuration from CLI flags or environment variables.
 
-- `--host` / `THREADLINE_HOST`
-- `--port` / `THREADLINE_PORT`
-- `--retained-session-capacity` / `THREADLINE_RETAINED_SESSION_CAPACITY`
-- `--jobs-enabled` / `THREADLINE_JOBS_ENABLED`
-- `--log-level` / `THREADLINE_LOG_LEVEL`
+| Flag | Environment variable | Stable default | Description |
+| --- | --- | --- | --- |
+| `--host` | `THREADLINE_HOST` | `127.0.0.1` | Listen address for the downstream HTTP server that accepts local `/v1/responses` requests. |
+| `--port` | `THREADLINE_PORT` | `8100` | Listen port for the downstream HTTP server. |
+| `--codex-client-version` | `THREADLINE_CODEX_CLIENT_VERSION` | `0.136.0` | Codex client version Threadline sends to the upstream backend for compatibility. |
+| `--retained-session-capacity` | `THREADLINE_RETAINED_SESSION_CAPACITY` | `64` | Maximum number of retained sessions kept available for response continuation. |
+| `--jobs-enabled` | `THREADLINE_JOBS_ENABLED` | `false` | Enables local job execution support for long-running work. |
+| `--job-output-buffer-limit-bytes` | `THREADLINE_JOB_OUTPUT_BUFFER_LIMIT_BYTES` | `32768` | Maximum in-memory buffered job output before older output is dropped. |
+| `--job-retention-ttl-secs` | `THREADLINE_JOB_RETENTION_TTL_SECS` | `300` | How long completed job metadata and buffered output remain available after completion. |
+| `--job-allowed-commands` | `THREADLINE_JOB_ALLOWED_COMMANDS` | None | comma-separated exact program names allowed for jobs. Each configured entry is matched against the requested program name exactly. |
+| `--log-level` | `THREADLINE_LOG_LEVEL` | `info` | Threadline log verbosity. Supported Rust tracing levels include `error`, `warn`, `info`, `debug`, and `trace`. |
 
 Threadline does not accept an arbitrary model override through CLI flags or environment variables.
 

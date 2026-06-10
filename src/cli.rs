@@ -3,7 +3,11 @@ use clap::{Parser, Subcommand};
 use crate::config::ThreadlineConfig;
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
-#[command(name = "threadline", about = "Threadline BYOK bridge")]
+#[command(
+    name = "threadline",
+    about = "Bridge VSCode BYOK /v1/responses requests to Codex upstream sessions.",
+    long_about = "Bridge VSCode BYOK /v1/responses requests to Codex upstream sessions. Run without a subcommand to start the local downstream server."
+)]
 pub struct ThreadlineCli {
     #[command(flatten)]
     pub server: ThreadlineConfig,
@@ -14,6 +18,10 @@ pub struct ThreadlineCli {
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum ThreadlineCommand {
+    #[command(
+        about = "Show sign in guidance for Codex credentials.",
+        long_about = "Show sign in guidance for Codex credentials. This command provides informational instructions only and does not store, delete, or inspect credentials."
+    )]
     Login,
 }
 
