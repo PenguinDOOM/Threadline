@@ -1,6 +1,6 @@
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, Response, StatusCode};
-use futures_util::future::BoxFuture;
+use futures_util::{StreamExt, future::BoxFuture};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -172,6 +172,29 @@ fn assert_done_frame(frame: &str) {
         frame, "data: [DONE]",
         "expected a bare downstream DONE frame without an event line"
     );
+}
+
+async fn next_sse_frame(
+    body_stream: &mut (impl futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin),
+    pending: &mut String,
+) -> String {
+    loop {
+        if let Some(frame_end) = pending.find("\n\n") {
+            let frame = pending[..frame_end].to_string();
+            pending.drain(..frame_end + 2);
+            if !frame.trim().is_empty() {
+                return frame;
+            }
+            continue;
+        }
+
+        let chunk = match body_stream.next().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(error)) => panic!("expected SSE chunk, got body error: {error}"),
+            None => panic!("expected another SSE frame before EOF"),
+        };
+        pending.push_str(std::str::from_utf8(&chunk).expect("utf8 sse chunk"));
+    }
 }
 
 #[tokio::test]
@@ -483,6 +506,194 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
     assert_done_frame(frames[2]);
     assert!(!body_text.contains("  \"type\": \"response.output_item.done\""));
     assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn non_internal_tool_added_and_done_events_stream_before_response_completed() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "stream observed downstream tool events",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "downstream_tool",
+                    "description": "visible tool",
+                    "parameters": {"type": "object"}
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body_stream = response.into_body().into_data_stream();
+    let mut pending = String::new();
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-visible","name":"downstream_tool","arguments":"{}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-visible","name":"downstream_tool","arguments":"{}"}}"#,
+        )
+        .await;
+    let added_payload = json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-visible",
+            "name": "downstream_tool",
+            "arguments": "{}"
+        }
+    });
+    let done_payload = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-visible",
+            "name": "downstream_tool",
+            "arguments": "{}"
+        }
+    });
+    let completed_payload = json!({
+        "type": "response.completed",
+        "response": {"id": "response-visible"}
+    });
+
+    let added_frame = next_sse_frame(&mut body_stream, &mut pending).await;
+    let (added_event, added_data) = sse_event_and_data(&added_frame);
+    assert_eq!(added_event, "response.output_item.added");
+    assert_eq!(added_data, added_payload.to_string());
+
+    let done_frame = next_sse_frame(&mut body_stream, &mut pending).await;
+    let (done_event, done_data) = sse_event_and_data(&done_frame);
+    assert_eq!(done_event, "response.output_item.done");
+    assert_eq!(done_data, done_payload.to_string());
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-visible"}}"#)
+        .await;
+
+    let completed_frame = next_sse_frame(&mut body_stream, &mut pending).await;
+    let (completed_event, completed_data) = sse_event_and_data(&completed_frame);
+    assert_eq!(completed_event, "response.completed");
+    assert_eq!(completed_data, completed_payload.to_string());
+
+    let done_sentinel = next_sse_frame(&mut body_stream, &mut pending).await;
+    assert_done_frame(&done_sentinel);
+    assert!(
+        body_stream.next().await.is_none(),
+        "expected EOF after DONE"
+    );
+    assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn internal_tool_added_and_done_events_stay_hidden_until_intermediate_completion() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "run hidden internal tool loop",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+
+    assert!(
+        server.take_pending_client_messages().await.is_empty(),
+        "expected no follow-up request before the intermediate completion arrives"
+    );
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+
+    let followup_input = followup_request["input"]
+        .as_array()
+        .expect("followup input array");
+    assert_eq!(followup_input.len(), 1);
+    assert_eq!(followup_input[0]["type"], "function_call_output");
+    assert_eq!(followup_input[0]["call_id"], "call-1");
+    assert_eq!(followup_input[0]["output"], "alpha");
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"final answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let delta_frame = sse_event_and_data(frames[0]);
+    let completed_frame = sse_event_and_data(frames[1]);
+
+    assert_eq!(frames.len(), 3);
+    assert_eq!(delta_frame.0, "response.output_text.delta");
+    assert_eq!(
+        serde_json::from_str::<Value>(delta_frame.1).expect("delta json"),
+        json!({"type":"response.output_text.delta","delta":"final answer"})
+    );
+    assert_eq!(completed_frame.0, "response.completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(completed_frame.1).expect("completed json"),
+        json!({"type":"response.completed","response":{"id":"response-final"}})
+    );
+    assert_done_frame(frames[2]);
+    assert!(!body_text.contains("response.output_item.added"));
+    assert!(!body_text.contains("response.output_item.done"));
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("response-intermediate"));
 }
 
 #[test]
