@@ -5,13 +5,11 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
-use futures_util::future::BoxFuture;
 use futures_util::stream;
 use serde_json::Value;
 use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
-use crate::codex_ws::UpstreamSessionDescriptor;
 use crate::errors::ThreadlineError;
 use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
 use crate::tools::{
@@ -21,37 +19,19 @@ use crate::tools::{
 use crate::ws_pump::LiveUpstreamWebSocket;
 
 mod downstream;
+mod upstream;
 
 use self::downstream::{
     parse_downstream_request, safe_scalar_field, sse_done_chunk, sse_error_chunk, sse_json_chunk,
     sse_terminal_response_failed_chunk,
 };
+use self::upstream::{send_followup_tool_outputs, send_response_create};
+
+pub use self::upstream::{
+    ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
+};
 
 pub const TURN_STATE_HEADER: &str = "x-codex-turn-state";
-
-pub trait UpstreamAuthProvider: Send + Sync {
-    fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError>;
-}
-
-pub trait UpstreamConnector: Send + Sync {
-    fn connect(
-        &self,
-        auth: LoadedUpstreamAuth,
-        session: Option<UpstreamSessionDescriptor>,
-    ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>>;
-}
-
-#[derive(Clone)]
-pub struct ThreadlineServices {
-    auth_provider: Arc<dyn UpstreamAuthProvider>,
-    connector: Arc<dyn UpstreamConnector>,
-}
-
-pub struct ConnectedUpstream {
-    pub websocket: Arc<LiveUpstreamWebSocket>,
-    pub session: UpstreamSessionDescriptor,
-    pub turn_state: Option<String>,
-}
 
 #[derive(Clone)]
 pub struct ResponsesRouteState {
@@ -70,26 +50,6 @@ struct ResponseStreamState {
     reconnect_attempted: bool,
     final_done_pending: bool,
     done: bool,
-}
-
-impl ThreadlineServices {
-    pub fn new(
-        auth_provider: Arc<dyn UpstreamAuthProvider>,
-        connector: Arc<dyn UpstreamConnector>,
-    ) -> Self {
-        Self {
-            auth_provider,
-            connector,
-        }
-    }
-
-    pub fn auth_provider(&self) -> &Arc<dyn UpstreamAuthProvider> {
-        &self.auth_provider
-    }
-
-    pub fn connector(&self) -> &Arc<dyn UpstreamConnector> {
-        &self.connector
-    }
 }
 
 pub async fn responses_handler(
@@ -312,11 +272,12 @@ pub async fn responses_handler(
                             };
 
                             let outputs = mem::take(&mut state.pending_internal_outputs);
+                            let followup_input = build_followup_input(outputs);
                             if let Err(error) = send_followup_tool_outputs(
                                 &state.upstream,
                                 &state.base_request,
                                 response_id,
-                                outputs,
+                                followup_input,
                             )
                             .await
                             {
@@ -494,64 +455,6 @@ async fn ensure_upstream(
         .replace_upstream(Some(Arc::clone(&connected.websocket)))
         .await;
     Ok(connected.websocket)
-}
-
-async fn send_response_create(
-    upstream: &LiveUpstreamWebSocket,
-    response_payload: &serde_json::Map<String, Value>,
-) -> Result<(), ThreadlineError> {
-    let mut outbound = response_payload.clone();
-    remove_codex_unsupported_response_fields(&mut outbound);
-    outbound.insert("store".to_string(), Value::Bool(false));
-    match outbound.get("instructions") {
-        Some(Value::Null) | None => {
-            outbound.insert("instructions".to_string(), Value::String(String::new()));
-        }
-        Some(_) => {}
-    }
-    outbound.insert(
-        "type".to_string(),
-        Value::String("response.create".to_string()),
-    );
-    upstream
-        .send_text(Value::Object(outbound).to_string())
-        .await
-        .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)
-}
-
-const CODEX_UNSUPPORTED_RESPONSE_FIELDS: [&str; 4] = [
-    "max_output_tokens",
-    "max_tokens",
-    "max_completion_tokens",
-    "truncation",
-];
-
-fn remove_codex_unsupported_response_fields(payload: &mut serde_json::Map<String, Value>) {
-    for field_name in CODEX_UNSUPPORTED_RESPONSE_FIELDS {
-        payload.remove(field_name);
-    }
-}
-
-async fn send_followup_tool_outputs(
-    upstream: &LiveUpstreamWebSocket,
-    base_request: &serde_json::Map<String, Value>,
-    previous_response_id: &str,
-    outputs: Vec<PendingInternalToolOutput>,
-) -> Result<(), ThreadlineError> {
-    let output_count = outputs.len();
-    let mut response_payload = base_request.clone();
-    response_payload.insert(
-        "previous_response_id".to_string(),
-        Value::String(previous_response_id.to_string()),
-    );
-    response_payload.insert("input".to_string(), build_followup_input(outputs));
-    send_response_create(upstream, &response_payload).await?;
-    debug!(
-        previous_response_id = %previous_response_id,
-        output_count,
-        "internal_tool_followup_sent"
-    );
-    Ok(())
 }
 
 fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError {
