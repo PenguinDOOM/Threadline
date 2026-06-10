@@ -239,7 +239,7 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
     let first_response =
-        post_responses(app.clone(), json!({"model":"ignored","input":"first"})).await;
+        post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
     assert_eq!(first_response.status(), StatusCode::OK);
 
     let first_payload: Value = serde_json::from_str(&message_text(
@@ -270,7 +270,7 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     let second_response = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"second",
             "previous_response_id":"response-1"
         }),
@@ -310,7 +310,7 @@ async fn missing_previous_response_id_returns_stable_not_found() {
     let response = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"missing",
             "previous_response_id":"response-missing"
         }),
@@ -334,7 +334,7 @@ async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_l
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
@@ -346,7 +346,7 @@ async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_l
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -361,7 +361,7 @@ async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_l
     let conflict = post_responses(
         app.clone(),
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"conflict",
             "previous_response_id":"response-1"
         }),
@@ -375,7 +375,7 @@ async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_l
     let retried = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"retry",
             "previous_response_id":"response-1"
         }),
@@ -399,10 +399,10 @@ async fn retained_session_capacity_exhaustion_returns_503() {
         Arc::new(connector),
     );
 
-    let active = post_responses(app.clone(), json!({"model":"ignored","input":"first"})).await;
+    let active = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
     assert_eq!(active.status(), StatusCode::OK);
 
-    let exhausted = post_responses(app, json!({"model":"ignored","input":"second"})).await;
+    let exhausted = post_responses(app, json!({"model":"gpt-5.4","input":"second"})).await;
     assert_eq!(exhausted.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = to_bytes(exhausted.into_body(), usize::MAX)
         .await
@@ -420,7 +420,7 @@ async fn retained_session_capacity_exhaustion_returns_503() {
 async fn upstream_connect_failure_returns_502() {
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(FailingConnector));
 
-    let response = post_responses(app, json!({"model":"ignored","input":"connect"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"connect"})).await;
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = to_bytes(response.into_body(), usize::MAX)
@@ -442,7 +442,7 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"ignored","input":"pretty-delta"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"pretty-delta"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server
         .recv_client_message()
@@ -529,7 +529,7 @@ async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse()
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"ignored","input":"pretty-completed"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"pretty-completed"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server
         .recv_client_message()
@@ -573,7 +573,7 @@ async fn downstream_completed_and_done_are_separate_body_chunks_before_eof() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"ignored","input":"chunk-boundary"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"chunk-boundary"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server
         .recv_client_message()
@@ -629,7 +629,7 @@ async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_do
 
     let response = post_responses(
         app,
-        json!({"model":"ignored","input":"live-shaped-completed"}),
+        json!({"model":"gpt-5.4","input":"live-shaped-completed"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -675,7 +675,7 @@ async fn upstream_response_failed_emits_response_failed_terminal_event() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"ignored","input":"failure"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"failure"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("failure request");
     server
@@ -719,7 +719,7 @@ async fn response_failed_preserves_prior_completed_marker_for_resume() {
     ]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = first_server
         .recv_client_message()
@@ -735,7 +735,7 @@ async fn response_failed_preserves_prior_completed_marker_for_resume() {
     let failed = post_responses(
         app.clone(),
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
@@ -764,7 +764,7 @@ async fn response_failed_preserves_prior_completed_marker_for_resume() {
     let resumed = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"resume",
             "previous_response_id":"response-1"
         }),
@@ -797,7 +797,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -810,7 +810,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
     let failed = post_responses(
         app.clone(),
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
@@ -828,7 +828,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
     let rejected = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"invalid-resume",
             "previous_response_id":"response-failed"
         }),
@@ -852,7 +852,7 @@ async fn upstream_error_event_emits_a_single_compact_sse_error() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"ignored","input":"error"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"error"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("error request");
     server
@@ -891,7 +891,7 @@ async fn done_sentinel_is_not_forwarded_as_downstream_data() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"ignored","input":"done"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"done"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("done request");
     server.send_text("[DONE]").await;
@@ -919,7 +919,7 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"ignored","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
@@ -931,7 +931,7 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
     let response = post_responses(
         app.clone(),
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"malformed",
             "previous_response_id":"response-1"
         }),
@@ -959,7 +959,7 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
     let retried = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"retry",
             "previous_response_id":"response-1"
         }),
@@ -982,7 +982,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let first = post_responses(app.clone(), json!({"model":"ignored","input":"first"})).await;
+    let first = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
     let _ = server.recv_client_message().await.expect("first request");
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-parent"}}"#)
@@ -994,7 +994,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     let second = post_responses(
         app.clone(),
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"second",
             "previous_response_id":"response-parent"
         }),
@@ -1016,7 +1016,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     let third = post_responses(
         app.clone(),
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"third",
             "previous_response_id":"response-parent"
         }),
@@ -1038,7 +1038,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     let fourth = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"fourth",
             "previous_response_id":"response-child"
         }),
@@ -1074,7 +1074,7 @@ async fn supported_request_fields_are_preserved_while_codex_unsupported_fields_a
         app,
         json!({
             "type":"wrong.type",
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
             "tools":[{
                 "type":"function",
@@ -1155,7 +1155,7 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
         app.clone(),
         json!({
             "type":"wrong.type",
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
             "max_output_tokens":321,
             "max_tokens":654,
@@ -1192,7 +1192,7 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
         app,
         json!({
             "type":"wrong.type",
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello again"}]}],
             "instructions":null,
             "max_output_tokens":654,
@@ -1237,7 +1237,7 @@ async fn explicit_instructions_are_preserved_in_upstream_response_create() {
         app,
         json!({
             "type":"wrong.type",
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":[{"role":"user","content":[{"type":"input_text","text":"preserve me"}]}],
             "instructions":"explicit downstream instructions",
             "max_output_tokens":987,

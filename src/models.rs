@@ -51,25 +51,25 @@ mod tests {
     #[test]
     fn validate_request_model_requires_supported_string_model() {
         assert_eq!(
-            validate_request_model(&json!({}).as_object().unwrap())
+            validate_request_model(json!({}).as_object().unwrap())
                 .unwrap_err()
                 .to_string(),
             "The /v1/responses request must include a supported string model."
         );
         assert_eq!(
-            validate_request_model(&json!({ "model": { "id": "gpt-5.4" } }).as_object().unwrap())
+            validate_request_model(json!({ "model": { "id": "gpt-5.4" } }).as_object().unwrap())
                 .unwrap_err()
                 .to_string(),
             "The /v1/responses request must include a supported string model."
         );
         assert_eq!(
-            validate_request_model(&json!({ "model": "codex-mini-latest" }).as_object().unwrap())
+            validate_request_model(json!({ "model": "codex-mini-latest" }).as_object().unwrap())
                 .unwrap_err()
                 .to_string(),
             "The /v1/responses request must include a supported string model."
         );
         assert_eq!(
-            validate_request_model(&json!({ "model": "gpt-5.4" }).as_object().unwrap()).unwrap(),
+            validate_request_model(json!({ "model": "gpt-5.4" }).as_object().unwrap()).unwrap(),
             "gpt-5.4"
         );
     }

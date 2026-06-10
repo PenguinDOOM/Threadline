@@ -20,10 +20,20 @@ Threadline reads configuration from CLI flags or environment variables:
 
 - `--host` / `THREADLINE_HOST`
 - `--port` / `THREADLINE_PORT`
-- `--model-id` / `THREADLINE_MODEL_ID`
 - `--retained-session-capacity` / `THREADLINE_RETAINED_SESSION_CAPACITY`
 - `--jobs-enabled` / `THREADLINE_JOBS_ENABLED`
 - `--log-level` / `THREADLINE_LOG_LEVEL`
+
+Threadline does not accept an arbitrary model override through CLI flags or environment variables.
+
+## Supported models
+
+Threadline advertises and accepts exactly these model ids:
+
+- `gpt-5.5`
+- `gpt-5.4`
+- `gpt-5.4-mini`
+- `gpt-5.3-codex-spark`
 
 Running `threadline` without a subcommand starts the server. `threadline login` is informational only and prints guidance to sign in with Codex Desktop or Codex CLI.
 

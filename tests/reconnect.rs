@@ -194,7 +194,7 @@ fn assert_done_frame(frame: &str) {
 }
 
 async fn seed_marker(app: axum::Router, server: &ScriptedWebSocketServer, marker: &str) {
-    let response = post_responses(app, json!({"model":"ignored","input":"seed"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"seed"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -217,7 +217,7 @@ async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
     }]);
     let app = build_test_router(Arc::new(connector.clone()));
 
-    let response = post_responses(app, json!({"model":"ignored","input":"first"})).await;
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"first"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = timeout(Duration::from_secs(1), server.recv_client_message())
         .await
@@ -293,7 +293,7 @@ async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstre
     let response = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -398,7 +398,7 @@ async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
     let response = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -479,7 +479,7 @@ async fn reconnect_fallback_attempts_only_once() {
     let response = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -576,7 +576,7 @@ async fn reconnect_fallback_attempts_only_once_after_pre_stream_send_failure() {
     let response = post_responses(
         app,
         json!({
-            "model":"ignored",
+            "model":"gpt-5.4",
             "input":"followup",
             "previous_response_id":"response-1"
         }),

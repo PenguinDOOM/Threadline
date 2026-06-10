@@ -186,7 +186,7 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     let response = post_responses(
         app,
         json!({
-            "model": "ignored",
+            "model": "gpt-5.4",
             "input": "run internal tool loop",
             "max_output_tokens": 512,
             "max_tokens": 256,
@@ -327,7 +327,7 @@ async fn internal_tool_pre_done_events_are_hidden_from_downstream() {
     let response = post_responses(
         app,
         json!({
-            "model": "ignored",
+            "model": "gpt-5.4",
             "input": "run internal tool loop",
         }),
     )
@@ -408,7 +408,7 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
     let response = post_responses(
         app,
         json!({
-            "model": "ignored",
+            "model": "gpt-5.4",
             "input": "run downstream tool",
             "tools": [
                 {
