@@ -68,20 +68,18 @@ pub async fn responses_handler(
         }
     }
 
-    let stream = response_stream(
-        ResponseStreamState {
-            services: state.services.clone(),
-            upstream,
-            lease,
-            base_request: upstream_request,
-            pending_internal_outputs: Vec::new(),
-            previous_response_id: request.previous_response_id,
-            upstream_event_seen: false,
-            reconnect_attempted,
-            final_done_pending: false,
-            done: false,
-        },
-    );
+    let stream = response_stream(ResponseStreamState {
+        services: state.services.clone(),
+        upstream,
+        lease,
+        base_request: upstream_request,
+        pending_internal_outputs: Vec::new(),
+        previous_response_id: request.previous_response_id,
+        upstream_event_seen: false,
+        reconnect_attempted,
+        final_done_pending: false,
+        done: false,
+    });
 
     let response = Response::builder()
         .status(StatusCode::OK)

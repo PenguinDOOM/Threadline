@@ -59,7 +59,7 @@ impl ThreadlineServices {
     }
 }
 
-pub(crate) fn build_response_create_payload(request: Value) -> Result<Value, ThreadlineError> {
+pub(super) fn build_response_create_payload(request: Value) -> Result<Value, ThreadlineError> {
     let mut payload = require_payload_object(request)?;
     payload.insert(
         "type".to_string(),
@@ -75,13 +75,13 @@ pub(crate) fn build_response_create_payload(request: Value) -> Result<Value, Thr
     Ok(Value::Object(payload))
 }
 
-pub(crate) fn remove_codex_unsupported_response_fields(payload: &mut Map<String, Value>) {
+pub(super) fn remove_codex_unsupported_response_fields(payload: &mut Map<String, Value>) {
     for field in UNSUPPORTED_RESPONSE_FIELDS {
         payload.remove(*field);
     }
 }
 
-pub(crate) async fn send_response_create(
+pub(super) async fn send_response_create(
     upstream: &LiveUpstreamWebSocket,
     request_payload: &Map<String, Value>,
 ) -> Result<(), ThreadlineError> {
@@ -93,7 +93,7 @@ pub(crate) async fn send_response_create(
         .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)
 }
 
-pub(crate) fn build_followup_tool_outputs_payload(
+pub(super) fn build_followup_tool_outputs_payload(
     request: Value,
     previous_response_id: &str,
     input: Value,
@@ -107,7 +107,7 @@ pub(crate) fn build_followup_tool_outputs_payload(
     build_response_create_payload(Value::Object(payload))
 }
 
-pub(crate) async fn send_followup_tool_outputs(
+pub(super) async fn send_followup_tool_outputs(
     upstream: &LiveUpstreamWebSocket,
     request_payload: &Map<String, Value>,
     previous_response_id: &str,
