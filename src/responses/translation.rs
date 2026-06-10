@@ -21,6 +21,13 @@ use super::downstream::{
 };
 use super::upstream::{ThreadlineServices, send_followup_tool_outputs};
 
+fn response_id_from_event(event: &Value) -> Option<&str> {
+    event
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .and_then(Value::as_str)
+}
+
 pub(super) struct ResponseStreamState {
     pub(super) services: ThreadlineServices,
     pub(super) upstream: Arc<LiveUpstreamWebSocket>,
@@ -104,6 +111,10 @@ pub(super) fn response_stream(
                 match call.execute() {
                     Ok(output) => {
                         state.pending_internal_outputs.push(output);
+                        debug!(
+                            pending_internal_output_count = state.pending_internal_outputs.len(),
+                            "internal_tool_executed"
+                        );
                         continue;
                     }
                     Err(error) => {
@@ -125,16 +136,13 @@ pub(super) fn response_stream(
             if event_type.starts_with("response.output_item.")
                 && event_contains_internal_tool_name(&parsed)
             {
+                debug!(event_type, "translation_event_suppressed_internal_tool");
                 continue;
             }
 
             match event_type.as_str() {
                 "response.completed" => {
-                    let response_id = parsed
-                        .get("response")
-                        .and_then(|response| response.get("id"))
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string);
+                    let response_id = response_id_from_event(&parsed).map(ToString::to_string);
 
                     if let Some(response_id) = response_id.as_deref() {
                         state.lease.record_completed_marker(response_id).await;
@@ -149,6 +157,12 @@ pub(super) fn response_stream(
                         };
 
                         let outputs = mem::take(&mut state.pending_internal_outputs);
+                        let output_count = outputs.len();
+                        debug!(
+                            response_id,
+                            pending_internal_output_count = output_count,
+                            "intermediate_completion_consumed"
+                        );
                         let followup_input = build_followup_input(outputs);
                         if let Err(error) = send_followup_tool_outputs(
                             &state.upstream,
@@ -162,11 +176,19 @@ pub(super) fn response_stream(
                             state.done = true;
                             return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
                         }
+                        debug!(
+                            response_id,
+                            output_count,
+                            previous_response_id = state.previous_response_id.as_deref(),
+                            "internal_tool_followup_sent"
+                        );
                         continue;
                     }
 
-                    debug!(response_id, "final_response_completed");
+                    debug!(response_id, event_type, "translation_event_forwarded");
+                    debug!(response_id, "terminal_response_forwarded");
                     state.final_done_pending = true;
+                    debug!(response_id, "final_done_queued");
                     return Some((
                         Ok::<Bytes, Infallible>(sse_json_chunk(&event_type, &parsed)),
                         state,
@@ -175,6 +197,8 @@ pub(super) fn response_stream(
                 "response.failed" => {
                     state.lease.mark_upstream_recoverable().await;
                     state.final_done_pending = true;
+                    debug!(event_type, "terminal_response_forwarded");
+                    debug!(event_type, "final_done_queued");
                     return Some((
                         Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(&parsed)),
                         state,
@@ -207,6 +231,7 @@ pub(super) fn response_stream(
                     ));
                 }
                 _ => {
+                    debug!(event_type, "translation_event_forwarded");
                     return Some((
                         Ok::<Bytes, Infallible>(sse_json_chunk(&event_type, &parsed)),
                         state,

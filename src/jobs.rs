@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tracing::debug;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -169,7 +170,17 @@ impl ThreadlineJobManager {
         };
 
         let entry = entry.lock().expect("job entry lock");
+        let effective_offset = offset.max(entry.output.truncated_before);
         let output = entry.output.read_from(offset);
+        debug!(
+            job_id = %entry.job_id,
+            requested_offset = offset,
+            served_from_offset = effective_offset,
+            item_count = output.len(),
+            next_offset = entry.output.next_offset,
+            truncated_before = entry.output.truncated_before,
+            "job_output_offset_served"
+        );
         json!({
             "ok": true,
             "job_id": entry.job_id,
@@ -218,6 +229,11 @@ impl ThreadlineJobManager {
                     message: "The Threadline job was cancelled.".to_string(),
                 });
                 entry.finished_at = Some(Instant::now());
+                debug!(
+                    job_id = %entry.job_id,
+                    terminal_state = JobTerminalState::Cancelled.as_str(),
+                    "job_terminal_state_changed"
+                );
             }
             entry.child.clone()
         };
@@ -334,6 +350,11 @@ impl ManagedJobContext {
         entry.error = None;
         entry.child = None;
         entry.finished_at = Some(Instant::now());
+        debug!(
+            job_id = %entry.job_id,
+            terminal_state = JobTerminalState::Completed.as_str(),
+            "job_terminal_state_changed"
+        );
     }
 
     pub fn fail(&self, code: &'static str, message: impl Into<String>) {
@@ -350,6 +371,12 @@ impl ManagedJobContext {
         });
         entry.child = None;
         entry.finished_at = Some(Instant::now());
+        debug!(
+            job_id = %entry.job_id,
+            terminal_state = JobTerminalState::Failed.as_str(),
+            error_code = code,
+            "job_terminal_state_changed"
+        );
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -366,7 +393,29 @@ impl ManagedJobContext {
             return;
         }
 
+        let start_offset = entry.output.next_offset;
+        let truncated_before = entry.output.truncated_before;
         entry.output.append(stream, text);
+        debug!(
+            job_id = %entry.job_id,
+            stream,
+            byte_count = text.len(),
+            start_offset,
+            next_offset = entry.output.next_offset,
+            truncated_before = entry.output.truncated_before,
+            "job_output_chunk_appended"
+        );
+        if entry.output.truncated_before != truncated_before {
+            debug!(
+                job_id = %entry.job_id,
+                stream,
+                previous_truncated_before = truncated_before,
+                truncated_before = entry.output.truncated_before,
+                next_offset = entry.output.next_offset,
+                buffered_bytes = entry.output.buffered_bytes,
+                "job_output_truncation_advanced"
+            );
+        }
     }
 
     fn attach_child(&self, child: Arc<Mutex<Child>>) {
@@ -395,6 +444,12 @@ impl ManagedJobContext {
         });
         entry.child = None;
         entry.finished_at = Some(Instant::now());
+        debug!(
+            job_id = %entry.job_id,
+            terminal_state = JobTerminalState::Failed.as_str(),
+            error_code = "job_did_not_finalize",
+            "job_terminal_state_changed"
+        );
     }
 }
 
