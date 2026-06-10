@@ -5,6 +5,7 @@ pub mod config;
 pub mod errors;
 pub mod http;
 pub mod jobs;
+pub mod models;
 pub mod registry;
 pub mod responses;
 pub mod tools;

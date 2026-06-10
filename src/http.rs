@@ -14,6 +14,7 @@ use crate::auth::{AuthDiscoveryOptions, load_upstream_auth};
 use crate::codex_ws::build_handshake_request;
 use crate::config::ThreadlineConfig;
 use crate::errors::ThreadlineError;
+use crate::models::supported_model_ids;
 use crate::registry::RetainedSessionRegistry;
 use crate::responses::{
     ConnectedUpstream, ResponsesRouteState, ThreadlineServices, responses_handler,
@@ -25,7 +26,6 @@ const DEFAULT_UPSTREAM_URL: &str = "wss://chatgpt.com/backend-api/codex/response
 
 #[derive(Clone)]
 struct AppState {
-    config: ThreadlineConfig,
     responses: ResponsesRouteState,
 }
 
@@ -70,7 +70,7 @@ pub fn build_router_with_services(
         )),
         services,
     };
-    let state = AppState { config, responses };
+    let state = AppState { responses };
 
     Router::new()
         .route("/health", get(health))
@@ -86,15 +86,18 @@ async fn health() -> Json<HealthPayload> {
     })
 }
 
-async fn models(State(state): State<AppState>) -> Json<ModelListPayload> {
+async fn models() -> Json<ModelListPayload> {
     Json(ModelListPayload {
         object: "list",
-        data: vec![ModelEntry {
-            id: state.config.model_id,
-            object: "model",
-            created: MODEL_CREATED_UNSPECIFIED,
-            owned_by: "threadline",
-        }],
+        data: supported_model_ids()
+            .iter()
+            .map(|model_id| ModelEntry {
+                id: (*model_id).to_string(),
+                object: "model",
+                created: MODEL_CREATED_UNSPECIFIED,
+                owned_by: "threadline",
+            })
+            .collect(),
     })
 }
 

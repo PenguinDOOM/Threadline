@@ -8,7 +8,6 @@ use crate::jobs::ThreadlineJobManagerConfig;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8100;
-const DEFAULT_MODEL_ID: &str = "codex-mini-latest";
 const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.136.0";
 const DEFAULT_RETAINED_SESSION_CAPACITY: usize = 64;
 const DEFAULT_JOBS_ENABLED: bool = false;
@@ -26,9 +25,6 @@ pub struct ThreadlineConfig {
 
     #[arg(long, env = "THREADLINE_PORT", default_value_t = DEFAULT_PORT)]
     pub port: u16,
-
-    #[arg(long, env = "THREADLINE_MODEL_ID", default_value = DEFAULT_MODEL_ID)]
-    pub model_id: String,
 
     #[arg(
         long,
@@ -73,7 +69,6 @@ impl Default for ThreadlineConfig {
         let config = Self {
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
-            model_id: DEFAULT_MODEL_ID.to_string(),
             codex_client_version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
             retained_session_capacity: DEFAULT_RETAINED_SESSION_CAPACITY,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
