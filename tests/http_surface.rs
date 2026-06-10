@@ -1,7 +1,7 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use futures_util::future::BoxFuture;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -37,6 +37,43 @@ impl UpstreamConnector for UnusedConnector {
     }
 }
 
+const SUPPORTED_MODEL_IDS: [&str; 4] =
+    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"];
+
+const UNSUPPORTED_MODEL_IDS: [&str; 4] = [
+    "codex-mini-latest",
+    "gpt-5.5-preview",
+    "codex-threadline-preview",
+    "threadline-test-unsupported",
+];
+
+async fn read_json_body(response: axum::response::Response) -> Value {
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn invalid_model_payload(model: Value) -> Value {
+    json!({ "model": model })
+}
+
+async fn post_responses_json(app: axum::Router, payload: Value) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+fn assert_invalid_model_error(payload: &Value) {
+    assert_eq!(payload["error"]["type"], "invalid_request_error");
+    assert_eq!(payload["error"]["code"], "invalid_model");
+}
+
 #[tokio::test]
 async fn health_endpoint_reports_ok() {
     let app = build_router(ThreadlineConfig::default());
@@ -61,12 +98,8 @@ async fn health_endpoint_reports_ok() {
 }
 
 #[tokio::test]
-async fn models_endpoint_returns_configured_model() {
-    let config = ThreadlineConfig {
-        model_id: "codex-threadline-preview".to_string(),
-        ..ThreadlineConfig::default()
-    };
-    let app = build_router(config);
+async fn models_endpoint_returns_supported_models() {
+    let app = build_router(ThreadlineConfig::default());
 
     let response = app
         .oneshot(
@@ -80,39 +113,153 @@ async fn models_endpoint_returns_configured_model() {
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let payload = read_json_body(response).await;
 
     assert_eq!(payload["object"], "list");
-    assert_eq!(payload["data"][0]["id"], "codex-threadline-preview");
-    assert_eq!(payload["data"][0]["created"], 0);
-    assert_eq!(payload["data"][0]["owned_by"], "threadline");
+    let models = payload["data"].as_array().expect("models list");
+    assert_eq!(models.len(), SUPPORTED_MODEL_IDS.len());
+
+    for (model, expected_id) in models.iter().zip(SUPPORTED_MODEL_IDS) {
+        assert_eq!(model["id"], expected_id);
+        assert_eq!(model["object"], "model");
+        assert_eq!(model["created"], 0);
+        assert_eq!(model["owned_by"], "threadline");
+    }
 }
 
 #[tokio::test]
-async fn responses_endpoint_reports_configuration_error_when_upstream_credentials_are_unavailable()
-{
+async fn responses_endpoint_rejects_missing_model() {
     let app = build_router_with_services(
         ThreadlineConfig::default(),
         ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
     );
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"model":"ignored"}"#))
-                .unwrap(),
+    let response = post_responses_json(app, json!({})).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let payload = read_json_body(response).await;
+    assert_invalid_model_error(&payload);
+}
+
+#[tokio::test]
+async fn responses_endpoint_rejects_non_string_model() {
+    let app = build_router_with_services(
+        ThreadlineConfig::default(),
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+
+    let response =
+        post_responses_json(app, invalid_model_payload(json!({ "id": "gpt-5.4" }))).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let payload = read_json_body(response).await;
+    assert_invalid_model_error(&payload);
+}
+
+#[tokio::test]
+async fn responses_endpoint_rejects_each_unsupported_model() {
+    for model_id in UNSUPPORTED_MODEL_IDS {
+        let app = build_router_with_services(
+            ThreadlineConfig::default(),
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(app, invalid_model_payload(json!(model_id))).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "model_id={model_id}"
+        );
+
+        let payload = read_json_body(response).await;
+        assert_invalid_model_error(&payload);
+    }
+}
+
+#[tokio::test]
+async fn responses_endpoint_rejects_unsupported_model_before_lease_acquisition() {
+    for model_id in UNSUPPORTED_MODEL_IDS {
+        let app = build_router(ThreadlineConfig {
+            retained_session_capacity: 0,
+            ..ThreadlineConfig::default()
+        });
+
+        let response = post_responses_json(
+            app,
+            json!({
+                "model": model_id,
+                "previous_response_id": "response-missing"
+            }),
         )
-        .await
-        .unwrap();
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "model_id={model_id}"
+        );
+
+        let payload = read_json_body(response).await;
+        assert_invalid_model_error(&payload);
+    }
+}
+
+#[tokio::test]
+async fn responses_endpoint_rejects_unsupported_model_before_auth_loading_and_upstream_connection()
+{
+    for model_id in UNSUPPORTED_MODEL_IDS {
+        let app = build_router_with_services(
+            ThreadlineConfig::default(),
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(app, invalid_model_payload(json!(model_id))).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "model_id={model_id}"
+        );
+
+        let payload = read_json_body(response).await;
+        assert_invalid_model_error(&payload);
+    }
+}
+
+#[tokio::test]
+async fn responses_endpoint_accepts_each_supported_model_before_missing_auth_error() {
+    for model_id in SUPPORTED_MODEL_IDS {
+        let app = build_router_with_services(
+            ThreadlineConfig::default(),
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(app, json!({ "model": model_id })).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let payload = read_json_body(response).await;
+        assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
+        assert_eq!(payload["error"]["type"], "configuration_error");
+    }
+}
+
+#[tokio::test]
+async fn responses_endpoint_reports_configuration_error_for_allowed_model_when_upstream_credentials_are_unavailable()
+ {
+    let app = build_router_with_services(
+        ThreadlineConfig::default(),
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+
+    let response = post_responses_json(app, json!({ "model": "gpt-5.4" })).await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let payload = read_json_body(response).await;
 
     assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
     assert_eq!(payload["error"]["type"], "configuration_error");
