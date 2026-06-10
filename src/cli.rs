@@ -64,7 +64,10 @@ mod login_cli_tests {
 
     fn readme_section_containing(readme: &str, needle: &str) -> Option<String> {
         let start = readme.find(needle)?;
-        let section_start = readme[..start].rfind("\n\n").map(|idx| idx + 2).unwrap_or(0);
+        let section_start = readme[..start]
+            .rfind("\n\n")
+            .map(|idx| idx + 2)
+            .unwrap_or(0);
         let section_end = readme[start..]
             .find("\n\n")
             .map(|idx| start + idx)
@@ -289,8 +292,7 @@ mod login_cli_tests {
             "login help should describe informational-only guidance, got {about_text:?}"
         );
         assert!(
-            normalized_about.contains("does not")
-                || normalized_about.contains("without storing"),
+            normalized_about.contains("does not") || normalized_about.contains("without storing"),
             "login help should avoid implying credential storage behavior, got {about_text:?}"
         );
     }
