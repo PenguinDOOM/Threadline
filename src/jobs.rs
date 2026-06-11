@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use tracing::debug;
 use uuid::Uuid;
 
+const JOB_START_NEXT_ACTION_HINT: &str = "This job is running in the background. Continue other useful work if available, then poll status or read output later when needed.";
+
 #[derive(Debug, Clone)]
 pub struct ThreadlineJobManager {
     inner: Arc<ThreadlineJobManagerInner>,
@@ -120,11 +122,7 @@ impl ThreadlineJobManager {
             spawned_context.fail_if_unresolved();
         });
 
-        json!({
-            "ok": true,
-            "job_id": job_id,
-            "status": JobState::Starting.as_str(),
-        })
+        job_started_json(&job_id)
     }
 
     pub fn start_command_json(&self, command: Vec<String>) -> Value {
@@ -150,11 +148,7 @@ impl ThreadlineJobManager {
         let job_id = context.job_id();
         thread::spawn(move || run_command_job(context, command));
 
-        json!({
-            "ok": true,
-            "job_id": job_id,
-            "status": JobState::Starting.as_str(),
-        })
+        job_started_json(&job_id)
     }
 
     pub fn poll_json(&self, job_id: &str) -> Value {
@@ -595,6 +589,15 @@ fn stable_error(code: &'static str, message: &'static str) -> Value {
         "ok": false,
         "code": code,
         "message": message,
+    })
+}
+
+fn job_started_json(job_id: &str) -> Value {
+    json!({
+        "ok": true,
+        "job_id": job_id,
+        "status": JobState::Starting.as_str(),
+        "next_action_hint": JOB_START_NEXT_ACTION_HINT,
     })
 }
 

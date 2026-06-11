@@ -5,6 +5,8 @@ use threadline::jobs::{JobTerminalState, ThreadlineJobManager, ThreadlineJobMana
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
 
+const JOB_START_NEXT_ACTION_HINT: &str = "This job is running in the background. Continue other useful work if available, then poll status or read output later when needed.";
+
 fn shell_program() -> String {
     if cfg!(windows) {
         "pwsh".to_string()
@@ -60,6 +62,28 @@ async fn wait_for_output_items(
     }
 }
 
+async fn wait_for_terminal_result(
+    manager: &ThreadlineJobManager,
+    job_id: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let result = manager.get_result_json(job_id);
+        if result["status"] == "completed"
+            || result["status"] == "failed"
+            || result["status"] == "cancelled"
+        {
+            return result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for terminal job result"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn assert_no_output_for(
     manager: &ThreadlineJobManager,
     job_id: &str,
@@ -101,6 +125,7 @@ async fn job_manager_transitions_through_starting_running_and_completed() {
     assert!(start["ok"].as_bool().unwrap_or(false));
     let job_id = start["job_id"].as_str().expect("job id");
     assert_eq!(start["status"], "starting");
+    assert_eq!(start["next_action_hint"], JOB_START_NEXT_ACTION_HINT);
 
     let initial_poll = manager.poll_json(job_id);
     assert_eq!(initial_poll["status"], "starting");
@@ -269,6 +294,12 @@ async fn disabled_jobs_and_disallowed_commands_are_rejected_with_stable_json() {
     let disabled = disabled_manager.start_command_json(vec!["echo".to_string()]);
     assert_eq!(disabled["ok"], false);
     assert_eq!(disabled["code"], "jobs_disabled");
+    assert_eq!(disabled.get("next_action_hint"), None);
+
+    let invalid = disabled_manager.start_command_json(Vec::new());
+    assert_eq!(invalid["ok"], false);
+    assert_eq!(invalid["code"], "jobs_disabled");
+    assert_eq!(invalid.get("next_action_hint"), None);
 
     let restricted_manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
         jobs_enabled: true,
@@ -280,6 +311,13 @@ async fn disabled_jobs_and_disallowed_commands_are_rejected_with_stable_json() {
     let rejected = restricted_manager.start_command_json(vec!["echo".to_string()]);
     assert_eq!(rejected["ok"], false);
     assert_eq!(rejected["code"], "job_command_not_allowed");
+    assert_eq!(rejected.get("next_action_hint"), None);
+
+    let empty = restricted_manager.start_command_json(Vec::new());
+    assert_eq!(empty["ok"], false);
+    assert_eq!(empty["code"], "invalid_job_request");
+    assert_eq!(empty.get("next_action_hint"), None);
+
     assert_eq!(
         restricted_manager.poll_json("missing")["code"],
         "job_not_found"
@@ -309,6 +347,7 @@ async fn command_job_stdout_without_newline_becomes_visible_before_exit() {
 
     let start = manager.start_command_json(command);
     assert_eq!(start["status"], "starting");
+    assert_eq!(start["next_action_hint"], JOB_START_NEXT_ACTION_HINT);
 
     let job_id = start["job_id"].as_str().expect("job id").to_string();
     let output = wait_for_output_items(&manager, &job_id, 0, 1, Duration::from_millis(1200)).await;
@@ -320,6 +359,10 @@ async fn command_job_stdout_without_newline_becomes_visible_before_exit() {
     assert_eq!(items[0]["offset"], 0);
     assert_eq!(items[0]["text"], "partial stdout");
     assert_eq!(output["next_offset"], 14);
+
+    let result = wait_for_terminal_result(&manager, &job_id, Duration::from_millis(1200)).await;
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["result"]["success"], true);
 }
 
 #[tokio::test]
@@ -344,6 +387,10 @@ async fn command_job_stderr_without_newline_becomes_visible_before_exit() {
     assert_eq!(items[0]["offset"], 0);
     assert_eq!(items[0]["text"], "partial stderr");
     assert_eq!(output["next_offset"], 14);
+
+    let result = wait_for_terminal_result(&manager, &job_id, Duration::from_millis(1200)).await;
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["result"]["success"], true);
 }
 
 #[tokio::test]
@@ -393,4 +440,8 @@ async fn command_job_split_utf8_bytes_wait_for_valid_prefix_and_keep_byte_offset
     assert_eq!(ascii_items[0]["offset"], 4);
     assert_eq!(ascii_items[0]["text"], "a");
     assert_eq!(ascii_output["next_offset"], 5);
+
+    let result = wait_for_terminal_result(&manager, &job_id, Duration::from_millis(1200)).await;
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["result"]["success"], true);
 }
