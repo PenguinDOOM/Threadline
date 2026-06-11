@@ -2,11 +2,31 @@
 
 Threadline is a Rust service that will bridge VSCode Copilot BYOK Responses API traffic to the Codex backend WebSocket protocol.
 
+Threadline is a BYOK `/v1/responses` bridge. It is not native VS Code Copilot and it does not have native editor, terminal, or extension-host tool integration.
+
 The current implementation provides the initial HTTP surface only:
 
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/responses` placeholder that returns a stable public error until the bridge is implemented
+
+## Expected bridge UX
+
+When the `/v1/responses` bridge is implemented, the downstream experience will remain close to VSCode BYOK behavior, but it will not be identical to native Copilot UX.
+
+- Threadline forwards assistant output over `/v1/responses` and SSE, but native VS Code editor and terminal tool integration remains outside Threadline.
+- Threadline-owned `threadline_*` internal tools are executed locally and hidden from downstream clients.
+- Intermediate completions that exist only to carry internal tool work are consumed by Threadline and used for follow-up requests. Downstream clients should only see the final assistant-facing turn.
+- Long-running work is represented as jobs. Job state and job output are read back through job APIs, and incremental output is read by offset rather than pushed as a native editor or terminal stream.
+
+## Observability and job output
+
+Threadline keeps internal tool execution and job state observable without exposing Threadline-only tool calls to downstream clients.
+
+- Job tools return stable identifiers and status so follow-up requests can poll, read buffered output, and fetch final results.
+- Buffered job output is available before job completion, so partial output can be read incrementally instead of waiting for a single final payload.
+- Output reads are append-oriented and offset-based, which makes repeated reads predictable and avoids replaying the full buffer on every check.
+- UI rendering cadence still depends on how often the client or follow-up turn reads job output. Threadline improves partial output availability, but it does not promise native Copilot-identical live rendering cadence.
 
 ## Non-goals
 
