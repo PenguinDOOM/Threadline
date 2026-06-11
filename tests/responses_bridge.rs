@@ -1270,3 +1270,156 @@ async fn explicit_instructions_are_preserved_in_upstream_response_create() {
         .await
         .expect("explicit instructions body");
 }
+
+#[tokio::test]
+async fn visible_function_call_argument_deltas_stream_to_downstream_sse() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response =
+        post_responses(app, json!({"model":"gpt-5.4","input":"apply-patch-stream"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("apply patch stream request");
+
+    let mut body_stream = response.into_body().into_data_stream();
+
+    let added_event = json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-apply-patch",
+            "name": "apply_patch",
+            "arguments": ""
+        }
+    })
+    .to_string();
+    server.send_text(&added_event).await;
+
+    let added_chunk = next_body_chunk(&mut body_stream).await;
+    let added_text = String::from_utf8(added_chunk.to_vec()).expect("utf8 added chunk");
+    let (added_sse_event, added_sse_data) = sse_event_and_data(added_text.trim_end());
+    let added_payload: Value = serde_json::from_str(added_sse_data).expect("added payload json");
+    assert_eq!(added_sse_event, "response.output_item.added");
+    assert_eq!(added_payload["type"], "response.output_item.added");
+    assert_eq!(added_payload["output_index"], 0);
+    assert_eq!(added_payload["item"]["type"], "function_call");
+    assert_eq!(added_payload["item"]["name"], "apply_patch");
+    assert_eq!(added_payload["item"]["call_id"], "call-apply-patch");
+
+    let first_delta_event = json!({
+        "type": "response.function_call_arguments.delta",
+        "output_index": 0,
+        "item_id": "fc_apply_patch_1",
+        "delta": "{\"input\":\"*** Begin Patch"
+    })
+    .to_string();
+    server.send_text(&first_delta_event).await;
+
+    let first_delta_chunk = next_body_chunk(&mut body_stream).await;
+    let first_delta_text =
+        String::from_utf8(first_delta_chunk.to_vec()).expect("utf8 first delta chunk");
+    let (first_delta_sse_event, first_delta_sse_data) =
+        sse_event_and_data(first_delta_text.trim_end());
+    let first_delta_payload: Value =
+        serde_json::from_str(first_delta_sse_data).expect("first delta payload json");
+    assert_eq!(
+        first_delta_sse_event,
+        "response.function_call_arguments.delta"
+    );
+    assert_eq!(
+        first_delta_payload["type"],
+        "response.function_call_arguments.delta"
+    );
+    assert_eq!(first_delta_payload["output_index"], 0);
+    assert_eq!(first_delta_payload["item_id"], "fc_apply_patch_1");
+    assert_eq!(first_delta_payload["delta"], "{\"input\":\"*** Begin Patch");
+
+    let second_delta_event = json!({
+        "type": "response.function_call_arguments.delta",
+        "output_index": 0,
+        "item_id": "fc_apply_patch_1",
+        "delta": "\n*** End Patch\"}"
+    })
+    .to_string();
+    server.send_text(&second_delta_event).await;
+
+    let second_delta_chunk = next_body_chunk(&mut body_stream).await;
+    let second_delta_text =
+        String::from_utf8(second_delta_chunk.to_vec()).expect("utf8 second delta chunk");
+    let (second_delta_sse_event, second_delta_sse_data) =
+        sse_event_and_data(second_delta_text.trim_end());
+    let second_delta_payload: Value =
+        serde_json::from_str(second_delta_sse_data).expect("second delta payload json");
+    assert_eq!(
+        second_delta_sse_event,
+        "response.function_call_arguments.delta"
+    );
+    assert_eq!(
+        second_delta_payload["type"],
+        "response.function_call_arguments.delta"
+    );
+    assert_eq!(second_delta_payload["output_index"], 0);
+    assert_eq!(second_delta_payload["item_id"], "fc_apply_patch_1");
+    assert_eq!(second_delta_payload["delta"], "\n*** End Patch\"}");
+
+    let done_event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-apply-patch",
+            "name": "apply_patch",
+            "arguments": "{\"input\":\"*** Begin Patch\n*** End Patch\"}"
+        }
+    })
+    .to_string();
+    server.send_text(&done_event).await;
+
+    let done_chunk = next_body_chunk(&mut body_stream).await;
+    let done_text = String::from_utf8(done_chunk.to_vec()).expect("utf8 done chunk");
+    let (done_sse_event, done_sse_data) = sse_event_and_data(done_text.trim_end());
+    let done_payload: Value = serde_json::from_str(done_sse_data).expect("done payload json");
+    assert_eq!(done_sse_event, "response.output_item.done");
+    assert_eq!(done_payload["type"], "response.output_item.done");
+    assert_eq!(done_payload["output_index"], 0);
+    assert_eq!(done_payload["item"]["type"], "function_call");
+    assert_eq!(done_payload["item"]["name"], "apply_patch");
+    assert_eq!(
+        done_payload["item"]["arguments"],
+        "{\"input\":\"*** Begin Patch\n*** End Patch\"}"
+    );
+
+    let completed_event =
+        json!({"type": "response.completed", "response": {"id": "response-apply-patch"}})
+            .to_string();
+    server.send_text(&completed_event).await;
+
+    let completed_chunk = next_body_chunk(&mut body_stream).await;
+    let completed_text = String::from_utf8(completed_chunk.to_vec()).expect("utf8 completed chunk");
+    let (completed_sse_event, completed_sse_data) = sse_event_and_data(completed_text.trim_end());
+    let completed_payload: Value =
+        serde_json::from_str(completed_sse_data).expect("completed payload json");
+    assert_eq!(completed_sse_event, "response.completed");
+    assert_eq!(
+        completed_payload,
+        json!({"type":"response.completed","response":{"id":"response-apply-patch"}})
+    );
+
+    let done_sentinel_chunk = next_body_chunk(&mut body_stream).await;
+    let done_sentinel_text =
+        String::from_utf8(done_sentinel_chunk.to_vec()).expect("utf8 done sentinel chunk");
+    assert_done_frame(done_sentinel_text.trim_end());
+    assert!(
+        body_stream.next().await.is_none(),
+        "expected EOF after downstream DONE sentinel"
+    );
+}
