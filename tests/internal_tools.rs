@@ -4,6 +4,7 @@ use futures_util::{StreamExt, future::BoxFuture};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::connect_async;
@@ -24,8 +25,10 @@ use threadline::jobs::{ThreadlineJobManager, ThreadlineJobManagerConfig};
 use threadline::responses::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
 };
-use threadline::tools::InternalToolCall;
+use threadline::tools::{InternalToolCall, inject_internal_tools};
 use threadline::ws_pump::LiveUpstreamWebSocket;
+
+const JOB_START_NEXT_ACTION_HINT: &str = "This job is running in the background. Continue other useful work if available, then poll status or read output later when needed.";
 
 #[derive(Clone)]
 struct StaticAuthProvider;
@@ -119,6 +122,58 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
         thread_id: Uuid::now_v7().to_string(),
         window_id: Uuid::now_v7().to_string(),
         turn_state: None,
+    }
+}
+
+fn shell_program() -> String {
+    if cfg!(windows) {
+        "pwsh".to_string()
+    } else {
+        "sh".to_string()
+    }
+}
+
+fn shell_command(script: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            "pwsh".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            script.to_string(),
+        ]
+    } else {
+        vec!["sh".to_string(), "-lc".to_string(), script.to_string()]
+    }
+}
+
+fn shell_job_manager() -> ThreadlineJobManager {
+    ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::from_secs(60),
+        allowed_commands: vec![shell_program()],
+    })
+}
+
+async fn wait_for_terminal_result(
+    manager: &ThreadlineJobManager,
+    job_id: &str,
+    timeout: Duration,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let result = manager.get_result_json(job_id);
+        if result["status"] == "completed"
+            || result["status"] == "failed"
+            || result["status"] == "cancelled"
+        {
+            return result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for terminal job result"
+        );
+        sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -722,6 +777,134 @@ fn start_job_tool_returns_stable_disabled_json_by_default() {
         .expect("json payload");
     assert_eq!(payload["ok"], false);
     assert_eq!(payload["code"], "jobs_disabled");
+    assert_eq!(payload.get("next_action_hint"), None);
+
+    let invalid_event = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-start-invalid",
+            "name": "threadline_start_job",
+            "arguments": {
+                "command": "echo hello"
+            }
+        }
+    });
+
+    let invalid_call = InternalToolCall::from_event(&invalid_event)
+        .expect("invalid tool parse")
+        .expect("invalid internal tool call");
+    let invalid_output = invalid_call
+        .execute()
+        .expect("invalid tool output")
+        .into_followup_input();
+    let invalid_payload: Value = serde_json::from_str(
+        invalid_output["output"]
+            .as_str()
+            .expect("invalid output string"),
+    )
+    .expect("invalid json payload");
+    assert_eq!(invalid_payload["ok"], false);
+    assert_eq!(invalid_payload["code"], "invalid_job_request");
+    assert_eq!(invalid_payload.get("next_action_hint"), None);
+}
+
+#[test]
+fn injected_job_tool_definitions_include_contract_phrases_and_preserve_schema() {
+    let mut payload = serde_json::Map::new();
+    inject_internal_tools(&mut payload);
+
+    let tools = payload["tools"].as_array().expect("tools array");
+    let find_tool = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool definition: {name}"))
+    };
+
+    let start = find_tool("threadline_start_job");
+    let start_description = start["description"].as_str().expect("start description");
+    assert!(start_description.contains("background"));
+    assert!(start_description.contains("return immediately"));
+    assert!(start_description.contains("busy-poll"));
+    assert_eq!(start["parameters"]["required"], json!(["command"]));
+    assert_eq!(start["parameters"]["additionalProperties"], false);
+    assert_eq!(start["parameters"]["properties"]["command"]["minItems"], 1);
+
+    let poll = find_tool("threadline_poll_job");
+    let poll_description = poll["description"].as_str().expect("poll description");
+    assert!(poll_description.contains("natural checkpoint"));
+    assert!(poll_description.contains("tight loop"));
+    assert_eq!(poll["parameters"]["required"], json!(["job_id"]));
+    assert_eq!(poll["parameters"]["additionalProperties"], false);
+
+    let read_output = find_tool("threadline_read_job_output");
+    let read_description = read_output["description"]
+        .as_str()
+        .expect("read description");
+    assert!(read_description.contains("next_offset"));
+    assert!(read_description.contains("truncated_before"));
+    assert_eq!(read_output["parameters"]["required"], json!(["job_id"]));
+    assert_eq!(read_output["parameters"]["additionalProperties"], false);
+    assert_eq!(
+        read_output["parameters"]["properties"]["offset"]["minimum"],
+        0
+    );
+
+    let result = find_tool("threadline_get_job_result");
+    let result_description = result["description"].as_str().expect("result description");
+    assert!(result_description.contains("before final claims"));
+    assert!(result_description.contains("success or failure"));
+    assert_eq!(result["parameters"]["required"], json!(["job_id"]));
+    assert_eq!(result["parameters"]["additionalProperties"], false);
+
+    let cancel = find_tool("threadline_cancel_job");
+    let cancel_description = cancel["description"].as_str().expect("cancel description");
+    assert!(cancel_description.contains("stuck"));
+    assert!(cancel_description.contains("poll or get the result"));
+    assert_eq!(cancel["parameters"]["required"], json!(["job_id"]));
+    assert_eq!(cancel["parameters"]["additionalProperties"], false);
+}
+
+#[tokio::test]
+async fn start_job_tool_serializes_success_hint_in_function_call_output() {
+    let manager = shell_job_manager();
+    let command = if cfg!(windows) {
+        shell_command("Write-Output 'tool success'; Start-Sleep -Milliseconds 50")
+    } else {
+        shell_command("printf 'tool success\n'; sleep 0.05")
+    };
+
+    let call = InternalToolCall::from_event(&json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-start-success",
+            "name": "threadline_start_job",
+            "arguments": {"command": command}
+        }
+    }))
+    .expect("start parse")
+    .expect("start call");
+
+    let output = call
+        .execute_with_job_manager(&manager)
+        .expect("start output")
+        .into_followup_input();
+    let payload: Value =
+        serde_json::from_str(output["output"].as_str().expect("start output string"))
+            .expect("start json payload");
+
+    assert_eq!(output["type"], "function_call_output");
+    assert_eq!(output["call_id"], "call-start-success");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["status"], "starting");
+    assert_eq!(payload["next_action_hint"], JOB_START_NEXT_ACTION_HINT);
+
+    let job_id = payload["job_id"].as_str().expect("job id").to_string();
+    let result = wait_for_terminal_result(&manager, &job_id, Duration::from_millis(1500)).await;
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["result"]["success"], true);
 }
 
 #[tokio::test]

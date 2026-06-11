@@ -212,7 +212,7 @@ fn internal_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": START_JOB_TOOL_NAME,
-            "description": "Start a background Threadline job for an allowed local command and return immediately with a job id.",
+            "description": "Start a background Threadline job for an allowed local command, return immediately with a job id, and avoid busy-polling when independent work is still available.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -229,7 +229,7 @@ fn internal_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": POLL_JOB_TOOL_NAME,
-            "description": "Poll the state of a previously started Threadline job.",
+            "description": "Check a previously started Threadline job at a natural checkpoint for status updates, not in a tight loop.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -242,7 +242,7 @@ fn internal_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": READ_JOB_OUTPUT_TOOL_NAME,
-            "description": "Read incremental output from a Threadline job using a previous output offset.",
+            "description": "Read incremental output from a Threadline job using a previous output offset; preserve next_offset for the next read and notice truncated_before if older buffered output was dropped.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -256,7 +256,7 @@ fn internal_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": GET_JOB_RESULT_TOOL_NAME,
-            "description": "Get the current terminal result payload for a Threadline job.",
+            "description": "Get the current or terminal result payload for a Threadline job after a terminal poll state or before final claims that depend on success or failure.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -269,7 +269,7 @@ fn internal_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": CANCEL_JOB_TOOL_NAME,
-            "description": "Cancel a running Threadline job.",
+            "description": "Cancel a stuck or no-longer-useful Threadline job, then poll or get the result to confirm the terminal state.",
             "parameters": {
                 "type": "object",
                 "properties": {
