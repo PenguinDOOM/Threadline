@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -686,24 +686,77 @@ where
 {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
-        let mut buffer = Vec::new();
+        let mut pending = Vec::new();
+        let mut buffer = [0u8; 1024];
 
         loop {
-            buffer.clear();
-            match reader.read_until(b'\n', &mut buffer) {
+            match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(_) => {
-                    let text = String::from_utf8_lossy(&buffer).to_string();
-                    match stream {
-                        "stdout" => context.push_stdout(&text),
-                        "stderr" => context.push_stderr(&text),
-                        _ => {}
-                    }
+                Ok(read_bytes) => {
+                    pending.extend_from_slice(&buffer[..read_bytes]);
+                    flush_output_chunks(&context, stream, &mut pending);
                 }
                 Err(_) => break,
             }
         }
+
+        if !pending.is_empty() {
+            let text = String::from_utf8_lossy(&pending).to_string();
+            push_stream_output(&context, stream, &text);
+        }
     })
+}
+
+fn flush_output_chunks(context: &ManagedJobContext, stream: &'static str, pending: &mut Vec<u8>) {
+    loop {
+        if let Some(newline_index) = pending.iter().position(|byte| *byte == b'\n') {
+            let chunk: Vec<u8> = pending.drain(..=newline_index).collect();
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            push_stream_output(context, stream, &text);
+            continue;
+        }
+
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                if !text.is_empty() {
+                    push_stream_output(context, stream, text);
+                    pending.clear();
+                }
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    let text =
+                        std::str::from_utf8(&pending[..valid_up_to]).expect("valid utf-8 prefix");
+                    push_stream_output(context, stream, text);
+                    pending.drain(..valid_up_to);
+                    continue;
+                }
+
+                if error.error_len().is_none() {
+                    break;
+                }
+
+                let text = String::from_utf8_lossy(pending).to_string();
+                push_stream_output(context, stream, &text);
+                pending.clear();
+                break;
+            }
+        }
+    }
+}
+
+fn push_stream_output(context: &ManagedJobContext, stream: &'static str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+
+    match stream {
+        "stdout" => context.push_stdout(text),
+        "stderr" => context.push_stderr(text),
+        _ => {}
+    }
 }
 
 fn join_reader(reader: Option<thread::JoinHandle<()>>) {

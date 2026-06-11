@@ -1,7 +1,81 @@
+use std::time::Instant;
+
 use serde_json::json;
 use threadline::jobs::{JobTerminalState, ThreadlineJobManager, ThreadlineJobManagerConfig};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
+
+fn shell_program() -> String {
+    if cfg!(windows) {
+        "pwsh".to_string()
+    } else {
+        "sh".to_string()
+    }
+}
+
+fn shell_command(script: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            "pwsh".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            script.to_string(),
+        ]
+    } else {
+        vec!["sh".to_string(), "-lc".to_string(), script.to_string()]
+    }
+}
+
+fn shell_job_manager() -> ThreadlineJobManager {
+    ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::from_secs(60),
+        allowed_commands: vec![shell_program()],
+    })
+}
+
+async fn wait_for_output_items(
+    manager: &ThreadlineJobManager,
+    job_id: &str,
+    offset: u64,
+    expected_item_count: usize,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = manager.read_output_json(job_id, offset);
+        if output["items"]
+            .as_array()
+            .map(|items| items.len() >= expected_item_count)
+            .unwrap_or(false)
+        {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for job output"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn assert_no_output_for(
+    manager: &ThreadlineJobManager,
+    job_id: &str,
+    offset: u64,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let output = manager.read_output_json(job_id, offset);
+        assert_eq!(output["items"], json!([]));
+        if Instant::now() >= deadline {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
 
 #[tokio::test]
 async fn job_manager_transitions_through_starting_running_and_completed() {
@@ -222,4 +296,101 @@ async fn disabled_jobs_and_disallowed_commands_are_rejected_with_stable_json() {
         restricted_manager.cancel_json("missing")["code"],
         "job_not_found"
     );
+}
+
+#[tokio::test]
+async fn command_job_stdout_without_newline_becomes_visible_before_exit() {
+    let manager = shell_job_manager();
+    let command = if cfg!(windows) {
+        shell_command("[Console]::Out.Write('partial stdout'); Start-Sleep -Milliseconds 1000")
+    } else {
+        shell_command("printf 'partial stdout'; sleep 1.0")
+    };
+
+    let start = manager.start_command_json(command);
+    assert_eq!(start["status"], "starting");
+
+    let job_id = start["job_id"].as_str().expect("job id").to_string();
+    let output = wait_for_output_items(&manager, &job_id, 0, 1, Duration::from_millis(1200)).await;
+
+    assert_eq!(manager.poll_json(&job_id)["status"], "running");
+    let items = output["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["stream"], "stdout");
+    assert_eq!(items[0]["offset"], 0);
+    assert_eq!(items[0]["text"], "partial stdout");
+    assert_eq!(output["next_offset"], 14);
+}
+
+#[tokio::test]
+async fn command_job_stderr_without_newline_becomes_visible_before_exit() {
+    let manager = shell_job_manager();
+    let command = if cfg!(windows) {
+        shell_command("[Console]::Error.Write('partial stderr'); Start-Sleep -Milliseconds 1000")
+    } else {
+        shell_command("printf 'partial stderr' >&2; sleep 1.0")
+    };
+
+    let start = manager.start_command_json(command);
+    assert_eq!(start["status"], "starting");
+
+    let job_id = start["job_id"].as_str().expect("job id").to_string();
+    let output = wait_for_output_items(&manager, &job_id, 0, 1, Duration::from_millis(1200)).await;
+
+    assert_eq!(manager.poll_json(&job_id)["status"], "running");
+    let items = output["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["stream"], "stderr");
+    assert_eq!(items[0]["offset"], 0);
+    assert_eq!(items[0]["text"], "partial stderr");
+    assert_eq!(output["next_offset"], 14);
+}
+
+#[tokio::test]
+async fn command_job_split_utf8_bytes_wait_for_valid_prefix_and_keep_byte_offsets() {
+    let manager = shell_job_manager();
+    let command = if cfg!(windows) {
+        shell_command(
+            "$stdout = [Console]::OpenStandardOutput(); \
+            $emojiBytes = [byte[]](0xF0, 0x9F, 0x99, 0x82); \
+            $asciiBytes = [byte[]](0x61); \
+            $stdout.Write($emojiBytes, 0, 2); \
+            $stdout.Flush(); \
+            Start-Sleep -Milliseconds 1000; \
+            $stdout.Write($emojiBytes, 2, 2); \
+            $stdout.Flush(); \
+            Start-Sleep -Milliseconds 800; \
+            $stdout.Write($asciiBytes, 0, 1); \
+            $stdout.Flush(); \
+            Start-Sleep -Milliseconds 500",
+        )
+    } else {
+        shell_command(
+            r"printf '\360\237'; sleep 1.0; printf '\231\202'; sleep 0.8; printf 'a'; sleep 0.5",
+        )
+    };
+
+    let start = manager.start_command_json(command);
+    let job_id = start["job_id"].as_str().expect("job id").to_string();
+
+    assert_no_output_for(&manager, &job_id, 0, Duration::from_millis(300)).await;
+    assert_eq!(manager.poll_json(&job_id)["status"], "running");
+
+    let emoji_output =
+        wait_for_output_items(&manager, &job_id, 0, 1, Duration::from_millis(1800)).await;
+    let emoji_items = emoji_output["items"].as_array().expect("items array");
+    assert_eq!(emoji_items.len(), 1);
+    assert_eq!(emoji_items[0]["stream"], "stdout");
+    assert_eq!(emoji_items[0]["offset"], 0);
+    assert_eq!(emoji_items[0]["text"], "🙂");
+    assert_eq!(emoji_output["next_offset"], 4);
+
+    let ascii_output =
+        wait_for_output_items(&manager, &job_id, 4, 1, Duration::from_millis(1400)).await;
+    let ascii_items = ascii_output["items"].as_array().expect("items array");
+    assert_eq!(ascii_items.len(), 1);
+    assert_eq!(ascii_items[0]["stream"], "stdout");
+    assert_eq!(ascii_items[0]["offset"], 4);
+    assert_eq!(ascii_items[0]["text"], "a");
+    assert_eq!(ascii_output["next_offset"], 5);
 }
