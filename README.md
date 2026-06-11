@@ -24,9 +24,12 @@ When the `/v1/responses` bridge is implemented, the downstream experience will r
 Threadline keeps internal tool execution and job state observable without exposing Threadline-only tool calls to downstream clients.
 
 - Job tools return stable identifiers and status so follow-up requests can poll, read buffered output, and fetch final results.
+- Successful job starts return immediately and may include a short hint telling the caller to continue independent work before polling or reading output.
 - Buffered job output is available before job completion, so partial output can be read incrementally instead of waiting for a single final payload.
-- Output reads are append-oriented and offset-based, which makes repeated reads predictable and avoids replaying the full buffer on every check.
+- Output reads are append-oriented and offset-based. Repeated reads should pass the returned `next_offset` so later checks continue from the last consumed byte range.
+- The output buffer is finite. When older bytes are dropped, `truncated_before` advances and any stored offset older than that value must be treated as no longer recoverable.
 - UI rendering cadence still depends on how often the client or follow-up turn reads job output. Threadline improves partial output availability, but it does not promise native Copilot-identical live rendering cadence.
+- Threadline exposes job tools and buffered output only. It does not provide native VS Code terminal, editor, or extension-host tool streaming.
 
 ## Non-goals
 
@@ -47,7 +50,7 @@ Threadline reads configuration from CLI flags or environment variables.
 | `--jobs-enabled` | `THREADLINE_JOBS_ENABLED` | `false` | Enables local job execution support for long-running work. |
 | `--job-output-buffer-limit-bytes` | `THREADLINE_JOB_OUTPUT_BUFFER_LIMIT_BYTES` | `32768` | Maximum in-memory buffered job output before older output is dropped. |
 | `--job-retention-ttl-secs` | `THREADLINE_JOB_RETENTION_TTL_SECS` | `300` | How long completed job metadata and buffered output remain available after completion. |
-| `--job-allowed-commands` | `THREADLINE_JOB_ALLOWED_COMMANDS` | None | comma-separated exact program names allowed for jobs. Each configured entry is matched against the requested program name exactly. |
+| `--job-allowed-commands` | `THREADLINE_JOB_ALLOWED_COMMANDS` | None | comma-separated exact program names allowed for jobs. Threadline compares `command[0]` against each configured entry exactly, without normalizing wrappers, paths, or aliases. |
 | `--log-level` | `THREADLINE_LOG_LEVEL` | `info` | Threadline log verbosity. Supported Rust tracing levels include `error`, `warn`, `info`, `debug`, and `trace`. |
 
 Threadline does not accept an arbitrary model override through CLI flags or environment variables.

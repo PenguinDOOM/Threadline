@@ -185,9 +185,13 @@ Use `internal_tool_failed` for expected public error states involving internal t
 
 Long-running work should be represented as jobs.
 
-A job should start quickly and return a `job_id`.
+A job should start quickly, return a `job_id`, and continue asynchronously in local Threadline state.
+
+Successful `threadline_start_job` calls should return immediately. The current implementation returns a short `next_action_hint` alongside the initial `starting` status to reinforce that the job keeps running in the background.
 
 Use polling or result retrieval for later status.
+
+Poll or read output at natural checkpoints when status is actually needed. Avoid tight polling loops when other useful work can continue independently.
 
 Do not block a single tool call or HTTP request for work that should continue independently.
 
@@ -197,11 +201,13 @@ Internal job tools should use the `threadline_*` prefix.
 
 Expected job tools include `threadline_start_job`, `threadline_poll_job`, `threadline_read_job_output`, `threadline_get_job_result`, and `threadline_cancel_job`.
 
+Use `threadline_get_job_result` after a terminal status is observed, or before making final claims that depend on success, failure, or cancellation.
+
 These tools are internal and must not be forwarded downstream as normal model-visible tool calls.
 
 ## Job lifecycle
 
-A job should have explicit state such as queued, running, succeeded, failed, or cancelled.
+A job should have explicit state. In the current implementation and tests, the exposed status strings are `starting`, `running`, `completed`, `failed`, and `cancelled`.
 
 A job should store enough metadata for polling, result retrieval, incremental output, cancellation, and cleanup.
 
@@ -222,6 +228,14 @@ A later internal tool call or downstream-triggered request may retrieve job stat
 Do not invent a background upstream response just because a local job completed.
 
 Long job output should be retrievable incrementally through offsets or cursors.
+
+`threadline_read_job_output` returns a finite buffered view of job output, including `items`, `next_offset`, and `truncated_before`.
+
+Callers should pass the returned `next_offset` back on the next incremental read.
+
+If `truncated_before` is greater than a caller's stored offset, older output has already been dropped from the finite buffer and the next read should resume from `truncated_before`.
+
+Buffered output may be available before job completion, but final claims that depend on the terminal outcome should be confirmed with `threadline_get_job_result`.
 
 Do not return unbounded logs in a single response.
 
