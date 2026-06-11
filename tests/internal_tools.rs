@@ -751,6 +751,331 @@ async fn internal_tool_added_and_done_events_stay_hidden_until_intermediate_comp
     assert!(!body_text.contains("response-intermediate"));
 }
 
+#[tokio::test]
+async fn internal_tool_argument_deltas_are_not_forwarded_downstream() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "hide internal tool argument deltas",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "apply_patch",
+                    "description": "visible tool",
+                    "parameters": {"type": "object"}
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-internal","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call-visible","name":"apply_patch","arguments":""}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"item-internal","delta":"{\"value\":\"secret-internal\"}"}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"item-visible","delta":"{\"input\":\"*** Begin "}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.function_call_arguments.delta","item_id":"item-uncorrelated","delta":"{\"input\":\"still-visible-without-index\"}"}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-internal","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call-visible","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** End Patch\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+    assert_eq!(
+        followup_request["input"]
+            .as_array()
+            .expect("followup input")[0]["output"],
+        "alpha"
+    );
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"final answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    let visible_added = json!({
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-visible",
+            "name": "apply_patch",
+            "arguments": ""
+        }
+    });
+    let visible_delta = json!({
+        "type": "response.function_call_arguments.delta",
+        "output_index": 1,
+        "item_id": "item-visible",
+        "delta": "{\"input\":\"*** Begin "
+    });
+    let uncorrelated_delta = json!({
+        "type": "response.function_call_arguments.delta",
+        "item_id": "item-uncorrelated",
+        "delta": "{\"input\":\"still-visible-without-index\"}"
+    });
+    let visible_done = json!({
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-visible",
+            "name": "apply_patch",
+            "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+        }
+    });
+    let final_delta = json!({
+        "type": "response.output_text.delta",
+        "delta": "final answer"
+    });
+    let final_completed = json!({
+        "type": "response.completed",
+        "response": {"id": "response-final"}
+    });
+
+    assert_eq!(frames.len(), 7);
+
+    let added_frame = sse_event_and_data(frames[0]);
+    assert_eq!(added_frame.0, "response.output_item.added");
+    assert_eq!(added_frame.1, visible_added.to_string());
+
+    let visible_delta_frame = sse_event_and_data(frames[1]);
+    assert_eq!(
+        visible_delta_frame.0,
+        "response.function_call_arguments.delta"
+    );
+    assert_eq!(visible_delta_frame.1, visible_delta.to_string());
+
+    let uncorrelated_delta_frame = sse_event_and_data(frames[2]);
+    assert_eq!(
+        uncorrelated_delta_frame.0,
+        "response.function_call_arguments.delta"
+    );
+    assert_eq!(uncorrelated_delta_frame.1, uncorrelated_delta.to_string());
+
+    let done_frame = sse_event_and_data(frames[3]);
+    assert_eq!(done_frame.0, "response.output_item.done");
+    assert_eq!(done_frame.1, visible_done.to_string());
+
+    let final_delta_frame = sse_event_and_data(frames[4]);
+    assert_eq!(final_delta_frame.0, "response.output_text.delta");
+    assert_eq!(final_delta_frame.1, final_delta.to_string());
+
+    let completed_frame = sse_event_and_data(frames[5]);
+    assert_eq!(completed_frame.0, "response.completed");
+    assert_eq!(completed_frame.1, final_completed.to_string());
+
+    assert_done_frame(frames[6]);
+    assert!(!body_text.contains("call-internal"));
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("secret-internal"));
+    assert!(!body_text.contains("response-intermediate"));
+}
+
+#[tokio::test]
+async fn visible_followup_function_call_argument_delta_is_forwarded_when_output_index_is_reused() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "reuse output index after internal tool follow-up",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "apply_patch",
+                    "description": "visible tool",
+                    "parameters": {"type": "object"}
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-internal","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-internal","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+    assert_eq!(
+        followup_request["previous_response_id"],
+        "response-intermediate"
+    );
+    assert_eq!(
+        followup_request["input"]
+            .as_array()
+            .expect("followup input")[0]["output"],
+        "alpha"
+    );
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-visible","name":"apply_patch","arguments":""}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"item-visible","delta":"{\"input\":\"*** Begin Patch"}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-visible","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** End Patch\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    let visible_added = json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-visible",
+            "name": "apply_patch",
+            "arguments": ""
+        }
+    });
+    let visible_delta = json!({
+        "type": "response.function_call_arguments.delta",
+        "output_index": 0,
+        "item_id": "item-visible",
+        "delta": "{\"input\":\"*** Begin Patch"
+    });
+    let visible_done = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-visible",
+            "name": "apply_patch",
+            "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+        }
+    });
+    let final_completed = json!({
+        "type": "response.completed",
+        "response": {"id": "response-final"}
+    });
+
+    assert_eq!(frames.len(), 5);
+
+    let added_frame = sse_event_and_data(frames[0]);
+    assert_eq!(added_frame.0, "response.output_item.added");
+    assert_eq!(added_frame.1, visible_added.to_string());
+
+    let delta_frame = sse_event_and_data(frames[1]);
+    assert_eq!(delta_frame.0, "response.function_call_arguments.delta");
+    assert_eq!(delta_frame.1, visible_delta.to_string());
+
+    let done_frame = sse_event_and_data(frames[2]);
+    assert_eq!(done_frame.0, "response.output_item.done");
+    assert_eq!(done_frame.1, visible_done.to_string());
+
+    let completed_frame = sse_event_and_data(frames[3]);
+    assert_eq!(completed_frame.0, "response.completed");
+    assert_eq!(completed_frame.1, final_completed.to_string());
+
+    assert_done_frame(frames[4]);
+    assert!(!body_text.contains("call-internal"));
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("response-intermediate"));
+}
+
 #[test]
 fn start_job_tool_returns_stable_disabled_json_by_default() {
     let event = json!({

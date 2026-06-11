@@ -77,6 +77,7 @@ pub async fn responses_handler(
         base_request: upstream_request,
         pending_internal_outputs: Vec::new(),
         previous_response_id: request.previous_response_id,
+        suppressed_internal_output_indexes: std::collections::HashSet::new(),
         upstream_event_seen: false,
         reconnect_attempted,
         final_done_pending: false,

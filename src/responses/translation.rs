@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::mem;
 use std::sync::Arc;
@@ -28,6 +29,10 @@ fn response_id_from_event(event: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn output_index_from_event(event: &Value) -> Option<u64> {
+    event.get("output_index").and_then(Value::as_u64)
+}
+
 pub(super) struct ResponseStreamState {
     pub(super) services: ThreadlineServices,
     pub(super) upstream: Arc<LiveUpstreamWebSocket>,
@@ -35,6 +40,7 @@ pub(super) struct ResponseStreamState {
     pub(super) base_request: serde_json::Map<String, Value>,
     pub(super) pending_internal_outputs: Vec<PendingInternalToolOutput>,
     pub(super) previous_response_id: Option<String>,
+    pub(super) suppressed_internal_output_indexes: HashSet<u64>,
     pub(super) upstream_event_seen: bool,
     pub(super) reconnect_attempted: bool,
     pub(super) final_done_pending: bool,
@@ -136,6 +142,22 @@ pub(super) fn response_stream(
             if event_type.starts_with("response.output_item.")
                 && event_contains_internal_tool_name(&parsed)
             {
+                if let Some(output_index) = output_index_from_event(&parsed) {
+                    state
+                        .suppressed_internal_output_indexes
+                        .insert(output_index);
+                }
+                debug!(event_type, "translation_event_suppressed_internal_tool");
+                continue;
+            }
+
+            if event_type == "response.function_call_arguments.delta"
+                && output_index_from_event(&parsed).is_some_and(|output_index| {
+                    state
+                        .suppressed_internal_output_indexes
+                        .contains(&output_index)
+                })
+            {
                 debug!(event_type, "translation_event_suppressed_internal_tool");
                 continue;
             }
@@ -163,6 +185,7 @@ pub(super) fn response_stream(
                             pending_internal_output_count = output_count,
                             "intermediate_completion_consumed"
                         );
+                        state.suppressed_internal_output_indexes.clear();
                         let followup_input = build_followup_input(outputs);
                         if let Err(error) = send_followup_tool_outputs(
                             &state.upstream,
