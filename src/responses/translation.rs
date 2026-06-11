@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use futures_util::stream;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::errors::ThreadlineError;
 use crate::registry::RetainedSessionLease;
@@ -31,6 +31,153 @@ fn response_id_from_event(event: &Value) -> Option<&str> {
 
 fn output_index_from_event(event: &Value) -> Option<u64> {
     event.get("output_index").and_then(Value::as_u64)
+}
+
+const RESPONSES_TRANSLATION_UPSTREAM_EVENT: &str = "responses_translation_upstream_event";
+const RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT: &str =
+    "responses_translation_downstream_sse_event";
+const RESPONSES_TRANSLATION_EVENT_SUPPRESSED: &str = "responses_translation_event_suppressed";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownstreamTraceAction {
+    Forwarded,
+    Suppressed,
+    Terminal,
+    ErrorTranslated,
+}
+
+impl DownstreamTraceAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Suppressed => "suppressed",
+            Self::Terminal => "terminal",
+            Self::ErrorTranslated => "error-translated",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UpstreamEventTraceMetadata {
+    event_type: String,
+    item_type: Option<String>,
+    item_name: Option<String>,
+    call_id: Option<String>,
+    arguments_length: Option<usize>,
+    delta_length: Option<usize>,
+    output_index: Option<u64>,
+    item_id: Option<String>,
+}
+
+impl UpstreamEventTraceMetadata {
+    fn from_event(event: &Value) -> Self {
+        let item = event.get("item");
+        Self {
+            event_type: event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+                .to_string(),
+            item_type: string_field(item.and_then(|value| value.get("type")))
+                .or_else(|| string_field(event.get("item_type"))),
+            item_name: string_field(item.and_then(|value| value.get("name")))
+                .or_else(|| string_field(event.get("name")))
+                .or_else(|| string_field(event.get("tool_name"))),
+            call_id: string_field(item.and_then(|value| value.get("call_id")))
+                .or_else(|| string_field(event.get("call_id"))),
+            arguments_length: string_length_field(
+                item.and_then(|value| value.get("arguments"))
+                    .or_else(|| event.get("arguments")),
+            ),
+            delta_length: string_length_field(event.get("delta")),
+            output_index: output_index_from_event(event),
+            item_id: string_field(event.get("item_id"))
+                .or_else(|| string_field(item.and_then(|value| value.get("id")))),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DownstreamSseTraceMetadata {
+    translation_action: &'static str,
+    event_type: String,
+    item_type: Option<String>,
+    item_name: Option<String>,
+    call_id: Option<String>,
+    arguments_length: Option<usize>,
+    delta_length: Option<usize>,
+    output_index: Option<u64>,
+    item_id: Option<String>,
+}
+
+fn downstream_sse_trace_metadata(
+    event: &Value,
+    action: DownstreamTraceAction,
+) -> DownstreamSseTraceMetadata {
+    let metadata = UpstreamEventTraceMetadata::from_event(event);
+    DownstreamSseTraceMetadata {
+        translation_action: action.as_str(),
+        event_type: metadata.event_type,
+        item_type: metadata.item_type,
+        item_name: metadata.item_name,
+        call_id: metadata.call_id,
+        arguments_length: metadata.arguments_length,
+        delta_length: metadata.delta_length,
+        output_index: metadata.output_index,
+        item_id: metadata.item_id,
+    }
+}
+
+fn trace_upstream_event(metadata: &UpstreamEventTraceMetadata) {
+    trace!(
+        event_type = %metadata.event_type,
+        item_type = ?metadata.item_type,
+        item_name = ?metadata.item_name,
+        call_id = ?metadata.call_id,
+        arguments_length = ?metadata.arguments_length,
+        delta_length = ?metadata.delta_length,
+        output_index = ?metadata.output_index,
+        item_id = ?metadata.item_id,
+        "{RESPONSES_TRANSLATION_UPSTREAM_EVENT}"
+    );
+}
+
+fn trace_downstream_sse_event(metadata: &DownstreamSseTraceMetadata) {
+    trace!(
+        translation_action = metadata.translation_action,
+        event_type = %metadata.event_type,
+        item_type = ?metadata.item_type,
+        item_name = ?metadata.item_name,
+        call_id = ?metadata.call_id,
+        arguments_length = ?metadata.arguments_length,
+        delta_length = ?metadata.delta_length,
+        output_index = ?metadata.output_index,
+        item_id = ?metadata.item_id,
+        "{RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT}"
+    );
+}
+
+fn trace_suppressed_event(metadata: &UpstreamEventTraceMetadata) {
+    trace!(
+        translation_action = DownstreamTraceAction::Suppressed.as_str(),
+        event_type = %metadata.event_type,
+        item_type = ?metadata.item_type,
+        item_name = ?metadata.item_name,
+        call_id = ?metadata.call_id,
+        arguments_length = ?metadata.arguments_length,
+        delta_length = ?metadata.delta_length,
+        output_index = ?metadata.output_index,
+        item_id = ?metadata.item_id,
+        "{RESPONSES_TRANSLATION_EVENT_SUPPRESSED}"
+    );
+}
+
+fn string_field(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(ToString::to_string)
+}
+
+fn string_length_field(value: Option<&Value>) -> Option<usize> {
+    value.and_then(Value::as_str).map(str::len)
 }
 
 pub(super) struct ResponseStreamState {
@@ -104,9 +251,16 @@ pub(super) fn response_stream(
                 }
             };
 
+            let trace_metadata = UpstreamEventTraceMetadata::from_event(&parsed);
+            trace_upstream_event(&trace_metadata);
+
             let internal_tool_call = match InternalToolCall::from_event(&parsed) {
                 Ok(call) => call,
                 Err(error) => {
+                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                        &parsed,
+                        DownstreamTraceAction::ErrorTranslated,
+                    ));
                     state.lease.mark_upstream_terminal().await;
                     state.done = true;
                     return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
@@ -121,9 +275,14 @@ pub(super) fn response_stream(
                             pending_internal_output_count = state.pending_internal_outputs.len(),
                             "internal_tool_executed"
                         );
+                        trace_suppressed_event(&trace_metadata);
                         continue;
                     }
                     Err(error) => {
+                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                            &parsed,
+                            DownstreamTraceAction::ErrorTranslated,
+                        ));
                         state.lease.mark_upstream_terminal().await;
                         state.done = true;
                         return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
@@ -147,6 +306,7 @@ pub(super) fn response_stream(
                         .suppressed_internal_output_indexes
                         .insert(output_index);
                 }
+                trace_suppressed_event(&trace_metadata);
                 debug!(event_type, "translation_event_suppressed_internal_tool");
                 continue;
             }
@@ -158,6 +318,7 @@ pub(super) fn response_stream(
                         .contains(&output_index)
                 })
             {
+                trace_suppressed_event(&trace_metadata);
                 debug!(event_type, "translation_event_suppressed_internal_tool");
                 continue;
             }
@@ -173,6 +334,10 @@ pub(super) fn response_stream(
                     if !state.pending_internal_outputs.is_empty() {
                         let Some(response_id) = response_id.as_deref() else {
                             let error = ThreadlineError::InternalToolFailed;
+                            trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                                &parsed,
+                                DownstreamTraceAction::ErrorTranslated,
+                            ));
                             state.lease.mark_upstream_terminal().await;
                             state.done = true;
                             return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
@@ -208,6 +373,10 @@ pub(super) fn response_stream(
                         continue;
                     }
 
+                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                        &parsed,
+                        DownstreamTraceAction::Terminal,
+                    ));
                     debug!(response_id, event_type, "translation_event_forwarded");
                     debug!(response_id, "terminal_response_forwarded");
                     state.final_done_pending = true;
@@ -218,6 +387,10 @@ pub(super) fn response_stream(
                     ));
                 }
                 "response.failed" => {
+                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                        &parsed,
+                        DownstreamTraceAction::Terminal,
+                    ));
                     state.lease.mark_upstream_recoverable().await;
                     state.final_done_pending = true;
                     debug!(event_type, "terminal_response_forwarded");
@@ -244,6 +417,10 @@ pub(super) fn response_stream(
                         event_type,
                         error_code, error_message, status, "upstream_error_event"
                     );
+                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                        &parsed,
+                        DownstreamTraceAction::ErrorTranslated,
+                    ));
                     state.lease.mark_upstream_terminal().await;
                     state.done = true;
                     return Some((
@@ -254,6 +431,10 @@ pub(super) fn response_stream(
                     ));
                 }
                 _ => {
+                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                        &parsed,
+                        DownstreamTraceAction::Forwarded,
+                    ));
                     debug!(event_type, "translation_event_forwarded");
                     return Some((
                         Ok::<Bytes, Infallible>(sse_json_chunk(&event_type, &parsed)),
@@ -277,4 +458,84 @@ async fn try_reconnect_or_terminal_error(
         &mut state.reconnect_attempted,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        DownstreamTraceAction, RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT,
+        RESPONSES_TRANSLATION_EVENT_SUPPRESSED, RESPONSES_TRANSLATION_UPSTREAM_EVENT,
+        UpstreamEventTraceMetadata, downstream_sse_trace_metadata,
+    };
+
+    #[test]
+    fn upstream_event_trace_metadata_redacts_argument_bodies_and_keeps_lengths() {
+        let arguments = "{\"input\":\"*** Begin Patch\\nsecret\\n*** End Patch\"}";
+        let parsed = json!({
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item_id": "item-visible",
+            "item": {
+                "type": "function_call",
+                "call_id": "call-visible",
+                "name": "apply_patch",
+                "arguments": arguments
+            }
+        });
+
+        let metadata = UpstreamEventTraceMetadata::from_event(&parsed);
+
+        assert_eq!(metadata.event_type, "response.output_item.added");
+        assert_eq!(metadata.item_type.as_deref(), Some("function_call"));
+        assert_eq!(metadata.item_name.as_deref(), Some("apply_patch"));
+        assert_eq!(metadata.call_id.as_deref(), Some("call-visible"));
+        assert_eq!(metadata.arguments_length, Some(arguments.len()));
+        assert_eq!(metadata.output_index, Some(2));
+        assert_eq!(metadata.item_id.as_deref(), Some("item-visible"));
+    }
+
+    #[test]
+    fn downstream_sse_trace_metadata_reports_action_without_delta_body() {
+        let delta = "{\"input\":\"*** Begin Patch";
+        let parsed = json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_apply_patch_1",
+            "delta": delta
+        });
+
+        let metadata = downstream_sse_trace_metadata(&parsed, DownstreamTraceAction::Forwarded);
+
+        assert_eq!(
+            metadata.event_type,
+            "response.function_call_arguments.delta"
+        );
+        assert_eq!(
+            metadata.translation_action,
+            DownstreamTraceAction::Forwarded.as_str()
+        );
+        assert_eq!(metadata.delta_length, Some(delta.len()));
+        assert_eq!(metadata.output_index, Some(1));
+        assert_eq!(metadata.item_id.as_deref(), Some("fc_apply_patch_1"));
+        assert_eq!(metadata.arguments_length, None);
+        assert_eq!(metadata.item_name, None);
+    }
+
+    #[test]
+    fn translation_trace_event_names_remain_stable() {
+        assert_eq!(
+            RESPONSES_TRANSLATION_UPSTREAM_EVENT,
+            "responses_translation_upstream_event"
+        );
+        assert_eq!(
+            RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT,
+            "responses_translation_downstream_sse_event"
+        );
+        assert_eq!(
+            RESPONSES_TRANSLATION_EVENT_SUPPRESSED,
+            "responses_translation_event_suppressed"
+        );
+    }
 }

@@ -3,13 +3,18 @@ use axum::http::{Request, Response, StatusCode};
 use futures_util::{StreamExt, future::BoxFuture};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::io;
+use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
+use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
 
 #[path = "support/scripted_ws.rs"]
@@ -227,6 +232,142 @@ fn assert_done_frame(frame: &str) {
         frame, "data: [DONE]",
         "expected a bare downstream DONE frame without an event line"
     );
+}
+
+#[derive(Clone)]
+struct SharedLogBuffer {
+    bytes: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl SharedLogBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    fn logs(&self) -> String {
+        String::from_utf8(self.bytes.lock().expect("log buffer lock").clone())
+            .expect("utf8 trace logs")
+    }
+}
+
+struct SharedLogWriter {
+    bytes: Arc<StdMutex<Vec<u8>>>,
+}
+
+static TRACE_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ACTIVE_TRACE_BUFFER: OnceLock<StdMutex<Option<Arc<StdMutex<Vec<u8>>>>>> = OnceLock::new();
+static TRACE_SUBSCRIBER_INIT: OnceLock<()> = OnceLock::new();
+
+fn trace_capture_lock() -> &'static Mutex<()> {
+    TRACE_CAPTURE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn active_trace_buffer() -> &'static StdMutex<Option<Arc<StdMutex<Vec<u8>>>>> {
+    ACTIVE_TRACE_BUFFER.get_or_init(|| StdMutex::new(None))
+}
+
+fn ensure_test_trace_subscriber() {
+    TRACE_SUBSCRIBER_INIT.get_or_init(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(GlobalTraceCapture)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("global trace subscriber should only initialize once");
+    });
+}
+
+#[derive(Clone, Copy)]
+struct GlobalTraceCapture;
+
+struct GlobalTraceWriter;
+
+impl Write for GlobalTraceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(bytes) = active_trace_buffer()
+            .lock()
+            .expect("active trace buffer lock")
+            .as_ref()
+        {
+            bytes
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for GlobalTraceCapture {
+    type Writer = GlobalTraceWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        GlobalTraceWriter
+    }
+}
+
+struct TraceCaptureGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    log_buffer: SharedLogBuffer,
+}
+
+impl TraceCaptureGuard {
+    async fn begin() -> Self {
+        let lock = trace_capture_lock().lock().await;
+        ensure_test_trace_subscriber();
+        let log_buffer = SharedLogBuffer::new();
+        *active_trace_buffer()
+            .lock()
+            .expect("active trace buffer lock") = Some(Arc::clone(&log_buffer.bytes));
+        Self {
+            _lock: lock,
+            log_buffer,
+        }
+    }
+
+    fn logs(&self) -> String {
+        self.log_buffer.logs()
+    }
+}
+
+impl Drop for TraceCaptureGuard {
+    fn drop(&mut self) {
+        *active_trace_buffer()
+            .lock()
+            .expect("active trace buffer lock") = None;
+    }
+}
+
+impl Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes
+            .lock()
+            .expect("log buffer lock")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedLogBuffer {
+    type Writer = SharedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedLogWriter {
+            bytes: Arc::clone(&self.bytes),
+        }
+    }
 }
 
 async fn next_sse_frame(
@@ -928,6 +1069,92 @@ async fn internal_tool_argument_deltas_are_not_forwarded_downstream() {
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("secret-internal"));
     assert!(!body_text.contains("response-intermediate"));
+}
+
+#[tokio::test]
+async fn internal_tool_done_suppression_emits_stable_trace_event() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "trace suppressed internal tool completion",
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let trace_capture = TraceCaptureGuard::begin().await;
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-internal","name":"threadline_echo","arguments":"{\"value\":\"secret-internal\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+    assert_eq!(
+        followup_request["input"]
+            .as_array()
+            .expect("followup input")[0]["output"],
+        "secret-internal"
+    );
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"final answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 3);
+
+    let final_delta = sse_event_and_data(frames[0]);
+    assert_eq!(final_delta.0, "response.output_text.delta");
+
+    let final_completed = sse_event_and_data(frames[1]);
+    assert_eq!(final_completed.0, "response.completed");
+
+    assert_done_frame(frames[2]);
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("secret-internal"));
+
+    let logs = trace_capture.logs();
+    assert!(
+        logs.contains("responses_translation_event_suppressed")
+            && logs.contains("event_type=response.output_item.done"),
+        "expected stable suppression trace for successful internal tool completion, logs were: {logs}"
+    );
+    assert!(!logs.contains("secret-internal"));
 }
 
 #[tokio::test]
