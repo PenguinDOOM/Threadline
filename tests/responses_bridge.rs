@@ -1271,8 +1271,18 @@ async fn explicit_instructions_are_preserved_in_upstream_response_create() {
         .expect("explicit instructions body");
 }
 
-#[tokio::test]
-async fn visible_function_call_argument_deltas_stream_to_downstream_sse() {
+struct DownstreamSseEvent {
+    event: String,
+    payload: Value,
+}
+
+struct ApplyPatchStreamCapture {
+    upstream_events: Vec<Value>,
+    downstream_events: Vec<DownstreamSseEvent>,
+    done_frame: String,
+}
+
+async fn capture_visible_apply_patch_stream() -> ApplyPatchStreamCapture {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -1295,34 +1305,27 @@ async fn visible_function_call_argument_deltas_stream_to_downstream_sse() {
         "type": "response.output_item.added",
         "output_index": 0,
         "item": {
+            "id": "fc_apply_patch_1",
             "type": "function_call",
             "call_id": "call-apply-patch",
             "name": "apply_patch",
             "arguments": ""
         }
-    })
-    .to_string();
-    server.send_text(&added_event).await;
+    });
+    server.send_text(&added_event.to_string()).await;
 
     let added_chunk = next_body_chunk(&mut body_stream).await;
     let added_text = String::from_utf8(added_chunk.to_vec()).expect("utf8 added chunk");
     let (added_sse_event, added_sse_data) = sse_event_and_data(added_text.trim_end());
     let added_payload: Value = serde_json::from_str(added_sse_data).expect("added payload json");
-    assert_eq!(added_sse_event, "response.output_item.added");
-    assert_eq!(added_payload["type"], "response.output_item.added");
-    assert_eq!(added_payload["output_index"], 0);
-    assert_eq!(added_payload["item"]["type"], "function_call");
-    assert_eq!(added_payload["item"]["name"], "apply_patch");
-    assert_eq!(added_payload["item"]["call_id"], "call-apply-patch");
 
     let first_delta_event = json!({
         "type": "response.function_call_arguments.delta",
         "output_index": 0,
         "item_id": "fc_apply_patch_1",
         "delta": "{\"input\":\"*** Begin Patch"
-    })
-    .to_string();
-    server.send_text(&first_delta_event).await;
+    });
+    server.send_text(&first_delta_event.to_string()).await;
 
     let first_delta_chunk = next_body_chunk(&mut body_stream).await;
     let first_delta_text =
@@ -1331,26 +1334,14 @@ async fn visible_function_call_argument_deltas_stream_to_downstream_sse() {
         sse_event_and_data(first_delta_text.trim_end());
     let first_delta_payload: Value =
         serde_json::from_str(first_delta_sse_data).expect("first delta payload json");
-    assert_eq!(
-        first_delta_sse_event,
-        "response.function_call_arguments.delta"
-    );
-    assert_eq!(
-        first_delta_payload["type"],
-        "response.function_call_arguments.delta"
-    );
-    assert_eq!(first_delta_payload["output_index"], 0);
-    assert_eq!(first_delta_payload["item_id"], "fc_apply_patch_1");
-    assert_eq!(first_delta_payload["delta"], "{\"input\":\"*** Begin Patch");
 
     let second_delta_event = json!({
         "type": "response.function_call_arguments.delta",
         "output_index": 0,
         "item_id": "fc_apply_patch_1",
         "delta": "\n*** End Patch\"}"
-    })
-    .to_string();
-    server.send_text(&second_delta_event).await;
+    });
+    server.send_text(&second_delta_event.to_string()).await;
 
     let second_delta_chunk = next_body_chunk(&mut body_stream).await;
     let second_delta_text =
@@ -1359,60 +1350,50 @@ async fn visible_function_call_argument_deltas_stream_to_downstream_sse() {
         sse_event_and_data(second_delta_text.trim_end());
     let second_delta_payload: Value =
         serde_json::from_str(second_delta_sse_data).expect("second delta payload json");
-    assert_eq!(
-        second_delta_sse_event,
-        "response.function_call_arguments.delta"
-    );
-    assert_eq!(
-        second_delta_payload["type"],
-        "response.function_call_arguments.delta"
-    );
-    assert_eq!(second_delta_payload["output_index"], 0);
-    assert_eq!(second_delta_payload["item_id"], "fc_apply_patch_1");
-    assert_eq!(second_delta_payload["delta"], "\n*** End Patch\"}");
+
+    let arguments_done_event = json!({
+        "type": "response.function_call_arguments.done",
+        "output_index": 0,
+        "item_id": "fc_apply_patch_1",
+        "arguments": "{\"input\":\"*** Begin Patch\n*** End Patch\"}"
+    });
+    server.send_text(&arguments_done_event.to_string()).await;
+
+    let arguments_done_chunk = next_body_chunk(&mut body_stream).await;
+    let arguments_done_text =
+        String::from_utf8(arguments_done_chunk.to_vec()).expect("utf8 arguments done chunk");
+    let (arguments_done_sse_event, arguments_done_sse_data) =
+        sse_event_and_data(arguments_done_text.trim_end());
+    let arguments_done_payload: Value =
+        serde_json::from_str(arguments_done_sse_data).expect("arguments done payload json");
 
     let done_event = json!({
         "type": "response.output_item.done",
         "output_index": 0,
         "item": {
+            "id": "fc_apply_patch_1",
             "type": "function_call",
             "call_id": "call-apply-patch",
             "name": "apply_patch",
             "arguments": "{\"input\":\"*** Begin Patch\n*** End Patch\"}"
         }
-    })
-    .to_string();
-    server.send_text(&done_event).await;
+    });
+    server.send_text(&done_event.to_string()).await;
 
     let done_chunk = next_body_chunk(&mut body_stream).await;
     let done_text = String::from_utf8(done_chunk.to_vec()).expect("utf8 done chunk");
     let (done_sse_event, done_sse_data) = sse_event_and_data(done_text.trim_end());
     let done_payload: Value = serde_json::from_str(done_sse_data).expect("done payload json");
-    assert_eq!(done_sse_event, "response.output_item.done");
-    assert_eq!(done_payload["type"], "response.output_item.done");
-    assert_eq!(done_payload["output_index"], 0);
-    assert_eq!(done_payload["item"]["type"], "function_call");
-    assert_eq!(done_payload["item"]["name"], "apply_patch");
-    assert_eq!(
-        done_payload["item"]["arguments"],
-        "{\"input\":\"*** Begin Patch\n*** End Patch\"}"
-    );
 
     let completed_event =
-        json!({"type": "response.completed", "response": {"id": "response-apply-patch"}})
-            .to_string();
-    server.send_text(&completed_event).await;
+        json!({"type": "response.completed", "response": {"id": "response-apply-patch"}});
+    server.send_text(&completed_event.to_string()).await;
 
     let completed_chunk = next_body_chunk(&mut body_stream).await;
     let completed_text = String::from_utf8(completed_chunk.to_vec()).expect("utf8 completed chunk");
     let (completed_sse_event, completed_sse_data) = sse_event_and_data(completed_text.trim_end());
     let completed_payload: Value =
         serde_json::from_str(completed_sse_data).expect("completed payload json");
-    assert_eq!(completed_sse_event, "response.completed");
-    assert_eq!(
-        completed_payload,
-        json!({"type":"response.completed","response":{"id":"response-apply-patch"}})
-    );
 
     let done_sentinel_chunk = next_body_chunk(&mut body_stream).await;
     let done_sentinel_text =
@@ -1422,4 +1403,142 @@ async fn visible_function_call_argument_deltas_stream_to_downstream_sse() {
         body_stream.next().await.is_none(),
         "expected EOF after downstream DONE sentinel"
     );
+
+    ApplyPatchStreamCapture {
+        upstream_events: vec![
+            added_event,
+            first_delta_event,
+            second_delta_event,
+            arguments_done_event,
+            done_event,
+            completed_event,
+        ],
+        downstream_events: vec![
+            DownstreamSseEvent {
+                event: added_sse_event.to_string(),
+                payload: added_payload,
+            },
+            DownstreamSseEvent {
+                event: first_delta_sse_event.to_string(),
+                payload: first_delta_payload,
+            },
+            DownstreamSseEvent {
+                event: second_delta_sse_event.to_string(),
+                payload: second_delta_payload,
+            },
+            DownstreamSseEvent {
+                event: arguments_done_sse_event.to_string(),
+                payload: arguments_done_payload,
+            },
+            DownstreamSseEvent {
+                event: done_sse_event.to_string(),
+                payload: done_payload,
+            },
+            DownstreamSseEvent {
+                event: completed_sse_event.to_string(),
+                payload: completed_payload,
+            },
+        ],
+        done_frame: done_sentinel_text.trim_end().to_string(),
+    }
+}
+
+#[tokio::test]
+async fn responses_bridge_apply_patch_added_precedes_delta_with_vs_code_required_metadata() {
+    let capture = capture_visible_apply_patch_stream().await;
+
+    let added_index = capture
+        .downstream_events
+        .iter()
+        .position(|event| event.event == "response.output_item.added")
+        .expect("added event");
+    let first_delta_index = capture
+        .downstream_events
+        .iter()
+        .position(|event| event.event == "response.function_call_arguments.delta")
+        .expect("first delta event");
+
+    assert!(
+        added_index < first_delta_index,
+        "expected visible function call added event before argument deltas"
+    );
+
+    let added_payload = &capture.downstream_events[added_index].payload;
+    assert_eq!(added_payload["type"], "response.output_item.added");
+    assert_eq!(added_payload["output_index"], 0);
+    assert_eq!(added_payload["item"]["type"], "function_call");
+    assert_eq!(added_payload["item"]["name"], "apply_patch");
+    assert_eq!(added_payload["item"]["call_id"], "call-apply-patch");
+    assert_eq!(added_payload["item"]["id"], "fc_apply_patch_1");
+}
+
+#[tokio::test]
+async fn responses_bridge_apply_patch_delta_matches_added_output_index() {
+    let capture = capture_visible_apply_patch_stream().await;
+
+    let added_payload = &capture.downstream_events[0].payload;
+    let added_output_index = added_payload["output_index"].clone();
+    let delta_events: Vec<&DownstreamSseEvent> = capture
+        .downstream_events
+        .iter()
+        .filter(|event| event.event == "response.function_call_arguments.delta")
+        .collect();
+
+    assert_eq!(delta_events.len(), 2, "expected two visible argument deltas");
+    for delta_event in delta_events {
+        assert_eq!(
+            delta_event.payload["output_index"],
+            added_output_index,
+            "expected visible argument delta to preserve added output_index"
+        );
+        assert_eq!(delta_event.payload["item_id"], "fc_apply_patch_1");
+    }
+}
+
+#[tokio::test]
+async fn responses_bridge_apply_patch_done_preserves_complete_arguments() {
+    let capture = capture_visible_apply_patch_stream().await;
+
+    let arguments_done_payload = &capture.downstream_events[3].payload;
+    assert_eq!(
+        arguments_done_payload["type"],
+        "response.function_call_arguments.done"
+    );
+    assert_eq!(arguments_done_payload["output_index"], 0);
+    assert_eq!(arguments_done_payload["item_id"], "fc_apply_patch_1");
+    assert_eq!(
+        arguments_done_payload["arguments"],
+        "{\"input\":\"*** Begin Patch\n*** End Patch\"}"
+    );
+
+    let done_payload = &capture.downstream_events[4].payload;
+    assert_eq!(done_payload["type"], "response.output_item.done");
+    assert_eq!(done_payload["output_index"], 0);
+    assert_eq!(done_payload["item"]["id"], "fc_apply_patch_1");
+    assert_eq!(done_payload["item"]["call_id"], "call-apply-patch");
+    assert_eq!(done_payload["item"]["name"], "apply_patch");
+    assert_eq!(
+        done_payload["item"]["arguments"],
+        "{\"input\":\"*** Begin Patch\n*** End Patch\"}"
+    );
+}
+
+#[tokio::test]
+async fn responses_bridge_visible_function_call_payloads_are_forwarded_without_mutation() {
+    let capture = capture_visible_apply_patch_stream().await;
+
+    for (index, upstream_event) in capture.upstream_events.iter().enumerate() {
+        assert_eq!(
+            capture.downstream_events[index].payload,
+            *upstream_event,
+            "expected downstream SSE payload to match upstream event for index {index}"
+        );
+        assert_eq!(
+            capture.downstream_events[index].event,
+            upstream_event["type"].as_str().expect("upstream event type"),
+            "expected downstream SSE event name to match upstream event type for index {index}"
+        );
+    }
+
+    assert_eq!(capture.done_frame, "data: [DONE]");
 }
