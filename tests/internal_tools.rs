@@ -236,9 +236,12 @@ fn assert_done_frame(frame: &str) {
     );
 }
 
+type SharedBytes = Arc<StdMutex<Vec<u8>>>;
+type ActiveTraceBytes = StdMutex<Option<SharedBytes>>;
+
 #[derive(Clone)]
 struct SharedLogBuffer {
-    bytes: Arc<StdMutex<Vec<u8>>>,
+    bytes: SharedBytes,
 }
 
 impl SharedLogBuffer {
@@ -255,18 +258,18 @@ impl SharedLogBuffer {
 }
 
 struct SharedLogWriter {
-    bytes: Arc<StdMutex<Vec<u8>>>,
+    bytes: SharedBytes,
 }
 
 static TRACE_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static ACTIVE_TRACE_BUFFER: OnceLock<StdMutex<Option<Arc<StdMutex<Vec<u8>>>>>> = OnceLock::new();
+static ACTIVE_TRACE_BUFFER: OnceLock<ActiveTraceBytes> = OnceLock::new();
 static TRACE_SUBSCRIBER_INIT: OnceLock<()> = OnceLock::new();
 
 fn trace_capture_lock() -> &'static Mutex<()> {
     TRACE_CAPTURE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn active_trace_buffer() -> &'static StdMutex<Option<Arc<StdMutex<Vec<u8>>>>> {
+fn active_trace_buffer() -> &'static ActiveTraceBytes {
     ACTIVE_TRACE_BUFFER.get_or_init(|| StdMutex::new(None))
 }
 
