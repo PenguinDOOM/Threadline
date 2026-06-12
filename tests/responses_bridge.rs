@@ -1377,6 +1377,12 @@ struct ApplyPatchStreamCapture {
     done_frame: String,
 }
 
+struct CompactionStreamCapture {
+    upstream_events: Vec<Value>,
+    downstream_events: Vec<DownstreamSseEvent>,
+    done_frame: String,
+}
+
 async fn capture_visible_apply_patch_stream() -> ApplyPatchStreamCapture {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -1538,6 +1544,121 @@ async fn capture_visible_apply_patch_stream() -> ApplyPatchStreamCapture {
     }
 }
 
+async fn capture_compaction_stream(compaction_name_field: &str) -> CompactionStreamCapture {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response =
+        post_responses(app, json!({"model":"gpt-5.4","input":"compaction-stream"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("compaction stream request");
+
+    let mut body_stream = response.into_body().into_data_stream();
+
+    let added_event = json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "id": "cmp_1",
+            "type": "compaction",
+            compaction_name_field: "threadline_echo",
+            "encrypted_content": "opaque-added"
+        }
+    });
+    server.send_text(&added_event.to_string()).await;
+
+    let added_chunk = next_body_chunk(&mut body_stream).await;
+    let added_text = String::from_utf8(added_chunk.to_vec()).expect("utf8 added chunk");
+    let (added_sse_event, added_sse_data) = sse_event_and_data(added_text.trim_end());
+    let added_payload: Value = serde_json::from_str(added_sse_data).expect("added payload json");
+
+    let done_event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "cmp_1",
+            "type": "compaction",
+            compaction_name_field: "threadline_echo",
+            "encrypted_content": "opaque-done"
+        }
+    });
+    server.send_text(&done_event.to_string()).await;
+
+    let done_chunk = next_body_chunk(&mut body_stream).await;
+    let done_text = String::from_utf8(done_chunk.to_vec()).expect("utf8 done chunk");
+    let (done_sse_event, done_sse_data) = sse_event_and_data(done_text.trim_end());
+    let done_payload: Value = serde_json::from_str(done_sse_data).expect("done payload json");
+
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-compaction",
+            "output": [
+                {
+                    "id": "cmp_1",
+                    "type": "compaction",
+                    compaction_name_field: "threadline_echo",
+                    "encrypted_content": "opaque-completed"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "done"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    server.send_text(&completed_event.to_string()).await;
+
+    let completed_chunk = next_body_chunk(&mut body_stream).await;
+    let completed_text =
+        String::from_utf8(completed_chunk.to_vec()).expect("utf8 completed chunk");
+    let (completed_sse_event, completed_sse_data) = sse_event_and_data(completed_text.trim_end());
+    let completed_payload: Value =
+        serde_json::from_str(completed_sse_data).expect("completed payload json");
+
+    let done_sentinel_chunk = next_body_chunk(&mut body_stream).await;
+    let done_sentinel_text =
+        String::from_utf8(done_sentinel_chunk.to_vec()).expect("utf8 done sentinel chunk");
+    assert_done_frame(done_sentinel_text.trim_end());
+    assert!(
+        body_stream.next().await.is_none(),
+        "expected EOF after downstream DONE sentinel"
+    );
+
+    CompactionStreamCapture {
+        upstream_events: vec![added_event, done_event, completed_event],
+        downstream_events: vec![
+            DownstreamSseEvent {
+                event: added_sse_event.to_string(),
+                payload: added_payload,
+            },
+            DownstreamSseEvent {
+                event: done_sse_event.to_string(),
+                payload: done_payload,
+            },
+            DownstreamSseEvent {
+                event: completed_sse_event.to_string(),
+                payload: completed_payload,
+            },
+        ],
+        done_frame: done_sentinel_text.trim_end().to_string(),
+    }
+}
+
 #[tokio::test]
 async fn responses_bridge_apply_patch_added_precedes_delta_with_vs_code_required_metadata() {
     let capture = capture_visible_apply_patch_stream().await;
@@ -1634,6 +1755,48 @@ async fn responses_bridge_visible_function_call_payloads_are_forwarded_without_m
             "expected downstream SSE event name to match upstream event type for index {index}"
         );
     }
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
 
+#[tokio::test]
+async fn compaction_output_item_added_is_forwarded_downstream() {
+    let capture = capture_compaction_stream("name").await;
+
+    assert_eq!(capture.downstream_events[0].event, "response.output_item.added");
+    assert_eq!(capture.downstream_events[0].payload, capture.upstream_events[0]);
+    assert_eq!(capture.downstream_events[0].payload["item"]["type"], "compaction");
+    assert_eq!(
+        capture.downstream_events[0].payload["item"]["encrypted_content"],
+        "opaque-added"
+    );
+}
+
+#[tokio::test]
+async fn compaction_output_item_done_is_forwarded_downstream() {
+    let capture = capture_compaction_stream("tool_name").await;
+
+    assert_eq!(capture.downstream_events[1].event, "response.output_item.done");
+    assert_eq!(capture.downstream_events[1].payload, capture.upstream_events[1]);
+    assert_eq!(capture.downstream_events[1].payload["item"]["type"], "compaction");
+    assert_eq!(
+        capture.downstream_events[1].payload["item"]["encrypted_content"],
+        "opaque-done"
+    );
+}
+
+#[tokio::test]
+async fn completed_response_preserves_compaction_output() {
+    let capture = capture_compaction_stream("name").await;
+
+    assert_eq!(capture.downstream_events[2].event, "response.completed");
+    assert_eq!(capture.downstream_events[2].payload, capture.upstream_events[2]);
+    assert_eq!(
+        capture.downstream_events[2].payload["response"]["output"][0]["type"],
+        "compaction"
+    );
+    assert_eq!(
+        capture.downstream_events[2].payload["response"]["output"][0]["encrypted_content"],
+        "opaque-completed"
+    );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }

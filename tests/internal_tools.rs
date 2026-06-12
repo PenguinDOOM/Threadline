@@ -30,7 +30,9 @@ use threadline::jobs::{ThreadlineJobManager, ThreadlineJobManagerConfig};
 use threadline::responses::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
 };
-use threadline::tools::{InternalToolCall, inject_internal_tools};
+use threadline::tools::{
+    InternalToolCall, event_contains_internal_tool_name, inject_internal_tools,
+};
 use threadline::ws_pump::LiveUpstreamWebSocket;
 
 const JOB_START_NEXT_ACTION_HINT: &str = "This job is running in the background. Continue other useful work if available, then poll status or read output later when needed.";
@@ -1537,4 +1539,97 @@ async fn job_tool_outputs_are_serialized_as_function_call_output_json() {
     )
     .expect("result json");
     assert_eq!(result_payload["result"]["summary"], "done");
+}
+
+#[test]
+fn compaction_item_with_threadline_like_name_is_not_an_internal_tool_call() {
+    let event = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "compaction",
+            "id": "cmp_1",
+            "name": "threadline_echo",
+            "tool_name": "threadline_echo",
+            "encrypted_content": "opaque"
+        }
+    });
+
+    assert!(
+        InternalToolCall::from_event(&event)
+            .expect("compaction parse")
+            .is_none(),
+        "expected compaction items to bypass internal function-call handling"
+    );
+}
+
+#[test]
+fn internal_tool_name_detection_does_not_match_non_function_compaction_items() {
+    let compaction_added = json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "type": "compaction",
+            "id": "cmp_1",
+            "name": "threadline_echo",
+            "encrypted_content": "opaque"
+        }
+    });
+    let compaction_done = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "compaction",
+            "id": "cmp_1",
+            "tool_name": "threadline_echo",
+            "encrypted_content": "opaque"
+        }
+    });
+    let internal_done = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-internal",
+            "name": "threadline_echo",
+            "arguments": "{\"value\":\"opaque\"}"
+        }
+    });
+
+    assert!(
+        !event_contains_internal_tool_name(&compaction_added),
+        "expected non-function compaction added event to remain visible across translation"
+    );
+    assert!(
+        !event_contains_internal_tool_name(&compaction_done),
+        "expected non-function compaction done event to remain visible across translation"
+    );
+    assert!(
+        event_contains_internal_tool_name(&internal_done),
+        "expected actual internal function_call item to stay suppressed"
+    );
+}
+
+#[test]
+fn actual_internal_function_call_with_threadline_name_remains_suppressed() {
+    let event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-internal",
+            "name": "threadline_echo",
+            "arguments": "{\"value\":\"secret-internal\"}"
+        }
+    });
+
+    assert!(
+        InternalToolCall::from_event(&event)
+            .expect("internal parse")
+            .is_some(),
+        "expected actual threadline function_call item to remain an internal tool"
+    );
+    assert!(
+        event_contains_internal_tool_name(&event),
+        "expected actual threadline function_call item to remain suppressible"
+    );
 }

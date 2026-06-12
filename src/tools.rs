@@ -159,7 +159,14 @@ pub fn is_internal_tool_name(name: &str) -> bool {
 }
 
 pub fn event_contains_internal_tool_name(event: &Value) -> bool {
-    value_contains_internal_tool_name(event)
+    let Some(item) = event.get("item") else {
+        return false;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return false;
+    }
+
+    value_contains_internal_tool_name(item)
 }
 
 fn parse_arguments(arguments: Option<&Value>) -> Result<Value, ThreadlineError> {
