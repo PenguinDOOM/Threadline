@@ -67,19 +67,26 @@ struct UpstreamEventTraceMetadata {
     delta_length: Option<usize>,
     output_index: Option<u64>,
     item_id: Option<String>,
+    is_compaction: bool,
+    compaction_id: Option<String>,
+    has_encrypted_content: Option<bool>,
 }
 
 impl UpstreamEventTraceMetadata {
     fn from_event(event: &Value) -> Self {
         let item = event.get("item");
+        let item_type = string_field(item.and_then(|value| value.get("type")))
+            .or_else(|| string_field(event.get("item_type")));
+        let item_id = string_field(event.get("item_id"))
+            .or_else(|| string_field(item.and_then(|value| value.get("id"))));
+        let is_compaction = item_type.as_deref() == Some("compaction");
         Self {
             event_type: event
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("message")
                 .to_string(),
-            item_type: string_field(item.and_then(|value| value.get("type")))
-                .or_else(|| string_field(event.get("item_type"))),
+            item_type,
             item_name: string_field(item.and_then(|value| value.get("name")))
                 .or_else(|| string_field(event.get("name")))
                 .or_else(|| string_field(event.get("tool_name"))),
@@ -91,8 +98,13 @@ impl UpstreamEventTraceMetadata {
             ),
             delta_length: string_length_field(event.get("delta")),
             output_index: output_index_from_event(event),
-            item_id: string_field(event.get("item_id"))
-                .or_else(|| string_field(item.and_then(|value| value.get("id")))),
+            item_id: item_id.clone(),
+            is_compaction,
+            compaction_id: is_compaction.then_some(item_id).flatten(),
+            has_encrypted_content: is_compaction.then_some(
+                item.and_then(|value| value.get("encrypted_content"))
+                    .is_some(),
+            ),
         }
     }
 }
@@ -108,6 +120,9 @@ struct DownstreamSseTraceMetadata {
     delta_length: Option<usize>,
     output_index: Option<u64>,
     item_id: Option<String>,
+    is_compaction: bool,
+    compaction_id: Option<String>,
+    has_encrypted_content: Option<bool>,
 }
 
 fn downstream_sse_trace_metadata(
@@ -125,6 +140,9 @@ fn downstream_sse_trace_metadata(
         delta_length: metadata.delta_length,
         output_index: metadata.output_index,
         item_id: metadata.item_id,
+        is_compaction: metadata.is_compaction,
+        compaction_id: metadata.compaction_id,
+        has_encrypted_content: metadata.has_encrypted_content,
     }
 }
 
@@ -138,6 +156,9 @@ fn trace_upstream_event(metadata: &UpstreamEventTraceMetadata) {
         delta_length = ?metadata.delta_length,
         output_index = ?metadata.output_index,
         item_id = ?metadata.item_id,
+        is_compaction = metadata.is_compaction,
+        compaction_id = ?metadata.compaction_id,
+        has_encrypted_content = ?metadata.has_encrypted_content,
         "{RESPONSES_TRANSLATION_UPSTREAM_EVENT}"
     );
 }
@@ -153,6 +174,9 @@ fn trace_downstream_sse_event(metadata: &DownstreamSseTraceMetadata) {
         delta_length = ?metadata.delta_length,
         output_index = ?metadata.output_index,
         item_id = ?metadata.item_id,
+        is_compaction = metadata.is_compaction,
+        compaction_id = ?metadata.compaction_id,
+        has_encrypted_content = ?metadata.has_encrypted_content,
         "{RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT}"
     );
 }
@@ -168,6 +192,9 @@ fn trace_suppressed_event(metadata: &UpstreamEventTraceMetadata) {
         delta_length = ?metadata.delta_length,
         output_index = ?metadata.output_index,
         item_id = ?metadata.item_id,
+        is_compaction = metadata.is_compaction,
+        compaction_id = ?metadata.compaction_id,
+        has_encrypted_content = ?metadata.has_encrypted_content,
         "{RESPONSES_TRANSLATION_EVENT_SUPPRESSED}"
     );
 }
@@ -521,6 +548,52 @@ mod tests {
         assert_eq!(metadata.item_id.as_deref(), Some("fc_apply_patch_1"));
         assert_eq!(metadata.arguments_length, None);
         assert_eq!(metadata.item_name, None);
+    }
+
+    #[test]
+    fn upstream_event_trace_metadata_reports_compaction_without_encrypted_content() {
+        let encrypted_content = "opaque-compaction-payload";
+        let parsed = json!({
+            "type": "response.output_item.done",
+            "output_index": 4,
+            "item": {
+                "type": "compaction",
+                "id": "compaction-visible",
+                "encrypted_content": encrypted_content
+            }
+        });
+
+        let metadata = UpstreamEventTraceMetadata::from_event(&parsed);
+        let metadata_debug = format!("{metadata:?}");
+
+        assert_eq!(metadata.event_type, "response.output_item.done");
+        assert_eq!(metadata.item_type.as_deref(), Some("compaction"));
+        assert!(metadata.is_compaction);
+        assert_eq!(
+            metadata.compaction_id.as_deref(),
+            Some("compaction-visible")
+        );
+        assert_eq!(metadata.output_index, Some(4));
+        assert_eq!(metadata.has_encrypted_content, Some(true));
+        assert!(!metadata_debug.contains(encrypted_content));
+    }
+
+    #[test]
+    fn upstream_event_trace_metadata_reports_compaction_without_blob_when_missing() {
+        let parsed = json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "compaction",
+                "id": "compaction-empty"
+            }
+        });
+
+        let metadata = UpstreamEventTraceMetadata::from_event(&parsed);
+
+        assert!(metadata.is_compaction);
+        assert_eq!(metadata.compaction_id.as_deref(), Some("compaction-empty"));
+        assert_eq!(metadata.has_encrypted_content, Some(false));
     }
 
     #[test]
