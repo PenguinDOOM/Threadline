@@ -304,6 +304,101 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
 }
 
 #[tokio::test]
+async fn context_management_compaction_is_forwarded_without_changing_marker_semantics() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let second_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: Some("turn-state-1".to_string()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&second_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let first_response =
+        post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let first_payload: Value = serde_json::from_str(&message_text(
+        first_server
+            .recv_client_message()
+            .await
+            .expect("first request message"),
+    ))
+    .expect("first request json");
+    assert_eq!(first_payload["type"], "response.create");
+
+    first_server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-1"}}"#)
+        .await;
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+
+    first_server.send_close(1000, "done").await;
+    sleep(Duration::from_millis(50)).await;
+
+    let second_response = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"second",
+            "previous_response_id":"response-1",
+            "context_management": {
+                "type":"compaction",
+                "compact_threshold": 12345
+            },
+            "reasoning":{"effort":"high","summary":"auto"},
+            "include":["reasoning.encrypted_content"],
+            "truncation":"auto"
+        }),
+    )
+    .await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+
+    let second_payload: Value = serde_json::from_str(&message_text(
+        second_server
+            .recv_client_message()
+            .await
+            .expect("second request message"),
+    ))
+    .expect("second request json");
+    assert_eq!(second_payload["type"], "response.create");
+    assert_eq!(second_payload["previous_response_id"], "response-1");
+    assert_eq!(
+        second_payload["context_management"],
+        json!({
+            "type":"compaction",
+            "compact_threshold": 12345
+        })
+    );
+    assert_eq!(
+        second_payload["reasoning"],
+        json!({"effort":"high","summary":"auto"})
+    );
+    assert_eq!(
+        second_payload["include"],
+        json!(["reasoning.encrypted_content"])
+    );
+    assert!(second_payload.get("response").is_none());
+    assert_codex_unsupported_response_fields_are_absent(&second_payload);
+
+    second_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .await;
+    let _ = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .expect("second body");
+}
+
+#[tokio::test]
 async fn missing_previous_response_id_returns_stable_not_found() {
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(FailingConnector));
 
