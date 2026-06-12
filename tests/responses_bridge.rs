@@ -1624,8 +1624,7 @@ async fn capture_compaction_stream(compaction_name_field: &str) -> CompactionStr
     server.send_text(&completed_event.to_string()).await;
 
     let completed_chunk = next_body_chunk(&mut body_stream).await;
-    let completed_text =
-        String::from_utf8(completed_chunk.to_vec()).expect("utf8 completed chunk");
+    let completed_text = String::from_utf8(completed_chunk.to_vec()).expect("utf8 completed chunk");
     let (completed_sse_event, completed_sse_data) = sse_event_and_data(completed_text.trim_end());
     let completed_payload: Value =
         serde_json::from_str(completed_sse_data).expect("completed payload json");
@@ -1700,11 +1699,14 @@ async fn responses_bridge_apply_patch_delta_matches_added_output_index() {
         .filter(|event| event.event == "response.function_call_arguments.delta")
         .collect();
 
-    assert_eq!(delta_events.len(), 2, "expected two visible argument deltas");
+    assert_eq!(
+        delta_events.len(),
+        2,
+        "expected two visible argument deltas"
+    );
     for delta_event in delta_events {
         assert_eq!(
-            delta_event.payload["output_index"],
-            added_output_index,
+            delta_event.payload["output_index"], added_output_index,
             "expected visible argument delta to preserve added output_index"
         );
         assert_eq!(delta_event.payload["item_id"], "fc_apply_patch_1");
@@ -1745,13 +1747,14 @@ async fn responses_bridge_visible_function_call_payloads_are_forwarded_without_m
 
     for (index, upstream_event) in capture.upstream_events.iter().enumerate() {
         assert_eq!(
-            capture.downstream_events[index].payload,
-            *upstream_event,
+            capture.downstream_events[index].payload, *upstream_event,
             "expected downstream SSE payload to match upstream event for index {index}"
         );
         assert_eq!(
             capture.downstream_events[index].event,
-            upstream_event["type"].as_str().expect("upstream event type"),
+            upstream_event["type"]
+                .as_str()
+                .expect("upstream event type"),
             "expected downstream SSE event name to match upstream event type for index {index}"
         );
     }
@@ -1762,9 +1765,18 @@ async fn responses_bridge_visible_function_call_payloads_are_forwarded_without_m
 async fn compaction_output_item_added_is_forwarded_downstream() {
     let capture = capture_compaction_stream("name").await;
 
-    assert_eq!(capture.downstream_events[0].event, "response.output_item.added");
-    assert_eq!(capture.downstream_events[0].payload, capture.upstream_events[0]);
-    assert_eq!(capture.downstream_events[0].payload["item"]["type"], "compaction");
+    assert_eq!(
+        capture.downstream_events[0].event,
+        "response.output_item.added"
+    );
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        capture.upstream_events[0]
+    );
+    assert_eq!(
+        capture.downstream_events[0].payload["item"]["type"],
+        "compaction"
+    );
     assert_eq!(
         capture.downstream_events[0].payload["item"]["encrypted_content"],
         "opaque-added"
@@ -1775,9 +1787,18 @@ async fn compaction_output_item_added_is_forwarded_downstream() {
 async fn compaction_output_item_done_is_forwarded_downstream() {
     let capture = capture_compaction_stream("tool_name").await;
 
-    assert_eq!(capture.downstream_events[1].event, "response.output_item.done");
-    assert_eq!(capture.downstream_events[1].payload, capture.upstream_events[1]);
-    assert_eq!(capture.downstream_events[1].payload["item"]["type"], "compaction");
+    assert_eq!(
+        capture.downstream_events[1].event,
+        "response.output_item.done"
+    );
+    assert_eq!(
+        capture.downstream_events[1].payload,
+        capture.upstream_events[1]
+    );
+    assert_eq!(
+        capture.downstream_events[1].payload["item"]["type"],
+        "compaction"
+    );
     assert_eq!(
         capture.downstream_events[1].payload["item"]["encrypted_content"],
         "opaque-done"
@@ -1789,7 +1810,10 @@ async fn completed_response_preserves_compaction_output() {
     let capture = capture_compaction_stream("name").await;
 
     assert_eq!(capture.downstream_events[2].event, "response.completed");
-    assert_eq!(capture.downstream_events[2].payload, capture.upstream_events[2]);
+    assert_eq!(
+        capture.downstream_events[2].payload,
+        capture.upstream_events[2]
+    );
     assert_eq!(
         capture.downstream_events[2].payload["response"]["output"][0]["type"],
         "compaction"
