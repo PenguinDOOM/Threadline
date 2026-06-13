@@ -1383,6 +1383,11 @@ struct CompactionStreamCapture {
     done_frame: String,
 }
 
+struct CompletedOutputStreamCapture {
+    downstream_events: Vec<DownstreamSseEvent>,
+    done_frame: String,
+}
+
 async fn capture_visible_apply_patch_stream() -> ApplyPatchStreamCapture {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -1658,6 +1663,63 @@ async fn capture_compaction_stream(compaction_name_field: &str) -> CompactionStr
     }
 }
 
+async fn capture_completed_output_stream(
+    upstream_events: Vec<Value>,
+) -> CompletedOutputStreamCapture {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response =
+        post_responses(app, json!({"model":"gpt-5.4","input":"completed-output-stream"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("completed output stream request");
+
+    let mut body_stream = response.into_body().into_data_stream();
+    for upstream_event in upstream_events {
+        server.send_text(&upstream_event.to_string()).await;
+    }
+
+    let mut downstream_events = Vec::new();
+    let done_frame = loop {
+        let chunk = match body_stream.next().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(error)) => panic!("expected SSE chunk, got body error: {error}"),
+            None => panic!("expected downstream DONE sentinel before EOF"),
+        };
+
+        let chunk_text = String::from_utf8(chunk.to_vec()).expect("utf8 SSE chunk");
+        let frame = chunk_text.trim_end();
+        if frame == "data: [DONE]" {
+            break frame.to_string();
+        }
+
+        let (event, data) = sse_event_and_data(frame);
+        let payload: Value = serde_json::from_str(data).expect("SSE payload json");
+        downstream_events.push(DownstreamSseEvent {
+            event: event.to_string(),
+            payload,
+        });
+    };
+
+    assert!(
+        body_stream.next().await.is_none(),
+        "expected EOF after downstream DONE sentinel"
+    );
+
+    CompletedOutputStreamCapture {
+        downstream_events,
+        done_frame,
+    }
+}
+
 #[tokio::test]
 async fn responses_bridge_apply_patch_added_precedes_delta_with_vs_code_required_metadata() {
     let capture = capture_visible_apply_patch_stream().await;
@@ -1822,5 +1884,383 @@ async fn completed_response_preserves_compaction_output() {
         capture.downstream_events[2].payload["response"]["output"][0]["encrypted_content"],
         "opaque-completed"
     );
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn completed_only_assistant_output_text_is_synthesized_as_delta() {
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-completed-only",
+            "output": [
+                {
+                    "id": "assistant-item-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "hello from completed"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+
+    assert_eq!(capture.downstream_events.len(), 2);
+    assert_eq!(
+        capture.downstream_events[0].event,
+        "response.output_text.delta"
+    );
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "hello from completed",
+            "item_id": "assistant-item-1",
+            "output_index": 0,
+            "content_index": 0
+        })
+    );
+    assert_eq!(capture.downstream_events[1].event, "response.completed");
+    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn streamed_output_text_delta_is_not_duplicated_from_completed_output() {
+    let delta_event = json!({
+        "type": "response.output_text.delta",
+        "delta": "hello from stream",
+        "item_id": "assistant-item-2",
+        "output_index": 0,
+        "content_index": 0
+    });
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-prior-delta",
+            "output": [
+                {
+                    "id": "assistant-item-2",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "hello from stream"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    let capture =
+        capture_completed_output_stream(vec![delta_event.clone(), completed_event.clone()]).await;
+
+    assert_eq!(capture.downstream_events.len(), 2);
+    assert_eq!(
+        capture
+            .downstream_events
+            .iter()
+            .filter(|event| event.event == "response.output_text.delta")
+            .count(),
+        1,
+        "expected the existing streamed delta to remain unique"
+    );
+    assert_eq!(capture.downstream_events[0].event, "response.output_text.delta");
+    assert_eq!(capture.downstream_events[0].payload, delta_event);
+    assert_eq!(capture.downstream_events[1].event, "response.completed");
+    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn completed_without_assistant_output_text_does_not_synthesize_delta() {
+    let completed_cases = vec![
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-function-call-only",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "apply_patch",
+                        "call_id": "call-1"
+                    }
+                ]
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-non-output-text",
+                "output": [
+                    {
+                        "id": "assistant-item-3",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "refusal",
+                                "refusal": "declined"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }),
+    ];
+
+    for completed_event in completed_cases {
+        let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+        assert_eq!(
+            capture.downstream_events.len(),
+            1,
+            "expected only response.completed when no assistant output_text is present"
+        );
+        assert_eq!(capture.downstream_events[0].event, "response.completed");
+        assert_eq!(capture.downstream_events[0].payload, completed_event);
+        assert_eq!(capture.done_frame, "data: [DONE]");
+    }
+}
+
+#[tokio::test]
+async fn completed_only_synthetic_delta_precedes_completed_and_done_chunks() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"completed-output-order"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("completed output ordering request");
+
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-ordering",
+            "output": [
+                {
+                    "id": "assistant-item-4",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "ordered text"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    server.send_text(&completed_event.to_string()).await;
+
+    let mut body_stream = response.into_body().into_data_stream();
+
+    let first_chunk = next_body_chunk(&mut body_stream).await;
+    let first_text = String::from_utf8(first_chunk.to_vec()).expect("utf8 first chunk");
+    let (first_event, first_data) = sse_event_and_data(first_text.trim_end());
+    let first_payload: Value = serde_json::from_str(first_data).expect("first payload json");
+    assert_eq!(first_event, "response.output_text.delta");
+    assert_eq!(first_payload["delta"], "ordered text");
+
+    let second_chunk = next_body_chunk(&mut body_stream).await;
+    let second_text = String::from_utf8(second_chunk.to_vec()).expect("utf8 second chunk");
+    let (second_event, second_data) = sse_event_and_data(second_text.trim_end());
+    let second_payload: Value = serde_json::from_str(second_data).expect("second payload json");
+    assert_eq!(second_event, "response.completed");
+    assert_eq!(second_payload, completed_event);
+
+    let third_chunk = next_body_chunk(&mut body_stream).await;
+    assert_eq!(third_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(
+        body_stream.next().await.is_none(),
+        "expected EOF after downstream DONE sentinel"
+    );
+}
+
+#[tokio::test]
+async fn malformed_completed_output_does_not_panic_or_synthesize_delta() {
+    let completed_cases = vec![
+        (
+            "missing-output",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "response-missing-output"
+                }
+            }),
+        ),
+        (
+            "output-not-array",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "response-output-not-array",
+                    "output": {}
+                }
+            }),
+        ),
+        (
+            "content-missing",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "response-content-missing",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant"
+                        }
+                    ]
+                }
+            }),
+        ),
+        (
+            "content-not-array",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "response-content-not-array",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": {}
+                        }
+                    ]
+                }
+            }),
+        ),
+        (
+            "non-string-text",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "response-non-string-text",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": 42
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        ),
+    ];
+
+    for (case_name, completed_event) in completed_cases {
+        let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+        assert_eq!(
+            capture.downstream_events.len(),
+            1,
+            "expected malformed case {case_name} to forward response.completed without a synthetic delta"
+        );
+        assert_eq!(
+            capture.downstream_events[0].event,
+            "response.completed",
+            "expected malformed case {case_name} to preserve the completed event"
+        );
+        assert_eq!(
+            capture.downstream_events[0].payload,
+            completed_event,
+            "expected malformed case {case_name} to remain unchanged downstream"
+        );
+        assert_eq!(capture.done_frame, "data: [DONE]");
+    }
+}
+
+#[tokio::test]
+async fn multi_part_assistant_output_text_is_synthesized_as_single_delta_from_first_contributing_part_metadata() {
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-multi-part",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "apply_patch",
+                    "call_id": "call-metadata-anchor"
+                },
+                {
+                    "id": "assistant-item-5",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "   "
+                        },
+                        {
+                            "type": "output_text",
+                            "text": "Hello"
+                        },
+                        {
+                            "type": "output_text",
+                            "text": ""
+                        },
+                        {
+                            "type": "output_text",
+                            "text": "\n"
+                        },
+                        {
+                            "type": "output_text",
+                            "text": " world"
+                        }
+                    ]
+                },
+                {
+                    "id": "assistant-item-6",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "!"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+
+    assert_eq!(capture.downstream_events.len(), 2);
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Hello world!",
+            "item_id": "assistant-item-5",
+            "output_index": 1,
+            "content_index": 1
+        })
+    );
+    assert_eq!(capture.downstream_events[1].event, "response.completed");
+    assert_eq!(capture.downstream_events[1].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
