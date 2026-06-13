@@ -36,6 +36,7 @@ These invariants should remain true across refactors:
 * Intermediate completions for internal tool calls are not final downstream completions.
 * Long-running work is represented as jobs, not long blocking tool calls.
 * Job completion updates stored state only and does not push a new upstream response by itself.
+* Classified auxiliary summary requests are a narrow exception to retained continuation markers and must stay outside retained session registry semantics.
 * Public errors are stable and safe to expose.
 * Secrets are never logged.
 
@@ -53,6 +54,8 @@ This fallback does not rewrite the original final `response.completed` payload, 
 
 When a downstream request includes `previous_response_id`, use it as a continuation marker.
 
+Ordinary downstream requests that include `previous_response_id` keep retained continuation semantics and must not silently start unrelated fresh sessions.
+
 `response.completed.id` is the continuation-safe marker for later `previous_response_id` requests.
 
 If a later turn fails upstream, do not reinterpret that failed turn as a new continuation marker.
@@ -60,6 +63,14 @@ If a later turn fails upstream, do not reinterpret that failed turn as a new con
 A response marker may refer to a retained session that is open, closed but recoverable, missing, or unrecoverable. Handle each state explicitly.
 
 Do not assume that a missing or closed socket means the response marker should be forgotten.
+
+A classified auxiliary summary request is a narrow exception to that rule. This request class is identified by summary-only prompt fingerprints carried in `input`, using the observed summary instruction item shape for auxiliary summarization, and it may also carry a downstream `previous_response_id` as client context.
+
+Classify this request type by its summary-only auxiliary behavior, not by `context_management` fields alone.
+
+When a request is classified as an auxiliary summary request, do not acquire a retained marker, do not forward its downstream `previous_response_id` upstream, do not consume retained registry capacity, and do not register the completed summary response id as a continuation marker.
+
+After terminal completion, failure, or cancellation of an auxiliary summary request, clean up any transient auxiliary state associated with that request.
 
 ## WebSocket pump ownership
 
@@ -112,6 +123,8 @@ Do not store secrets in registry entries.
 ## Registry lifecycle and conflicts
 
 Create or update registry entries when an upstream response reaches a completed state that can be continued.
+
+Do not create retained registry entries for classified auxiliary summary requests or for their completed summary response ids.
 
 Do not register upstream failed response ids as continuation markers.
 
