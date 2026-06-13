@@ -898,6 +898,119 @@ async fn internal_tool_added_and_done_events_stay_hidden_until_intermediate_comp
 }
 
 #[tokio::test]
+async fn intermediate_internal_tool_completion_keeps_marker_active_until_followup_finishes() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model": "gpt-5.4",
+            "input": "run hidden internal tool loop",
+            "previous_response_id": "response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(active.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let active_request: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("active request"),
+    ))
+    .expect("active request json");
+    assert_eq!(active_request["previous_response_id"], "response-1");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(
+        followup_request["previous_response_id"],
+        "response-intermediate"
+    );
+
+    let conflict = post_responses(
+        app.clone(),
+        json!({
+            "model": "gpt-5.4",
+            "input": "conflict-before-followup-finish",
+            "previous_response_id": "response-1"
+        }),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    assert!(
+        server.take_pending_client_messages().await.is_empty(),
+        "expected no extra upstream request while the follow-up response is still active"
+    );
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"final answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 3);
+    let delta_frame = sse_event_and_data(frames[0]);
+    assert_eq!(delta_frame.0, "response.output_text.delta");
+    assert_eq!(
+        serde_json::from_str::<Value>(delta_frame.1).expect("delta json"),
+        json!({"type":"response.output_text.delta","delta":"final answer"})
+    );
+
+    let completed_frame = sse_event_and_data(frames[1]);
+    assert_eq!(completed_frame.0, "response.completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(completed_frame.1).expect("completed json"),
+        json!({"type":"response.completed","response":{"id":"response-final"}})
+    );
+
+    assert_done_frame(frames[2]);
+}
+
+#[tokio::test]
 async fn internal_tool_argument_deltas_are_not_forwarded_downstream() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {

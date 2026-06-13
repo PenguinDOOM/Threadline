@@ -714,6 +714,154 @@ async fn downstream_completed_and_done_are_separate_body_chunks_before_eof() {
 }
 
 #[tokio::test]
+async fn completed_marker_can_be_reused_after_terminal_chunk_before_done_or_eof() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let active_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("active request"),
+    ))
+    .expect("active request json");
+    assert_eq!(active_payload["previous_response_id"], "response-1");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .await;
+
+    let mut active_body = active.into_body().into_data_stream();
+    let first_chunk = next_body_chunk(&mut active_body).await;
+    let first_text = String::from_utf8(first_chunk.to_vec()).expect("utf8 first chunk");
+    let (event, data) = sse_event_and_data(first_text.trim_end());
+    let payload: Value = serde_json::from_str(data).expect("completed json");
+    assert_eq!(event, "response.completed");
+    assert_eq!(payload["response"]["id"], "response-2");
+
+    let resumed = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume-before-done",
+            "previous_response_id":"response-2"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("resumed request"),
+    ))
+    .expect("resumed request json");
+    assert_eq!(resumed_payload["previous_response_id"], "response-2");
+
+    let done_chunk = next_body_chunk(&mut active_body).await;
+    assert_eq!(done_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(
+        active_body.next().await.is_none(),
+        "expected EOF after DONE"
+    );
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-3"}}"#)
+        .await;
+    let _ = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+}
+
+#[tokio::test]
+async fn recoverable_upstream_close_releases_prior_marker_before_body_drop() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: Some("turn-state-1".to_string()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&reconnect_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = first_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+
+    let mut initial_body = initial.into_body().into_data_stream();
+    let first_chunk = next_body_chunk(&mut initial_body).await;
+    let first_text = String::from_utf8(first_chunk.to_vec()).expect("utf8 first chunk");
+    let (event, data) = sse_event_and_data(first_text.trim_end());
+    let payload: Value = serde_json::from_str(data).expect("completed json");
+    assert_eq!(event, "response.completed");
+    assert_eq!(payload["response"]["id"], "response-1");
+
+    first_server.send_close(1000, "done").await;
+    sleep(Duration::from_millis(50)).await;
+
+    let resumed = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume-after-close",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_payload: Value = serde_json::from_str(&message_text(
+        reconnect_server
+            .recv_client_message()
+            .await
+            .expect("resumed request"),
+    ))
+    .expect("resumed request json");
+    assert_eq!(resumed_payload["previous_response_id"], "response-1");
+
+    let done_chunk = next_body_chunk(&mut initial_body).await;
+    assert_eq!(done_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(
+        initial_body.next().await.is_none(),
+        "expected EOF after DONE"
+    );
+
+    reconnect_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .await;
+    let _ = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+}
+
+#[tokio::test]
 async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_done_and_eof() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -875,6 +1023,99 @@ async fn response_failed_preserves_prior_completed_marker_for_resume() {
     .expect("resumed request json");
     assert!(resumed_payload.get("response").is_none());
     assert_eq!(resumed_payload["previous_response_id"], "response-1");
+    reconnect_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .await;
+    let _ = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+}
+
+#[tokio::test]
+async fn failed_turn_releases_prior_marker_before_body_drop() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: Some("turn-state-1".to_string()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&reconnect_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = first_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let failed = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"failure",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::OK);
+    let failed_payload: Value = serde_json::from_str(&message_text(
+        first_server
+            .recv_client_message()
+            .await
+            .expect("failed request message"),
+    ))
+    .expect("failed request json");
+    assert_eq!(failed_payload["previous_response_id"], "response-1");
+    first_server
+        .send_text(r#"{"type":"response.failed","response":{"id":"response-failed"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
+        .await;
+
+    let mut failed_body = failed.into_body().into_data_stream();
+    let failed_chunk = next_body_chunk(&mut failed_body).await;
+    let failed_text = String::from_utf8(failed_chunk.to_vec()).expect("utf8 failed chunk");
+    let (event, data) = sse_event_and_data(failed_text.trim_end());
+    let failed_event: Value = serde_json::from_str(data).expect("failed event json");
+    assert_eq!(event, "response.failed");
+    assert_eq!(failed_event["response"]["id"], "response-failed");
+
+    let resumed = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume-before-failed-body-drop",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_payload: Value = serde_json::from_str(&message_text(
+        reconnect_server
+            .recv_client_message()
+            .await
+            .expect("resumed request message"),
+    ))
+    .expect("resumed request json");
+    assert_eq!(resumed_payload["previous_response_id"], "response-1");
+
+    let done_chunk = next_body_chunk(&mut failed_body).await;
+    assert_eq!(done_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(
+        failed_body.next().await.is_none(),
+        "expected EOF after DONE"
+    );
+
     reconnect_server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
         .await;
@@ -2100,6 +2341,108 @@ async fn completed_only_synthetic_delta_precedes_completed_and_done_chunks() {
         body_stream.next().await.is_none(),
         "expected EOF after downstream DONE sentinel"
     );
+}
+
+#[tokio::test]
+async fn completed_only_synthetic_delta_releases_marker_before_queued_completed() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"completed-output-order",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let active_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("active request"),
+    ))
+    .expect("active request json");
+    assert_eq!(active_payload["previous_response_id"], "response-1");
+
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-ordering",
+            "output": [
+                {
+                    "id": "assistant-item-4",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "ordered text"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    server.send_text(&completed_event.to_string()).await;
+
+    let mut active_body = active.into_body().into_data_stream();
+    let first_chunk = next_body_chunk(&mut active_body).await;
+    let first_text = String::from_utf8(first_chunk.to_vec()).expect("utf8 first chunk");
+    let (event, data) = sse_event_and_data(first_text.trim_end());
+    let payload: Value = serde_json::from_str(data).expect("synthetic delta json");
+    assert_eq!(event, "response.output_text.delta");
+    assert_eq!(payload["delta"], "ordered text");
+
+    let resumed = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume-before-queued-completed",
+            "previous_response_id":"response-ordering"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("resumed request"),
+    ))
+    .expect("resumed request json");
+    assert_eq!(resumed_payload["previous_response_id"], "response-ordering");
+
+    let second_chunk = next_body_chunk(&mut active_body).await;
+    let second_text = String::from_utf8(second_chunk.to_vec()).expect("utf8 second chunk");
+    let (second_event, second_data) = sse_event_and_data(second_text.trim_end());
+    let second_payload: Value = serde_json::from_str(second_data).expect("completed json");
+    assert_eq!(second_event, "response.completed");
+    assert_eq!(second_payload, completed_event);
+
+    let third_chunk = next_body_chunk(&mut active_body).await;
+    assert_eq!(third_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
+    assert!(
+        active_body.next().await.is_none(),
+        "expected EOF after DONE"
+    );
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-3"}}"#)
+        .await;
+    let _ = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
 }
 
 #[tokio::test]
