@@ -358,6 +358,7 @@ pub(super) fn response_stream(
                     }
                     Ok(None) => {
                         state.lease.mark_upstream_recoverable().await;
+                        state.lease.release();
                         state.done = true;
                         return Some((
                             Ok::<Bytes, Infallible>(sse_error_chunk(
@@ -514,26 +515,27 @@ pub(super) fn response_stream(
                     if !state.downstream_output_text_delta_emitted
                         && let Some(synthetic_delta) =
                             synthesized_completed_output_text_delta(&parsed)
-                        {
-                            trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                    {
+                        state.lease.release();
+                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                            &synthetic_delta,
+                            DownstreamTraceAction::Forwarded,
+                        ));
+                        debug!(
+                            response_id,
+                            event_type = "response.output_text.delta",
+                            "translation_event_forwarded"
+                        );
+                        state.downstream_output_text_delta_emitted = true;
+                        state.queued_final_completed = Some(parsed);
+                        return Some((
+                            Ok::<Bytes, Infallible>(sse_json_chunk(
+                                "response.output_text.delta",
                                 &synthetic_delta,
-                                DownstreamTraceAction::Forwarded,
-                            ));
-                            debug!(
-                                response_id,
-                                event_type = "response.output_text.delta",
-                                "translation_event_forwarded"
-                            );
-                            state.downstream_output_text_delta_emitted = true;
-                            state.queued_final_completed = Some(parsed);
-                            return Some((
-                                Ok::<Bytes, Infallible>(sse_json_chunk(
-                                    "response.output_text.delta",
-                                    &synthetic_delta,
-                                )),
-                                state,
-                            ));
-                        }
+                            )),
+                            state,
+                        ));
+                    }
 
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
                         &parsed,
@@ -541,6 +543,7 @@ pub(super) fn response_stream(
                     ));
                     debug!(response_id, event_type, "translation_event_forwarded");
                     debug!(response_id, "terminal_response_forwarded");
+                    state.lease.release();
                     state.final_done_pending = true;
                     debug!(response_id, "final_done_queued");
                     return Some((
@@ -554,6 +557,7 @@ pub(super) fn response_stream(
                         DownstreamTraceAction::Terminal,
                     ));
                     state.lease.mark_upstream_recoverable().await;
+                    state.lease.release();
                     state.final_done_pending = true;
                     debug!(event_type, "terminal_response_forwarded");
                     debug!(event_type, "final_done_queued");

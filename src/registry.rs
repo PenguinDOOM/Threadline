@@ -24,6 +24,7 @@ pub struct RetainedSessionLease {
     session: UpstreamSessionDescriptor,
     upstream: Option<Arc<LiveUpstreamWebSocket>>,
     removed: bool,
+    released: bool,
 }
 
 impl std::fmt::Debug for RetainedSessionLease {
@@ -33,6 +34,7 @@ impl std::fmt::Debug for RetainedSessionLease {
             .field("session", &self.session)
             .field("has_live_upstream", &self.upstream.is_some())
             .field("removed", &self.removed)
+            .field("released", &self.released)
             .finish()
     }
 }
@@ -120,6 +122,7 @@ impl RetainedSessionRegistry {
             session,
             upstream: None,
             removed: false,
+            released: false,
         })
     }
 
@@ -167,6 +170,7 @@ impl RetainedSessionRegistry {
             session: entry.session.clone(),
             upstream: entry.upstream.clone(),
             removed: false,
+            released: false,
         })
     }
 }
@@ -182,6 +186,27 @@ impl RetainedSessionLease {
 
     pub fn upstream(&self) -> Option<Arc<LiveUpstreamWebSocket>> {
         self.upstream.clone()
+    }
+
+    pub fn release(&mut self) {
+        if self.removed || self.released {
+            return;
+        }
+
+        self.released = true;
+
+        if let Ok(mut state) = self.registry.lock()
+            && let Some(entry) = state.entries.get_mut(&self.entry_id)
+        {
+            entry.in_use = false;
+            entry.last_used = Instant::now();
+            debug!(
+                session_id = %entry.session.session_id,
+                thread_id = %entry.session.thread_id,
+                window_id = %entry.session.window_id,
+                "retained_session_released"
+            );
+        }
     }
 
     pub async fn record_completed_marker(&mut self, response_marker: impl Into<String>) {
@@ -238,27 +263,13 @@ impl RetainedSessionLease {
         remove_entry(&mut state, self.entry_id);
         self.upstream = None;
         self.removed = true;
+        self.released = true;
     }
 }
 
 impl Drop for RetainedSessionLease {
     fn drop(&mut self) {
-        if self.removed {
-            return;
-        }
-
-        if let Ok(mut state) = self.registry.lock()
-            && let Some(entry) = state.entries.get_mut(&self.entry_id)
-        {
-            entry.in_use = false;
-            entry.last_used = Instant::now();
-            debug!(
-                session_id = %entry.session.session_id,
-                thread_id = %entry.session.thread_id,
-                window_id = %entry.session.window_id,
-                "retained_session_released"
-            );
-        }
+        self.release();
     }
 }
 
