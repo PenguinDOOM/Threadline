@@ -341,6 +341,7 @@ pub(super) struct ResponseStreamState {
     pub(super) base_request: serde_json::Map<String, Value>,
     pub(super) pending_internal_outputs: Vec<PendingInternalToolOutput>,
     pub(super) previous_response_id: Option<String>,
+    pub(super) execute_internal_tools: bool,
     pub(super) suppressed_internal_output_indexes: HashSet<u64>,
     pub(super) upstream_event_seen: bool,
     pub(super) reconnect_attempted: bool,
@@ -431,30 +432,9 @@ pub(super) fn response_stream(
             let trace_metadata = UpstreamEventTraceMetadata::from_event(&parsed);
             trace_upstream_event(&trace_metadata);
 
-            let internal_tool_call = match InternalToolCall::from_event(&parsed) {
-                Ok(call) => call,
-                Err(error) => {
-                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
-                        &parsed,
-                        DownstreamTraceAction::ErrorTranslated,
-                    ));
-                    state.lease.mark_upstream_terminal().await;
-                    state.done = true;
-                    return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
-                }
-            };
-
-            if let Some(call) = internal_tool_call {
-                match call.execute() {
-                    Ok(output) => {
-                        state.pending_internal_outputs.push(output);
-                        debug!(
-                            pending_internal_output_count = state.pending_internal_outputs.len(),
-                            "internal_tool_executed"
-                        );
-                        trace_suppressed_event(&trace_metadata);
-                        continue;
-                    }
+            if state.execute_internal_tools {
+                let internal_tool_call = match InternalToolCall::from_event(&parsed) {
+                    Ok(call) => call,
                     Err(error) => {
                         trace_downstream_sse_event(&downstream_sse_trace_metadata(
                             &parsed,
@@ -463,6 +443,30 @@ pub(super) fn response_stream(
                         state.lease.mark_upstream_terminal().await;
                         state.done = true;
                         return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
+                    }
+                };
+
+                if let Some(call) = internal_tool_call {
+                    match call.execute() {
+                        Ok(output) => {
+                            state.pending_internal_outputs.push(output);
+                            debug!(
+                                pending_internal_output_count =
+                                    state.pending_internal_outputs.len(),
+                                "internal_tool_executed"
+                            );
+                            trace_suppressed_event(&trace_metadata);
+                            continue;
+                        }
+                        Err(error) => {
+                            trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                                &parsed,
+                                DownstreamTraceAction::ErrorTranslated,
+                            ));
+                            state.lease.mark_upstream_terminal().await;
+                            state.done = true;
+                            return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
+                        }
                     }
                 }
             }

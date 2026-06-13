@@ -11,7 +11,7 @@ use crate::auth::LoadedUpstreamAuth;
 use crate::errors::ThreadlineError;
 use crate::models::validate_request_model;
 use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
-use crate::tools::inject_internal_tools;
+use crate::tools::{inject_internal_tools, is_internal_tool_name};
 use crate::ws_pump::LiveUpstreamWebSocket;
 
 mod downstream;
@@ -41,10 +41,15 @@ pub async fn responses_handler(
     let request = parse_downstream_request(payload)?;
     validate_request_model(&request.payload)?;
     let auth = state.services.auth_provider().load()?;
+    let classification = request.classification;
     let mut upstream_request = request.payload;
-    inject_internal_tools(&mut upstream_request);
-    let (upstream, lease, previous_response_id, reconnect_attempted) = match request.classification
-    {
+    match classification {
+        DownstreamRequestClassification::Normal => inject_internal_tools(&mut upstream_request),
+        DownstreamRequestClassification::AuxiliarySummary => {
+            strip_threadline_tools(&mut upstream_request)
+        }
+    }
+    let (upstream, lease, previous_response_id, reconnect_attempted) = match classification {
         DownstreamRequestClassification::Normal => {
             let mut lease =
                 acquire_lease(&state.registry, request.previous_response_id.as_deref()).await?;
@@ -101,6 +106,7 @@ pub async fn responses_handler(
         base_request: upstream_request,
         pending_internal_outputs: Vec::new(),
         previous_response_id,
+        execute_internal_tools: classification == DownstreamRequestClassification::Normal,
         suppressed_internal_output_indexes: std::collections::HashSet::new(),
         upstream_event_seen: false,
         reconnect_attempted,
@@ -120,6 +126,19 @@ pub async fn responses_handler(
         .body(Body::from_stream(stream))
         .expect("build sse response");
     Ok(response)
+}
+
+fn strip_threadline_tools(payload: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Array(tools)) = payload.get_mut("tools") else {
+        return;
+    };
+
+    tools.retain(|tool| {
+        !tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(is_internal_tool_name)
+    });
 }
 
 async fn attempt_pre_first_event_reconnect(

@@ -132,6 +132,62 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
     }
 }
 
+fn auxiliary_summary_text() -> &'static str {
+    concat!(
+        "The conversation has grown too large for the context window and must be compacted now",
+        "\n\n",
+        "Your ONLY task right now is to produce a comprehensive summary",
+        "\n",
+        "Output your summary wrapped in <summary> and </summary> tags"
+    )
+}
+
+fn auxiliary_summary_input_item() -> Value {
+    json!({
+        "type": "message",
+        "role": "system",
+        "content": [
+            {
+                "type": "input_text",
+                "text": auxiliary_summary_text()
+            }
+        ]
+    })
+}
+
+fn downstream_function_tool(name: &str) -> Value {
+    json!({
+        "type": "function",
+        "name": name,
+        "description": format!("{name} description"),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }
+    })
+}
+
+fn auxiliary_summary_request_with_tools(tools: Vec<Value>) -> Value {
+    json!({
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Continue from the earlier answer."
+                    }
+                ]
+            },
+            auxiliary_summary_input_item()
+        ],
+        "tools": tools
+    })
+}
+
 fn shell_program() -> String {
     if cfg!(windows) {
         "pwsh".to_string()
@@ -618,6 +674,192 @@ async fn internal_tool_pre_done_events_are_hidden_from_downstream() {
     assert!(!body_text.contains("event: response.output_item.added"));
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("response-intermediate"));
+}
+
+#[tokio::test]
+async fn summary_request_does_not_inject_threadline_internal_tools() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        auxiliary_summary_request_with_tools(vec![downstream_function_tool("downstream_tool")]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let first_request: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("initial request"),
+    ))
+    .expect("initial request json");
+    let tools = first_request["tools"].as_array().expect("tools array");
+
+    assert!(tools.iter().any(|tool| tool["name"] == "downstream_tool"));
+    assert!(
+        !tools.iter().any(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("threadline_"))
+        }),
+        "expected classified summary request to skip internal tool injection: {tools:?}"
+    );
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"summary answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-summary"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(!body_text.contains("threadline_"));
+}
+
+#[tokio::test]
+async fn summary_request_strips_downstream_threadline_prefixed_tools() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        auxiliary_summary_request_with_tools(vec![
+            downstream_function_tool("downstream_tool"),
+            downstream_function_tool("threadline_echo"),
+            downstream_function_tool("external_web_search"),
+        ]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let first_request: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("initial request"),
+    ))
+    .expect("initial request json");
+    let tools = first_request["tools"].as_array().expect("tools array");
+    let tool_names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+
+    assert_eq!(
+        tool_names.len(),
+        2,
+        "expected only non-Threadline tools upstream"
+    );
+    assert!(tool_names.contains(&"downstream_tool"));
+    assert!(tool_names.contains(&"external_web_search"));
+    assert!(
+        !tool_names
+            .iter()
+            .any(|name| name.starts_with("threadline_")),
+        "expected classified summary request to strip downstream threadline_* tools: {tool_names:?}"
+    );
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"summary answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-summary"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(!body_text.contains("threadline_"));
+}
+
+#[tokio::test]
+async fn summary_request_does_not_execute_threadline_tool_call_events() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        auxiliary_summary_request_with_tools(vec![downstream_function_tool("downstream_tool")]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let first_request: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("initial request"),
+    ))
+    .expect("initial request json");
+    let tools = first_request["tools"].as_array().expect("tools array");
+
+    assert!(
+        !tools.iter().any(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("threadline_"))
+        }),
+        "expected classified summary request to exclude internal tools before streaming"
+    );
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-summary-intermediate"}}"#,
+        )
+        .await;
+
+    let maybe_followup =
+        tokio::time::timeout(Duration::from_millis(100), server.recv_client_message()).await;
+    let saw_followup_request = matches!(maybe_followup, Ok(Some(_)));
+
+    if saw_followup_request {
+        server
+            .send_text(r#"{"type":"response.output_text.delta","delta":"summary answer"}"#)
+            .await;
+        server
+            .send_text(
+                r#"{"type":"response.completed","response":{"id":"response-summary-final"}}"#,
+            )
+            .await;
+    }
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+
+    assert!(
+        !saw_followup_request,
+        "expected no local internal-tool followup request during summary stream"
+    );
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("call-1"));
 }
 
 #[tokio::test]
