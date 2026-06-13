@@ -28,7 +28,26 @@ async fn previous_response_marker_reuses_the_same_retained_session_after_release
 }
 
 #[tokio::test]
-async fn concurrent_use_of_the_same_marker_returns_a_stable_conflict() {
+async fn released_lease_can_be_reacquired_before_drop() {
+    let registry = RetainedSessionRegistry::new(1);
+    let mut lease = registry.acquire_new().await.expect("create session");
+    let original_session = lease.session().clone();
+
+    lease.record_completed_marker("response-1").await;
+    lease.release();
+
+    let reacquired = registry
+        .acquire_previous("response-1")
+        .await
+        .expect("released marker should be reacquired before drop");
+
+    assert_eq!(reacquired.session().session_id, original_session.session_id);
+    assert_eq!(reacquired.session().thread_id, original_session.thread_id);
+    assert_eq!(reacquired.session().window_id, original_session.window_id);
+}
+
+#[tokio::test]
+async fn active_lease_still_conflicts() {
     let registry = RetainedSessionRegistry::new(2);
     let mut first = registry.acquire_new().await.expect("create session");
 
