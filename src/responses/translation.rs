@@ -511,8 +511,8 @@ pub(super) fn response_stream(
                         continue;
                     }
 
-                    if !state.downstream_output_text_delta_emitted {
-                        if let Some(synthetic_delta) =
+                    if !state.downstream_output_text_delta_emitted
+                        && let Some(synthetic_delta) =
                             synthesized_completed_output_text_delta(&parsed)
                         {
                             trace_downstream_sse_event(&downstream_sse_trace_metadata(
@@ -534,7 +534,6 @@ pub(super) fn response_stream(
                                 state,
                             ));
                         }
-                    }
 
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
                         &parsed,
