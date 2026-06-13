@@ -1493,6 +1493,52 @@ async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_do
 }
 
 #[tokio::test]
+async fn completed_with_internal_function_call_and_assistant_text_synthesizes_delta() {
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-internal-visible-text",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "threadline_echo",
+                    "call_id": "call-internal"
+                },
+                {
+                    "id": "assistant-item-internal-visible",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "visible completed text"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+
+    assert_eq!(capture.downstream_events.len(), 2);
+    assert_eq!(capture.downstream_events[0].event, "response.output_text.delta");
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "visible completed text",
+            "item_id": "assistant-item-internal-visible",
+            "output_index": 1,
+            "content_index": 0
+        })
+    );
+    assert_eq!(capture.downstream_events[1].event, "response.completed");
+    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
 async fn upstream_response_failed_emits_response_failed_terminal_event() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -2759,6 +2805,92 @@ async fn completed_only_assistant_output_text_is_synthesized_as_delta() {
 }
 
 #[tokio::test]
+async fn output_text_done_only_text_is_synthesized_as_delta() {
+    let output_text_done_event = json!({
+        "type": "response.output_text.done",
+        "item_id": "assistant-item-done-only",
+        "output_index": 0,
+        "content_index": 0,
+        "text": "hello from output_text.done"
+    });
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-output-text-done-only"
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![
+        output_text_done_event,
+        completed_event.clone(),
+    ])
+    .await;
+
+    assert_eq!(capture.downstream_events.len(), 2);
+    assert_eq!(capture.downstream_events[0].event, "response.output_text.delta");
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "hello from output_text.done",
+            "item_id": "assistant-item-done-only",
+            "output_index": 0,
+            "content_index": 0
+        })
+    );
+    assert_eq!(capture.downstream_events[1].event, "response.completed");
+    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn output_item_done_message_text_is_synthesized_as_delta() {
+    let output_item_done_event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "assistant-item-done-message",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "hello from output_item.done"
+                }
+            ]
+        }
+    });
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-output-item-done-message"
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![
+        output_item_done_event,
+        completed_event.clone(),
+    ])
+    .await;
+
+    assert_eq!(capture.downstream_events.len(), 2);
+    assert_eq!(capture.downstream_events[0].event, "response.output_text.delta");
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "hello from output_item.done",
+            "item_id": "assistant-item-done-message",
+            "output_index": 0,
+            "content_index": 0
+        })
+    );
+    assert_eq!(capture.downstream_events[1].event, "response.completed");
+    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
 async fn streamed_output_text_delta_is_not_duplicated_from_completed_output() {
     let delta_event = json!({
         "type": "response.output_text.delta",
@@ -2807,6 +2939,109 @@ async fn streamed_output_text_delta_is_not_duplicated_from_completed_output() {
     assert_eq!(capture.downstream_events[0].payload, delta_event);
     assert_eq!(capture.downstream_events[1].event, "response.completed");
     assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn multiple_done_only_visible_text_sources_are_not_dropped() {
+    let output_text_done_event = json!({
+        "type": "response.output_text.done",
+        "item_id": "assistant-item-first",
+        "output_index": 0,
+        "content_index": 0,
+        "text": "first visible text"
+    });
+    let output_item_done_event = json!({
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": {
+            "id": "assistant-item-second",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "second visible text"
+                }
+            ]
+        }
+    });
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-multiple-visible-sources",
+            "output": [
+                {
+                    "id": "assistant-item-third",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "third visible text"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![
+        output_text_done_event,
+        output_item_done_event,
+        completed_event.clone(),
+    ])
+    .await;
+
+    let delta_payloads: Vec<Value> = capture
+        .downstream_events
+        .iter()
+        .filter(|event| event.event == "response.output_text.delta")
+        .map(|event| event.payload.clone())
+        .collect();
+
+    assert_eq!(
+        delta_payloads,
+        vec![
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "first visible text",
+                "item_id": "assistant-item-first",
+                "output_index": 0,
+                "content_index": 0
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "second visible text",
+                "item_id": "assistant-item-second",
+                "output_index": 1,
+                "content_index": 0
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "third visible text",
+                "item_id": "assistant-item-third",
+                "output_index": 0,
+                "content_index": 0
+            })
+        ]
+    );
+    assert_eq!(
+        capture
+            .downstream_events
+            .last()
+            .expect("completed event")
+            .event,
+        "response.completed"
+    );
+    assert_eq!(
+        capture
+            .downstream_events
+            .last()
+            .expect("completed payload")
+            .payload,
+        completed_event
+    );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
