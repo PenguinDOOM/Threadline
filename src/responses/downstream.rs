@@ -4,10 +4,26 @@ use serde_json::{Map, Value};
 
 use crate::errors::ThreadlineError;
 
+const SUMMARY_PROMPT_PREFIX: &str =
+    "The conversation has grown too large for the context window and must be compacted now";
+const SUMMARY_TAGS_INSTRUCTION: &str =
+    "Output your summary wrapped in <summary> and </summary> tags";
+const SUMMARY_ONLY_TASK_INSTRUCTION: &str =
+    "Your ONLY task right now is to produce a comprehensive summary";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum DownstreamRequestClassification {
+    #[default]
+    Normal,
+    AuxiliarySummary,
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct DownstreamResponsesRequest {
     #[serde(default)]
     pub(super) previous_response_id: Option<String>,
+    #[serde(skip)]
+    pub(super) classification: DownstreamRequestClassification,
     #[serde(flatten)]
     pub(super) payload: serde_json::Map<String, Value>,
 }
@@ -15,8 +31,105 @@ pub(super) struct DownstreamResponsesRequest {
 pub(super) fn parse_downstream_request(
     payload: Value,
 ) -> Result<DownstreamResponsesRequest, ThreadlineError> {
-    serde_json::from_value::<DownstreamResponsesRequest>(payload)
-        .map_err(|_| ThreadlineError::InvalidResponsesRequest)
+    let mut request = serde_json::from_value::<DownstreamResponsesRequest>(payload)
+        .map_err(|_| ThreadlineError::InvalidResponsesRequest)?;
+    request.classification = classify_request(&request.payload);
+    Ok(request)
+}
+
+fn classify_request(payload: &serde_json::Map<String, Value>) -> DownstreamRequestClassification {
+    if is_auxiliary_summary_request(payload.get("input")) {
+        DownstreamRequestClassification::AuxiliarySummary
+    } else {
+        DownstreamRequestClassification::Normal
+    }
+}
+
+fn is_auxiliary_summary_request(input: Option<&Value>) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+
+    let Some(summary_text) = final_summary_instruction_text(input) else {
+        return false;
+    };
+
+    let fingerprints = collect_summary_fingerprints(input);
+    fingerprints.all_present() && text_matches_summary_fingerprints(summary_text)
+}
+
+fn final_summary_instruction_text(input: &Value) -> Option<&str> {
+    let final_item = input.as_array()?.last()?.as_object()?;
+
+    if final_item.get("type")?.as_str()? != "message" {
+        return None;
+    }
+
+    if final_item.get("role")?.as_str()? != "system" {
+        return None;
+    }
+
+    let content = final_item.get("content")?.as_array()?;
+    if content.len() != 1 {
+        return None;
+    }
+
+    let content_item = content.first()?.as_object()?;
+    if content_item.get("type")?.as_str()? != "input_text" {
+        return None;
+    }
+
+    content_item.get("text")?.as_str()
+}
+
+#[derive(Default)]
+struct SummaryFingerprints {
+    has_prompt_prefix: bool,
+    has_summary_tags_instruction: bool,
+    has_summary_only_task_instruction: bool,
+}
+
+impl SummaryFingerprints {
+    fn all_present(&self) -> bool {
+        self.has_prompt_prefix
+            && self.has_summary_tags_instruction
+            && self.has_summary_only_task_instruction
+    }
+
+    fn record_text(&mut self, text: &str) {
+        self.has_prompt_prefix |= text.starts_with(SUMMARY_PROMPT_PREFIX);
+        self.has_summary_tags_instruction |= text.contains(SUMMARY_TAGS_INSTRUCTION);
+        self.has_summary_only_task_instruction |= text.contains(SUMMARY_ONLY_TASK_INSTRUCTION);
+    }
+}
+
+fn collect_summary_fingerprints(value: &Value) -> SummaryFingerprints {
+    let mut fingerprints = SummaryFingerprints::default();
+    collect_summary_fingerprints_into(value, &mut fingerprints);
+    fingerprints
+}
+
+fn collect_summary_fingerprints_into(value: &Value, fingerprints: &mut SummaryFingerprints) {
+    match value {
+        Value::String(text) => fingerprints.record_text(text),
+        Value::Array(values) => {
+            for value in values {
+                collect_summary_fingerprints_into(value, fingerprints);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                collect_summary_fingerprints_into(value, fingerprints);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn text_matches_summary_fingerprints(text: &str) -> bool {
+    text.starts_with(SUMMARY_PROMPT_PREFIX)
+        && text.contains(SUMMARY_TAGS_INSTRUCTION)
+        && text.contains(SUMMARY_ONLY_TASK_INSTRUCTION)
 }
 
 pub(super) fn sse_payload_chunk(event: &str, payload: &str) -> Bytes {
@@ -100,11 +213,35 @@ pub(super) fn sse_error_chunk(error: &ThreadlineError) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_downstream_request, safe_scalar_field, sse_done_chunk, sse_error_chunk,
-        sse_json_chunk, sse_payload_chunk, sse_terminal_response_failed_chunk,
+        DownstreamRequestClassification, parse_downstream_request, safe_scalar_field,
+        sse_done_chunk, sse_error_chunk, sse_json_chunk, sse_payload_chunk,
+        sse_terminal_response_failed_chunk,
     };
     use crate::errors::ThreadlineError;
     use serde_json::{Value, json};
+
+    fn auxiliary_summary_text() -> &'static str {
+        concat!(
+            "The conversation has grown too large for the context window and must be compacted now",
+            "\n\n",
+            "Your ONLY task right now is to produce a comprehensive summary",
+            "\n",
+            "Output your summary wrapped in <summary> and </summary> tags"
+        )
+    }
+
+    fn auxiliary_summary_input_item() -> Value {
+        json!({
+            "type": "message",
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": auxiliary_summary_text()
+                }
+            ]
+        })
+    }
 
     #[test]
     fn parse_downstream_request_extracts_previous_response_id_and_payload() {
@@ -119,6 +256,138 @@ mod tests {
         assert_eq!(request.payload.get("model"), Some(&json!("gpt-5.4")));
         assert_eq!(request.payload.get("stream"), Some(&json!(true)));
         assert!(!request.payload.contains_key("previous_response_id"));
+    }
+
+    #[test]
+    fn parse_downstream_request_identifies_auxiliary_summary_request() {
+        let request = parse_downstream_request(json!({
+            "previous_response_id": "resp_123",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Continue from the earlier answer."
+                        }
+                    ]
+                },
+                auxiliary_summary_input_item()
+            ]
+        }))
+        .expect("parse request");
+
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::AuxiliarySummary
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_context_management_only() {
+        let request = parse_downstream_request(json!({
+            "previous_response_id": "resp_123",
+            "context_management": {
+                "type": "auto"
+            },
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Please continue the earlier task."
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("parse request");
+
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_fingerprints_outside_input() {
+        let request = parse_downstream_request(json!({
+            "previous_response_id": "resp_123",
+            "metadata": {
+                "summary_prompt": auxiliary_summary_text()
+            },
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Please continue the earlier task."
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("parse request");
+
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_partial_summary_quote() {
+        let request = parse_downstream_request(json!({
+            "previous_response_id": "resp_123",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "The conversation has grown too large for the context window and must be compacted now"
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("parse request");
+
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_user_role_full_prompt_quote() {
+        let request = parse_downstream_request(json!({
+            "previous_response_id": "resp_123",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": auxiliary_summary_text()
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("parse request");
+
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::Normal
+        );
     }
 
     #[test]
