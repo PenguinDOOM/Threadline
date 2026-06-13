@@ -1673,8 +1673,11 @@ async fn capture_completed_output_stream(
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response =
-        post_responses(app, json!({"model":"gpt-5.4","input":"completed-output-stream"})).await;
+    let response = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"completed-output-stream"}),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let _ = server
@@ -1973,7 +1976,10 @@ async fn streamed_output_text_delta_is_not_duplicated_from_completed_output() {
         1,
         "expected the existing streamed delta to remain unique"
     );
-    assert_eq!(capture.downstream_events[0].event, "response.output_text.delta");
+    assert_eq!(
+        capture.downstream_events[0].event,
+        "response.output_text.delta"
+    );
     assert_eq!(capture.downstream_events[0].payload, delta_event);
     assert_eq!(capture.downstream_events[1].event, "response.completed");
     assert_eq!(capture.downstream_events[1].payload, completed_event);
@@ -2180,13 +2186,11 @@ async fn malformed_completed_output_does_not_panic_or_synthesize_delta() {
             "expected malformed case {case_name} to forward response.completed without a synthetic delta"
         );
         assert_eq!(
-            capture.downstream_events[0].event,
-            "response.completed",
+            capture.downstream_events[0].event, "response.completed",
             "expected malformed case {case_name} to preserve the completed event"
         );
         assert_eq!(
-            capture.downstream_events[0].payload,
-            completed_event,
+            capture.downstream_events[0].payload, completed_event,
             "expected malformed case {case_name} to remain unchanged downstream"
         );
         assert_eq!(capture.done_frame, "data: [DONE]");
@@ -2194,7 +2198,8 @@ async fn malformed_completed_output_does_not_panic_or_synthesize_delta() {
 }
 
 #[tokio::test]
-async fn multi_part_assistant_output_text_is_synthesized_as_single_delta_from_first_contributing_part_metadata() {
+async fn multi_part_assistant_output_text_is_synthesized_as_single_delta_from_first_contributing_part_metadata()
+ {
     let completed_event = json!({
         "type": "response.completed",
         "response": {

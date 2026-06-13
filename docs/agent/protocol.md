@@ -47,6 +47,10 @@ Keep request normalization separate from transport code.
 
 Keep SSE translation separate from upstream WebSocket frame handling.
 
+As a narrow compatibility fallback for the Threadline `/v1/responses` bridge, if final assistant body text exists only inside `response.completed.response.output` and Threadline did not forward any real downstream `response.output_text.delta`, Threadline synthesizes one downstream `response.output_text.delta` before forwarding the original `response.completed` event.
+
+This fallback does not rewrite the original final `response.completed` payload, and bare `[DONE]` still follows as a separate downstream chunk.
+
 When a downstream request includes `previous_response_id`, use it as a continuation marker.
 
 `response.completed.id` is the continuation-safe marker for later `previous_response_id` requests.
@@ -160,6 +164,8 @@ When an upstream response emits a Threadline internal tool call, preserve this o
 Do not send follow-up tool outputs before the intermediate response completes.
 
 Do not treat the intermediate response completion as the final downstream completion.
+
+The completed-only downstream text-delta fallback is final-only and does not apply to intermediate completions that Threadline consumes internally before local tool follow-up.
 
 Do not expose internal tool call details downstream unless explicitly required for diagnostics and safe to expose.
 

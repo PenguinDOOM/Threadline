@@ -12,7 +12,7 @@ use crate::errors::ThreadlineError;
 use crate::registry::RetainedSessionLease;
 use crate::tools::{
     InternalToolCall, PendingInternalToolOutput, build_followup_input,
-    event_contains_internal_tool_name,
+    event_contains_internal_tool_name, is_internal_tool_name,
 };
 use crate::ws_pump::LiveUpstreamWebSocket;
 
@@ -207,11 +207,29 @@ fn string_length_field(value: Option<&Value>) -> Option<usize> {
     value.and_then(Value::as_str).map(str::len)
 }
 
+fn completed_output_blocks_synthetic_delta(output: &[Value]) -> bool {
+    output
+        .iter()
+        .any(|item| match item.get("type").and_then(Value::as_str) {
+            Some("compaction") => true,
+            Some("function_call") => item
+                .get("name")
+                .or_else(|| item.get("tool_name"))
+                .and_then(Value::as_str)
+                .is_some_and(is_internal_tool_name),
+            _ => false,
+        })
+}
+
 fn synthesized_completed_output_text_delta(event: &Value) -> Option<Value> {
     let output = event
         .get("response")
         .and_then(|response| response.get("output"))
         .and_then(Value::as_array)?;
+
+    if completed_output_blocks_synthetic_delta(output) {
+        return None;
+    }
 
     let mut delta = String::new();
     let mut first_item_id = None;
@@ -305,7 +323,11 @@ pub(super) fn response_stream(
                     &completed,
                     DownstreamTraceAction::Terminal,
                 ));
-                debug!(response_id, event_type = "response.completed", "translation_event_forwarded");
+                debug!(
+                    response_id,
+                    event_type = "response.completed",
+                    "translation_event_forwarded"
+                );
                 debug!(response_id, "terminal_response_forwarded");
                 state.final_done_pending = true;
                 debug!(response_id, "final_done_queued");
@@ -497,7 +519,11 @@ pub(super) fn response_stream(
                                 &synthetic_delta,
                                 DownstreamTraceAction::Forwarded,
                             ));
-                            debug!(response_id, event_type = "response.output_text.delta", "translation_event_forwarded");
+                            debug!(
+                                response_id,
+                                event_type = "response.output_text.delta",
+                                "translation_event_forwarded"
+                            );
                             state.downstream_output_text_delta_emitted = true;
                             state.queued_final_completed = Some(parsed);
                             return Some((
