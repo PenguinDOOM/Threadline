@@ -18,8 +18,8 @@ mod downstream;
 mod translation;
 mod upstream;
 
-use self::downstream::parse_downstream_request;
-use self::translation::{ResponseStreamState, response_stream};
+use self::downstream::{DownstreamRequestClassification, parse_downstream_request};
+use self::translation::{ResponseStreamLease, ResponseStreamState, response_stream};
 use self::upstream::send_response_create;
 
 pub use self::upstream::{
@@ -40,35 +40,59 @@ pub async fn responses_handler(
 ) -> Result<impl IntoResponse, ThreadlineError> {
     let request = parse_downstream_request(payload)?;
     validate_request_model(&request.payload)?;
-    let mut lease = acquire_lease(&state.registry, request.previous_response_id.as_deref()).await?;
     let auth = state.services.auth_provider().load()?;
-    let mut upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
-
     let mut upstream_request = request.payload;
-    if let Some(previous_response_id) = &request.previous_response_id {
-        upstream_request.insert(
-            "previous_response_id".to_string(),
-            Value::String(previous_response_id.clone()),
-        );
-    }
     inject_internal_tools(&mut upstream_request);
-    let mut reconnect_attempted = false;
-    if let Err(error) = send_response_create(&upstream, &upstream_request).await {
-        if let Some(reconnected) = attempt_pre_first_event_reconnect(
-            &state.services,
-            &mut lease,
-            &upstream_request,
-            request.previous_response_id.as_deref(),
-            false,
-            &mut reconnect_attempted,
-        )
-        .await?
-        {
-            upstream = reconnected;
-        } else {
-            return Err(error);
+    let (upstream, lease, previous_response_id, reconnect_attempted) = match request.classification
+    {
+        DownstreamRequestClassification::Normal => {
+            let mut lease =
+                acquire_lease(&state.registry, request.previous_response_id.as_deref()).await?;
+            let mut upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
+
+            if let Some(previous_response_id) = &request.previous_response_id {
+                upstream_request.insert(
+                    "previous_response_id".to_string(),
+                    Value::String(previous_response_id.clone()),
+                );
+            }
+
+            let mut reconnect_attempted = false;
+            if let Err(error) = send_response_create(&upstream, &upstream_request).await {
+                if let Some(reconnected) = attempt_pre_first_event_reconnect(
+                    &state.services,
+                    &mut lease,
+                    &upstream_request,
+                    request.previous_response_id.as_deref(),
+                    false,
+                    &mut reconnect_attempted,
+                )
+                .await?
+                {
+                    upstream = reconnected;
+                } else {
+                    return Err(error);
+                }
+            }
+
+            (
+                upstream,
+                ResponseStreamLease::Retained(lease),
+                request.previous_response_id,
+                reconnect_attempted,
+            )
         }
-    }
+        DownstreamRequestClassification::AuxiliarySummary => {
+            let connected = state.services.connector().connect(auth, None).await?;
+            send_response_create(&connected.websocket, &upstream_request).await?;
+            (
+                connected.websocket,
+                ResponseStreamLease::TransientAuxiliary,
+                None,
+                false,
+            )
+        }
+    };
 
     let stream = response_stream(ResponseStreamState {
         services: state.services.clone(),
@@ -76,7 +100,7 @@ pub async fn responses_handler(
         lease,
         base_request: upstream_request,
         pending_internal_outputs: Vec::new(),
-        previous_response_id: request.previous_response_id,
+        previous_response_id,
         suppressed_internal_output_indexes: std::collections::HashSet::new(),
         upstream_event_seen: false,
         reconnect_attempted,

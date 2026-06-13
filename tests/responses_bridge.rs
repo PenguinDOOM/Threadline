@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
@@ -49,6 +49,7 @@ struct PlannedConnection {
 struct RecordingConnector {
     plans: Arc<Mutex<VecDeque<PlannedConnection>>>,
     sessions: Arc<Mutex<Vec<UpstreamSessionDescriptor>>>,
+    websockets: Arc<Mutex<Vec<Weak<LiveUpstreamWebSocket>>>>,
 }
 
 impl RecordingConnector {
@@ -56,11 +57,16 @@ impl RecordingConnector {
         Self {
             plans: Arc::new(Mutex::new(plans.into())),
             sessions: Arc::new(Mutex::new(Vec::new())),
+            websockets: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     async fn recorded_sessions(&self) -> Vec<UpstreamSessionDescriptor> {
         self.sessions.lock().await.clone()
+    }
+
+    async fn recorded_websockets(&self) -> Vec<Weak<LiveUpstreamWebSocket>> {
+        self.websockets.lock().await.clone()
     }
 }
 
@@ -72,6 +78,7 @@ impl UpstreamConnector for RecordingConnector {
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
         let plans = Arc::clone(&self.plans);
         let sessions = Arc::clone(&self.sessions);
+        let websockets = Arc::clone(&self.websockets);
         Box::pin(async move {
             let session = session.unwrap_or_else(new_session_descriptor);
             let plan = plans
@@ -85,8 +92,11 @@ impl UpstreamConnector for RecordingConnector {
                 .await
                 .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
 
+            let websocket = Arc::new(LiveUpstreamWebSocket::from_stream(stream));
+            websockets.lock().await.push(Arc::downgrade(&websocket));
+
             Ok(ConnectedUpstream {
-                websocket: Arc::new(LiveUpstreamWebSocket::from_stream(stream)),
+                websocket,
                 session,
                 turn_state: plan.turn_state,
             })
@@ -210,6 +220,54 @@ fn assert_done_frame(frame: &str) {
         frame, "data: [DONE]",
         "expected a bare downstream DONE frame without an event line"
     );
+}
+
+fn auxiliary_summary_text() -> &'static str {
+    concat!(
+        "The conversation has grown too large for the context window and must be compacted now",
+        "\n\n",
+        "Your ONLY task right now is to produce a comprehensive summary",
+        "\n",
+        "Output your summary wrapped in <summary> and </summary> tags"
+    )
+}
+
+fn auxiliary_summary_input_item() -> Value {
+    json!({
+        "type": "message",
+        "role": "system",
+        "content": [
+            {
+                "type": "input_text",
+                "text": auxiliary_summary_text()
+            }
+        ]
+    })
+}
+
+fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
+    let mut payload = json!({
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Continue from the earlier answer."
+                    }
+                ]
+            },
+            auxiliary_summary_input_item()
+        ]
+    });
+
+    if let Some(previous_response_id) = previous_response_id {
+        payload["previous_response_id"] = json!(previous_response_id);
+    }
+
+    payload
 }
 
 async fn next_body_chunk(
@@ -418,6 +476,531 @@ async fn missing_previous_response_id_returns_stable_not_found() {
         .expect("body");
     let payload: Value = serde_json::from_slice(&body).expect("json body");
     assert_eq!(payload["error"]["code"], "previous_response_not_found");
+}
+
+#[tokio::test]
+async fn summary_request_with_active_previous_response_id_uses_auxiliary_session() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let summary = post_responses(app, auxiliary_summary_request(Some("response-1"))).await;
+    assert_eq!(summary.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn summary_request_with_unknown_previous_response_id_uses_auxiliary_session() {
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&summary_server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, auxiliary_summary_request(Some("response-missing"))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn summary_request_does_not_forward_previous_response_id_upstream() {
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&summary_server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, auxiliary_summary_request(Some("response-1"))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let payload: Value = serde_json::from_str(&message_text(
+        summary_server
+            .recv_client_message()
+            .await
+            .expect("summary request"),
+    ))
+    .expect("summary request json");
+    assert_eq!(payload["type"], "response.create");
+    assert!(payload.get("previous_response_id").is_none());
+}
+
+#[tokio::test]
+async fn summary_request_with_context_management_keeps_context_management_but_omits_previous_response_id()
+ {
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&summary_server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let mut payload = auxiliary_summary_request(Some("response-1"));
+    payload["context_management"] = json!({
+        "type": "compaction",
+        "compact_threshold": 12345
+    });
+
+    let response = post_responses(app, payload).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let forwarded: Value = serde_json::from_str(&message_text(
+        summary_server
+            .recv_client_message()
+            .await
+            .expect("summary request"),
+    ))
+    .expect("summary request json");
+    assert!(forwarded.get("previous_response_id").is_none());
+    assert_eq!(
+        forwarded["context_management"],
+        json!({
+            "type": "compaction",
+            "compact_threshold": 12345
+        })
+    );
+}
+
+#[tokio::test]
+async fn summary_request_without_previous_response_id_uses_auxiliary_session() {
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let ordinary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&ordinary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let summary = post_responses(app.clone(), auxiliary_summary_request(None)).await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary_payload: Value = serde_json::from_str(&message_text(
+        summary_server
+            .recv_client_message()
+            .await
+            .expect("summary request"),
+    ))
+    .expect("summary request json");
+    assert!(summary_payload.get("previous_response_id").is_none());
+
+    let ordinary = post_responses(app, json!({"model":"gpt-5.4","input":"ordinary"})).await;
+    assert_eq!(ordinary.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn summary_response_id_is_not_registered_as_continuation_marker() {
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&summary_server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let summary = post_responses(app.clone(), auxiliary_summary_request(Some("response-1"))).await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let _ = summary_server
+        .recv_client_message()
+        .await
+        .expect("summary request");
+    summary_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-summary"}}"#)
+        .await;
+    let _ = to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .expect("summary body");
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-summary"
+        }),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("rejected body");
+    let payload: Value = serde_json::from_slice(&body).expect("rejected json body");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
+}
+
+#[tokio::test]
+async fn transient_summary_request_does_not_evict_existing_retained_marker() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let resumed_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: Some("turn-state-1".to_string()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&resumed_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+    retained_server.send_close(1000, "seed complete").await;
+    sleep(Duration::from_millis(50)).await;
+
+    let summary = post_responses(app.clone(), auxiliary_summary_request(Some("response-1"))).await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let _ = summary_server
+        .recv_client_message()
+        .await
+        .expect("summary request");
+    summary_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-summary"}}"#)
+        .await;
+    let _ = to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .expect("summary body");
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_payload: Value = serde_json::from_str(&message_text(
+        resumed_server
+            .recv_client_message()
+            .await
+            .expect("resumed request"),
+    ))
+    .expect("resumed request json");
+    assert_eq!(resumed_payload["previous_response_id"], "response-1");
+}
+
+#[tokio::test]
+async fn transient_summary_request_uses_no_retained_capacity_after_completion() {
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let ordinary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&ordinary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let summary = post_responses(app.clone(), auxiliary_summary_request(None)).await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let _ = summary_server
+        .recv_client_message()
+        .await
+        .expect("summary request");
+    summary_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-summary"}}"#)
+        .await;
+    let _ = to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .expect("summary body");
+
+    let ordinary = post_responses(app, json!({"model":"gpt-5.4","input":"ordinary"})).await;
+    assert_eq!(ordinary.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transient_summary_request_can_run_while_previous_marker_is_active_at_capacity() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let summary = post_responses(app, auxiliary_summary_request(Some("response-1"))).await;
+    assert_eq!(summary.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transient_summary_request_failure_or_drop_does_not_leave_capacity_blocked() {
+    let failed_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let ordinary_after_failed_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let failure_connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&failed_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&ordinary_after_failed_server),
+            turn_state: None,
+        },
+    ]);
+    let failure_app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(failure_connector),
+    );
+
+    let failed_summary = post_responses(failure_app.clone(), auxiliary_summary_request(None)).await;
+    assert_eq!(failed_summary.status(), StatusCode::OK);
+    let _ = failed_server
+        .recv_client_message()
+        .await
+        .expect("failed summary request");
+    failed_server
+        .send_text(r#"{"type":"response.failed","response":{"id":"response-summary"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
+        .await;
+    let _ = to_bytes(failed_summary.into_body(), usize::MAX)
+        .await
+        .expect("failed summary body");
+
+    let ordinary_after_failed = post_responses(
+        failure_app,
+        json!({"model":"gpt-5.4","input":"ordinary-after-failed"}),
+    )
+    .await;
+    assert_eq!(ordinary_after_failed.status(), StatusCode::OK);
+
+    let dropped_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let ordinary_after_drop_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let drop_connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&dropped_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&ordinary_after_drop_server),
+            turn_state: None,
+        },
+    ]);
+    let drop_app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(drop_connector),
+    );
+
+    let dropped_summary = post_responses(drop_app.clone(), auxiliary_summary_request(None)).await;
+    assert_eq!(dropped_summary.status(), StatusCode::OK);
+    let _ = dropped_server
+        .recv_client_message()
+        .await
+        .expect("dropped summary request");
+    drop(dropped_summary);
+    sleep(Duration::from_millis(50)).await;
+
+    let ordinary_after_drop = post_responses(
+        drop_app,
+        json!({"model":"gpt-5.4","input":"ordinary-after-drop"}),
+    )
+    .await;
+    assert_eq!(ordinary_after_drop.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transient_summary_request_terminal_paths_close_pump_or_upstream_handle() {
+    let completion_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let completion_connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&completion_server),
+        turn_state: None,
+    }]);
+    let completion_app = build_test_router(
+        ThreadlineConfig::default(),
+        Arc::new(completion_connector.clone()),
+    );
+
+    let completion_response = post_responses(completion_app, auxiliary_summary_request(None)).await;
+    assert_eq!(completion_response.status(), StatusCode::OK);
+    let _ = completion_server
+        .recv_client_message()
+        .await
+        .expect("completion summary request");
+    completion_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-summary"}}"#)
+        .await;
+    let _ = to_bytes(completion_response.into_body(), usize::MAX)
+        .await
+        .expect("completion summary body");
+    sleep(Duration::from_millis(50)).await;
+    let completion_sockets = completion_connector.recorded_websockets().await;
+    assert!(completion_sockets[0].upgrade().is_none());
+
+    let failure_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let failure_connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&failure_server),
+        turn_state: None,
+    }]);
+    let failure_app = build_test_router(
+        ThreadlineConfig::default(),
+        Arc::new(failure_connector.clone()),
+    );
+
+    let failure_response = post_responses(failure_app, auxiliary_summary_request(None)).await;
+    assert_eq!(failure_response.status(), StatusCode::OK);
+    let _ = failure_server
+        .recv_client_message()
+        .await
+        .expect("failure summary request");
+    failure_server
+        .send_text(r#"{"type":"response.failed","response":{"id":"response-summary"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
+        .await;
+    let _ = to_bytes(failure_response.into_body(), usize::MAX)
+        .await
+        .expect("failure summary body");
+    sleep(Duration::from_millis(50)).await;
+    let failure_sockets = failure_connector.recorded_websockets().await;
+    assert!(failure_sockets[0].upgrade().is_none());
+
+    let drop_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let drop_connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&drop_server),
+        turn_state: None,
+    }]);
+    let drop_app = build_test_router(
+        ThreadlineConfig::default(),
+        Arc::new(drop_connector.clone()),
+    );
+
+    let drop_response = post_responses(drop_app, auxiliary_summary_request(None)).await;
+    assert_eq!(drop_response.status(), StatusCode::OK);
+    let _ = drop_server
+        .recv_client_message()
+        .await
+        .expect("drop summary request");
+    drop(drop_response);
+    sleep(Duration::from_millis(50)).await;
+    let drop_sockets = drop_connector.recorded_websockets().await;
+    assert!(drop_sockets[0].upgrade().is_none());
 }
 
 #[tokio::test]

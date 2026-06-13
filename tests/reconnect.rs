@@ -141,6 +141,54 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
     }
 }
 
+fn auxiliary_summary_text() -> &'static str {
+    concat!(
+        "The conversation has grown too large for the context window and must be compacted now",
+        "\n\n",
+        "Your ONLY task right now is to produce a comprehensive summary",
+        "\n",
+        "Output your summary wrapped in <summary> and </summary> tags"
+    )
+}
+
+fn auxiliary_summary_input_item() -> Value {
+    json!({
+        "type": "message",
+        "role": "system",
+        "content": [
+            {
+                "type": "input_text",
+                "text": auxiliary_summary_text()
+            }
+        ]
+    })
+}
+
+fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
+    let mut payload = json!({
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Continue from the earlier answer."
+                    }
+                ]
+            },
+            auxiliary_summary_input_item()
+        ]
+    });
+
+    if let Some(previous_response_id) = previous_response_id {
+        payload["previous_response_id"] = json!(previous_response_id);
+    }
+
+    payload
+}
+
 fn split_sse_frames(body: &str) -> Vec<&str> {
     body.split("\n\n")
         .filter(|frame| !frame.trim().is_empty())
@@ -648,4 +696,47 @@ async fn reconnect_fallback_attempts_only_once_after_pre_stream_send_failure() {
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 3);
+}
+
+#[tokio::test]
+async fn summary_request_first_send_failure_does_not_reconnect_as_continuation() {
+    let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let first_attempt_server =
+        Arc::new(ScriptedWebSocketServer::start_disconnect_after_handshake().await);
+    let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&seed_server),
+            turn_state: Some("turn-state-1".to_string()),
+            wait_until_closed_before_return: false,
+        },
+        PlannedConnection {
+            server: Arc::clone(&first_attempt_server),
+            turn_state: None,
+            wait_until_closed_before_return: true,
+        },
+        PlannedConnection {
+            server: Arc::clone(&unexpected_reconnect_server),
+            turn_state: None,
+            wait_until_closed_before_return: false,
+        },
+    ]);
+    let app = build_test_router(Arc::new(connector.clone()));
+
+    seed_marker(app.clone(), &seed_server, "response-1").await;
+    seed_server.send_close(1000, "seed complete").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let response = post_responses(app, auxiliary_summary_request(Some("response-1"))).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let no_reconnect = timeout(
+        Duration::from_millis(250),
+        unexpected_reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_reconnect.is_err());
+
+    let sessions = connector.recorded_sessions().await;
+    assert_eq!(sessions.len(), 2);
 }

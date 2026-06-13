@@ -33,6 +33,44 @@ fn output_index_from_event(event: &Value) -> Option<u64> {
     event.get("output_index").and_then(Value::as_u64)
 }
 
+pub(super) enum ResponseStreamLease {
+    Retained(RetainedSessionLease),
+    TransientAuxiliary,
+}
+
+impl ResponseStreamLease {
+    fn release(&mut self) {
+        if let Self::Retained(lease) = self {
+            lease.release();
+        }
+    }
+
+    async fn record_completed_marker(&mut self, response_marker: &str) {
+        if let Self::Retained(lease) = self {
+            lease.record_completed_marker(response_marker).await;
+        }
+    }
+
+    async fn mark_upstream_recoverable(&mut self) {
+        if let Self::Retained(lease) = self {
+            lease.mark_upstream_recoverable().await;
+        }
+    }
+
+    async fn mark_upstream_terminal(&mut self) {
+        if let Self::Retained(lease) = self {
+            lease.mark_upstream_terminal().await;
+        }
+    }
+
+    fn retained_mut(&mut self) -> Option<&mut RetainedSessionLease> {
+        match self {
+            Self::Retained(lease) => Some(lease),
+            Self::TransientAuxiliary => None,
+        }
+    }
+}
+
 const RESPONSES_TRANSLATION_UPSTREAM_EVENT: &str = "responses_translation_upstream_event";
 const RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT: &str =
     "responses_translation_downstream_sse_event";
@@ -299,7 +337,7 @@ fn synthesized_completed_output_text_delta(event: &Value) -> Option<Value> {
 pub(super) struct ResponseStreamState {
     pub(super) services: ThreadlineServices,
     pub(super) upstream: Arc<LiveUpstreamWebSocket>,
-    pub(super) lease: RetainedSessionLease,
+    pub(super) lease: ResponseStreamLease,
     pub(super) base_request: serde_json::Map<String, Value>,
     pub(super) pending_internal_outputs: Vec<PendingInternalToolOutput>,
     pub(super) previous_response_id: Option<String>,
@@ -618,9 +656,13 @@ pub(super) fn response_stream(
 async fn try_reconnect_or_terminal_error(
     state: &mut ResponseStreamState,
 ) -> Result<Option<Arc<LiveUpstreamWebSocket>>, ThreadlineError> {
+    let Some(lease) = state.lease.retained_mut() else {
+        return Ok(None);
+    };
+
     super::attempt_pre_first_event_reconnect(
         &state.services,
-        &mut state.lease,
+        lease,
         &state.base_request,
         state.previous_response_id.as_deref(),
         state.upstream_event_seen,
