@@ -1163,6 +1163,118 @@ async fn internal_tool_done_suppression_emits_stable_trace_event() {
 }
 
 #[tokio::test]
+async fn internal_tool_followup_completed_only_text_is_synthesized_as_final_delta() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "synthesize final follow-up completed-only assistant text",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+
+    let followup_input = followup_request["input"]
+        .as_array()
+        .expect("followup input array");
+    assert_eq!(followup_input.len(), 1);
+    assert_eq!(followup_input[0]["type"], "function_call_output");
+    assert_eq!(followup_input[0]["call_id"], "call-1");
+    assert_eq!(followup_input[0]["output"], "alpha");
+
+    let final_completed = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-final",
+            "output": [
+                {
+                    "id": "msg-final",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "final follow-up answer"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    server.send_text(&final_completed.to_string()).await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 3);
+
+    let synthetic_delta_frame = sse_event_and_data(frames[0]);
+    assert_eq!(synthetic_delta_frame.0, "response.output_text.delta");
+    assert_eq!(
+        serde_json::from_str::<Value>(synthetic_delta_frame.1).expect("synthetic delta json"),
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "final follow-up answer",
+            "item_id": "msg-final",
+            "output_index": 0,
+            "content_index": 0
+        })
+    );
+
+    let completed_frame = sse_event_and_data(frames[1]);
+    assert_eq!(completed_frame.0, "response.completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(completed_frame.1).expect("completed json"),
+        final_completed
+    );
+
+    assert_done_frame(frames[2]);
+    assert!(!body_text.contains("response.output_item.added"));
+    assert!(!body_text.contains("response.output_item.done"));
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("response-intermediate"));
+}
+
+#[tokio::test]
 async fn visible_followup_function_call_argument_delta_is_forwarded_when_output_index_is_reused() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
