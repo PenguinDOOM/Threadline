@@ -207,6 +207,77 @@ fn string_length_field(value: Option<&Value>) -> Option<usize> {
     value.and_then(Value::as_str).map(str::len)
 }
 
+fn synthesized_completed_output_text_delta(event: &Value) -> Option<Value> {
+    let output = event
+        .get("response")
+        .and_then(|response| response.get("output"))
+        .and_then(Value::as_array)?;
+
+    let mut delta = String::new();
+    let mut first_item_id = None;
+    let mut first_output_index = None;
+    let mut first_content_index = None;
+
+    for (output_index, item) in output.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("message")
+            || item.get("role").and_then(Value::as_str) != Some("assistant")
+        {
+            continue;
+        }
+
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for (content_index, part) in content.iter().enumerate() {
+            if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                continue;
+            }
+
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+
+            if text.trim().is_empty() {
+                continue;
+            }
+
+            if first_output_index.is_none() {
+                first_item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                first_output_index = Some(output_index as u64);
+                first_content_index = Some(content_index as u64);
+            }
+
+            delta.push_str(text);
+        }
+    }
+
+    if delta.is_empty() {
+        return None;
+    }
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "type".to_string(),
+        Value::String("response.output_text.delta".to_string()),
+    );
+    payload.insert("delta".to_string(), Value::String(delta));
+    if let Some(item_id) = first_item_id {
+        payload.insert("item_id".to_string(), Value::String(item_id));
+    }
+    if let Some(output_index) = first_output_index {
+        payload.insert("output_index".to_string(), Value::from(output_index));
+    }
+    if let Some(content_index) = first_content_index {
+        payload.insert("content_index".to_string(), Value::from(content_index));
+    }
+
+    Some(Value::Object(payload))
+}
+
 pub(super) struct ResponseStreamState {
     pub(super) services: ThreadlineServices,
     pub(super) upstream: Arc<LiveUpstreamWebSocket>,
@@ -217,6 +288,8 @@ pub(super) struct ResponseStreamState {
     pub(super) suppressed_internal_output_indexes: HashSet<u64>,
     pub(super) upstream_event_seen: bool,
     pub(super) reconnect_attempted: bool,
+    pub(super) downstream_output_text_delta_emitted: bool,
+    pub(super) queued_final_completed: Option<Value>,
     pub(super) final_done_pending: bool,
     pub(super) done: bool,
 }
@@ -226,6 +299,22 @@ pub(super) fn response_stream(
 ) -> impl futures_util::Stream<Item = Result<Bytes, Infallible>> {
     stream::unfold(state, |mut state| async move {
         loop {
+            if let Some(completed) = state.queued_final_completed.take() {
+                let response_id = response_id_from_event(&completed);
+                trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                    &completed,
+                    DownstreamTraceAction::Terminal,
+                ));
+                debug!(response_id, event_type = "response.completed", "translation_event_forwarded");
+                debug!(response_id, "terminal_response_forwarded");
+                state.final_done_pending = true;
+                debug!(response_id, "final_done_queued");
+                return Some((
+                    Ok::<Bytes, Infallible>(sse_json_chunk("response.completed", &completed)),
+                    state,
+                ));
+            }
+
             if state.final_done_pending {
                 state.final_done_pending = false;
                 state.done = true;
@@ -400,6 +489,27 @@ pub(super) fn response_stream(
                         continue;
                     }
 
+                    if !state.downstream_output_text_delta_emitted {
+                        if let Some(synthetic_delta) =
+                            synthesized_completed_output_text_delta(&parsed)
+                        {
+                            trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                                &synthetic_delta,
+                                DownstreamTraceAction::Forwarded,
+                            ));
+                            debug!(response_id, event_type = "response.output_text.delta", "translation_event_forwarded");
+                            state.downstream_output_text_delta_emitted = true;
+                            state.queued_final_completed = Some(parsed);
+                            return Some((
+                                Ok::<Bytes, Infallible>(sse_json_chunk(
+                                    "response.output_text.delta",
+                                    &synthetic_delta,
+                                )),
+                                state,
+                            ));
+                        }
+                    }
+
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
                         &parsed,
                         DownstreamTraceAction::Terminal,
@@ -458,6 +568,9 @@ pub(super) fn response_stream(
                     ));
                 }
                 _ => {
+                    if event_type == "response.output_text.delta" {
+                        state.downstream_output_text_delta_emitted = true;
+                    }
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
                         &parsed,
                         DownstreamTraceAction::Forwarded,

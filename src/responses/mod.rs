@@ -80,6 +80,8 @@ pub async fn responses_handler(
         suppressed_internal_output_indexes: std::collections::HashSet::new(),
         upstream_event_seen: false,
         reconnect_attempted,
+        downstream_output_text_delta_emitted: false,
+        queued_final_completed: None,
         final_done_pending: false,
         done: false,
     });
