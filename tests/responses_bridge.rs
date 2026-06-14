@@ -156,6 +156,41 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
     }
 }
 
+fn assistant_text_completed_event(response_id: &str, text: &str) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": text
+                        }
+                    ]
+                }
+            ]
+        }
+    })
+}
+
+fn no_visible_output_failed_event(response_id: &str) -> Value {
+    json!({
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "status": "failed",
+            "error": {
+                "code": "threadline_no_visible_output",
+                "message": "Response contained no visible output."
+            }
+        }
+    })
+}
+
 fn assert_codex_unsupported_response_fields_are_absent(payload: &Value) {
     for field_name in [
         "max_output_tokens",
@@ -313,7 +348,7 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
         .send_text(r#"{"type":"response.created","response":{"id":"response-1"}}"#)
         .await;
     first_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "first completion").to_string())
         .await;
     let first_body = to_bytes(first_response.into_body(), usize::MAX)
         .await
@@ -354,7 +389,7 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     assert_eq!(sessions[1].turn_state.as_deref(), Some("turn-state-1"));
 
     second_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .send_text(&assistant_text_completed_event("response-2", "second completion").to_string())
         .await;
     let _ = to_bytes(second_response.into_body(), usize::MAX)
         .await
@@ -394,7 +429,7 @@ async fn context_management_compaction_is_forwarded_without_changing_marker_sema
         .send_text(r#"{"type":"response.created","response":{"id":"response-1"}}"#)
         .await;
     first_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "first completion").to_string())
         .await;
     let _ = to_bytes(first_response.into_body(), usize::MAX)
         .await
@@ -449,7 +484,7 @@ async fn context_management_compaction_is_forwarded_without_changing_marker_sema
     assert_codex_unsupported_response_fields_are_absent(&second_payload);
 
     second_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .send_text(&assistant_text_completed_event("response-2", "second completion").to_string())
         .await;
     let _ = to_bytes(second_response.into_body(), usize::MAX)
         .await
@@ -507,7 +542,7 @@ async fn summary_request_with_active_previous_response_id_uses_auxiliary_session
         .await
         .expect("seed request");
     retained_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(initial.into_body(), usize::MAX)
         .await
@@ -714,7 +749,7 @@ async fn transient_summary_request_does_not_evict_existing_retained_marker() {
         .await
         .expect("seed request");
     retained_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(seed.into_body(), usize::MAX)
         .await
@@ -729,7 +764,9 @@ async fn transient_summary_request_does_not_evict_existing_retained_marker() {
         .await
         .expect("summary request");
     summary_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-summary"}}"#)
+        .send_text(
+            &assistant_text_completed_event("response-summary", "summary completion").to_string(),
+        )
         .await;
     let _ = to_bytes(summary.into_body(), usize::MAX)
         .await
@@ -823,7 +860,7 @@ async fn transient_summary_request_can_run_while_previous_marker_is_active_at_ca
         .await
         .expect("seed request");
     retained_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(seed.into_body(), usize::MAX)
         .await
@@ -1015,7 +1052,7 @@ async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_l
     let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(initial.into_body(), usize::MAX)
         .await
@@ -1130,7 +1167,7 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
         .send_text("{\n  \"type\": \"response.output_text.delta\",\n  \"delta\": \"hello\"\n}")
         .await;
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "hello").to_string())
         .await;
 
     let body = to_bytes(response.into_body(), usize::MAX)
@@ -1157,7 +1194,7 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
     assert_eq!(completed_event, "response.completed");
     assert_eq!(
         completed_payload,
-        json!({"type":"response.completed","response":{"id":"response-1"}})
+        assistant_text_completed_event("response-1", "hello")
     );
 
     assert_done_frame(frames[2]);
@@ -1213,10 +1250,9 @@ async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse()
         .recv_client_message()
         .await
         .expect("pretty completed request");
+    let completed_event = assistant_text_completed_event("response-1", "hello from completed");
     server
-        .send_text(
-            "{\n  \"type\": \"response.completed\",\n  \"response\": {\n    \"id\": \"response-1\"\n  }\n}",
-        )
+        .send_text(&serde_json::to_string_pretty(&completed_event).expect("pretty completed json"))
         .await;
 
     let body = to_bytes(response.into_body(), usize::MAX)
@@ -1226,20 +1262,29 @@ async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse()
     let frames = split_sse_frames(&body_text);
     assert_eq!(
         frames.len(),
-        2,
-        "expected completed SSE plus bare DONE frame, got body: {body_text}"
+        3,
+        "expected synthetic delta, completed SSE, and bare DONE frame, got body: {body_text}"
     );
 
-    let (event, data) = sse_event_and_data(frames[0]);
+    let (delta_event, delta_data) = sse_event_and_data(frames[0]);
+    let delta_payload: Value = serde_json::from_str(delta_data).expect("delta json");
+    let (event, data) = sse_event_and_data(frames[1]);
     let payload: Value = serde_json::from_str(data).expect("completed json");
 
-    assert_eq!(event, "response.completed");
+    assert_eq!(delta_event, "response.output_text.delta");
     assert_eq!(
-        payload,
-        json!({"type":"response.completed","response":{"id":"response-1"}})
+        delta_payload,
+        json!({
+            "type":"response.output_text.delta",
+            "delta":"hello from completed",
+            "output_index":0,
+            "content_index":0
+        })
     );
+    assert_eq!(event, "response.completed");
+    assert_eq!(payload, completed_event);
 
-    assert_done_frame(frames[1]);
+    assert_done_frame(frames[2]);
 }
 
 #[tokio::test]
@@ -1257,10 +1302,9 @@ async fn downstream_completed_and_done_are_separate_body_chunks_before_eof() {
         .recv_client_message()
         .await
         .expect("chunk-boundary request");
+    let completed_event = assistant_text_completed_event("response-1", "hello from completed");
     server
-        .send_text(
-            "{\n  \"type\": \"response.completed\",\n  \"response\": {\n    \"id\": \"response-1\"\n  }\n}",
-        )
+        .send_text(&serde_json::to_string_pretty(&completed_event).expect("pretty completed json"))
         .await;
 
     let mut body_stream = response.into_body().into_data_stream();
@@ -1268,36 +1312,54 @@ async fn downstream_completed_and_done_are_separate_body_chunks_before_eof() {
     let first_text = String::from_utf8(first.to_vec()).expect("utf8 first chunk");
     assert!(
         !first_text.contains("data: [DONE]"),
-        "expected the completed chunk to exclude the bare DONE sentinel"
+        "expected the first synthetic delta chunk to exclude the bare DONE sentinel"
     );
     let (event, data) = sse_event_and_data(first_text.trim_end());
-    let payload: Value = serde_json::from_str(data).expect("completed json");
-    assert_eq!(event, "response.completed");
+    let payload: Value = serde_json::from_str(data).expect("delta json");
+    assert_eq!(event, "response.output_text.delta");
     assert_eq!(
         payload,
-        json!({"type":"response.completed","response":{"id":"response-1"}}),
-        "expected the first chunk to contain only the compact response.completed SSE frame"
+        json!({
+            "type":"response.output_text.delta",
+            "delta":"hello from completed",
+            "output_index":0,
+            "content_index":0
+        }),
+        "expected the first chunk to contain only the synthetic response.output_text.delta SSE frame"
     );
 
     let second = match body_stream.next().await {
         Some(Ok(chunk)) => chunk,
-        Some(Err(error)) => panic!("expected a bare DONE chunk, got body error: {error}"),
+        Some(Err(error)) => panic!("expected a completed chunk, got body error: {error}"),
         None => panic!(
-            "expected a separate bare DONE chunk after the completed chunk, but reached EOF after first chunk: {first_text:?}"
+            "expected a separate completed chunk after the synthetic delta chunk, but reached EOF after first chunk: {first_text:?}"
         ),
     };
-    let third = body_stream.next().await;
+    let second_text = String::from_utf8(second.to_vec()).expect("utf8 second chunk");
+    let (second_event, second_data) = sse_event_and_data(second_text.trim_end());
+    let second_payload: Value = serde_json::from_str(second_data).expect("completed json");
+    assert_eq!(second_event, "response.completed");
+    assert_eq!(second_payload, completed_event);
+
+    let third = match body_stream.next().await {
+        Some(Ok(chunk)) => chunk,
+        Some(Err(error)) => panic!("expected a bare DONE chunk, got body error: {error}"),
+        None => panic!(
+            "expected a separate bare DONE chunk after the completed chunk, but reached EOF after second chunk: {second_text:?}"
+        ),
+    };
+    let fourth = body_stream.next().await;
 
     assert_eq!(
-        second,
+        third,
         Bytes::from_static(b"data: [DONE]\n\n"),
-        "expected the second chunk to be exactly the bare downstream DONE sentinel"
+        "expected the third chunk to be exactly the bare downstream DONE sentinel"
     );
-    assert!(third.is_none(), "expected EOF after the bare DONE chunk");
+    assert!(fourth.is_none(), "expected EOF after the bare DONE chunk");
 }
 
 #[tokio::test]
-async fn completed_marker_can_be_reused_after_terminal_chunk_before_done_or_eof() {
+async fn completed_marker_can_be_reused_after_completed_chunk_before_done_or_eof() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -1309,7 +1371,7 @@ async fn completed_marker_can_be_reused_after_terminal_chunk_before_done_or_eof(
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(seed.into_body(), usize::MAX)
         .await
@@ -1331,16 +1393,26 @@ async fn completed_marker_can_be_reused_after_terminal_chunk_before_done_or_eof(
     .expect("active request json");
     assert_eq!(active_payload["previous_response_id"], "response-1");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .send_text(&assistant_text_completed_event("response-2", "followup completion").to_string())
         .await;
 
     let mut active_body = active.into_body().into_data_stream();
     let first_chunk = next_body_chunk(&mut active_body).await;
     let first_text = String::from_utf8(first_chunk.to_vec()).expect("utf8 first chunk");
     let (event, data) = sse_event_and_data(first_text.trim_end());
-    let payload: Value = serde_json::from_str(data).expect("completed json");
-    assert_eq!(event, "response.completed");
-    assert_eq!(payload["response"]["id"], "response-2");
+    let payload: Value = serde_json::from_str(data).expect("delta json");
+    assert_eq!(event, "response.output_text.delta");
+    assert_eq!(payload["delta"], "followup completion");
+
+    let completed_chunk = next_body_chunk(&mut active_body).await;
+    let completed_text = String::from_utf8(completed_chunk.to_vec()).expect("utf8 completed chunk");
+    let (completed_event, completed_data) = sse_event_and_data(completed_text.trim_end());
+    let completed_payload: Value = serde_json::from_str(completed_data).expect("completed json");
+    assert_eq!(completed_event, "response.completed");
+    assert_eq!(
+        completed_payload,
+        assistant_text_completed_event("response-2", "followup completion")
+    );
 
     let resumed = post_responses(
         app.clone(),
@@ -1366,7 +1438,7 @@ async fn completed_marker_can_be_reused_after_terminal_chunk_before_done_or_eof(
     );
 
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-3"}}"#)
+        .send_text(&assistant_text_completed_event("response-3", "resume completion").to_string())
         .await;
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
@@ -1374,7 +1446,7 @@ async fn completed_marker_can_be_reused_after_terminal_chunk_before_done_or_eof(
 }
 
 #[tokio::test]
-async fn recoverable_upstream_close_releases_prior_marker_before_body_drop() {
+async fn recoverable_upstream_close_releases_prior_marker_after_completed_chunk_before_body_drop() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
@@ -1396,19 +1468,29 @@ async fn recoverable_upstream_close_releases_prior_marker_before_body_drop() {
         .await
         .expect("seed request");
     first_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
 
     let mut initial_body = initial.into_body().into_data_stream();
     let first_chunk = next_body_chunk(&mut initial_body).await;
     let first_text = String::from_utf8(first_chunk.to_vec()).expect("utf8 first chunk");
     let (event, data) = sse_event_and_data(first_text.trim_end());
-    let payload: Value = serde_json::from_str(data).expect("completed json");
-    assert_eq!(event, "response.completed");
-    assert_eq!(payload["response"]["id"], "response-1");
+    let payload: Value = serde_json::from_str(data).expect("delta json");
+    assert_eq!(event, "response.output_text.delta");
+    assert_eq!(payload["delta"], "seed completion");
 
     first_server.send_close(1000, "done").await;
     sleep(Duration::from_millis(50)).await;
+
+    let completed_chunk = next_body_chunk(&mut initial_body).await;
+    let completed_text = String::from_utf8(completed_chunk.to_vec()).expect("utf8 completed chunk");
+    let (completed_event, completed_data) = sse_event_and_data(completed_text.trim_end());
+    let completed_payload: Value = serde_json::from_str(completed_data).expect("completed json");
+    assert_eq!(completed_event, "response.completed");
+    assert_eq!(
+        completed_payload,
+        assistant_text_completed_event("response-1", "seed completion")
+    );
 
     let resumed = post_responses(
         app.clone(),
@@ -1437,7 +1519,7 @@ async fn recoverable_upstream_close_releases_prior_marker_before_body_drop() {
     );
 
     reconnect_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .send_text(&assistant_text_completed_event("response-2", "resume completion").to_string())
         .await;
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
@@ -1824,7 +1906,7 @@ async fn response_failed_preserves_prior_completed_marker_for_resume() {
         .await
         .expect("seed request");
     first_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(initial.into_body(), usize::MAX)
         .await
@@ -1879,7 +1961,7 @@ async fn response_failed_preserves_prior_completed_marker_for_resume() {
     assert!(resumed_payload.get("response").is_none());
     assert_eq!(resumed_payload["previous_response_id"], "response-1");
     reconnect_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .send_text(&assistant_text_completed_event("response-2", "resume completion").to_string())
         .await;
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
@@ -1909,7 +1991,7 @@ async fn failed_turn_releases_prior_marker_before_body_drop() {
         .await
         .expect("seed request");
     first_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(initial.into_body(), usize::MAX)
         .await
@@ -1992,7 +2074,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(initial.into_body(), usize::MAX)
         .await
@@ -2162,7 +2244,7 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
     let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(initial.into_body(), usize::MAX)
         .await
@@ -2225,7 +2307,9 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     let first = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
     let _ = server.recv_client_message().await.expect("first request");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-parent"}}"#)
+        .send_text(
+            &assistant_text_completed_event("response-parent", "parent completion").to_string(),
+        )
         .await;
     let _ = to_bytes(first.into_body(), usize::MAX)
         .await
@@ -2247,7 +2331,9 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     assert!(second_payload.get("response").is_none());
     assert_eq!(second_payload["previous_response_id"], "response-parent");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-child"}}"#)
+        .send_text(
+            &assistant_text_completed_event("response-child", "child completion").to_string(),
+        )
         .await;
     let _ = to_bytes(second.into_body(), usize::MAX)
         .await
@@ -2269,7 +2355,9 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     assert!(third_payload.get("response").is_none());
     assert_eq!(third_payload["previous_response_id"], "response-parent");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-third"}}"#)
+        .send_text(
+            &assistant_text_completed_event("response-third", "third completion").to_string(),
+        )
         .await;
     let _ = to_bytes(third.into_body(), usize::MAX)
         .await
@@ -2291,7 +2379,9 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     assert!(fourth_payload.get("response").is_none());
     assert_eq!(fourth_payload["previous_response_id"], "response-child");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-fourth"}}"#)
+        .send_text(
+            &assistant_text_completed_event("response-fourth", "fourth completion").to_string(),
+        )
         .await;
     let _ = to_bytes(fourth.into_body(), usize::MAX)
         .await
@@ -3006,7 +3096,10 @@ async fn responses_bridge_apply_patch_done_preserves_complete_arguments() {
 async fn responses_bridge_visible_function_call_payloads_are_forwarded_without_mutation() {
     let capture = capture_visible_apply_patch_stream().await;
 
-    for (index, upstream_event) in capture.upstream_events.iter().enumerate() {
+    for (index, upstream_event) in capture.upstream_events[..capture.upstream_events.len() - 1]
+        .iter()
+        .enumerate()
+    {
         assert_eq!(
             capture.downstream_events[index].payload, *upstream_event,
             "expected downstream SSE payload to match upstream event for index {index}"
@@ -3019,6 +3112,11 @@ async fn responses_bridge_visible_function_call_payloads_are_forwarded_without_m
             "expected downstream SSE event name to match upstream event type for index {index}"
         );
     }
+    assert_eq!(capture.downstream_events[5].event, "response.failed");
+    assert_eq!(
+        capture.downstream_events[5].payload,
+        no_visible_output_failed_event("response-apply-patch")
+    );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
@@ -3783,7 +3881,7 @@ async fn completed_only_synthetic_delta_precedes_completed_and_done_chunks() {
 }
 
 #[tokio::test]
-async fn completed_only_synthetic_delta_releases_marker_before_queued_completed() {
+async fn completed_output_marker_is_reusable_after_completed_before_done() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -3795,7 +3893,7 @@ async fn completed_only_synthetic_delta_releases_marker_before_queued_completed(
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
     let _ = to_bytes(seed.into_body(), usize::MAX)
         .await
@@ -3846,6 +3944,13 @@ async fn completed_only_synthetic_delta_releases_marker_before_queued_completed(
     assert_eq!(event, "response.output_text.delta");
     assert_eq!(payload["delta"], "ordered text");
 
+    let second_chunk = next_body_chunk(&mut active_body).await;
+    let second_text = String::from_utf8(second_chunk.to_vec()).expect("utf8 second chunk");
+    let (second_event, second_data) = sse_event_and_data(second_text.trim_end());
+    let second_payload: Value = serde_json::from_str(second_data).expect("completed json");
+    assert_eq!(second_event, "response.completed");
+    assert_eq!(second_payload, completed_event);
+
     let resumed = post_responses(
         app.clone(),
         json!({
@@ -3861,13 +3966,6 @@ async fn completed_only_synthetic_delta_releases_marker_before_queued_completed(
     ))
     .expect("resumed request json");
     assert_eq!(resumed_payload["previous_response_id"], "response-ordering");
-
-    let second_chunk = next_body_chunk(&mut active_body).await;
-    let second_text = String::from_utf8(second_chunk.to_vec()).expect("utf8 second chunk");
-    let (second_event, second_data) = sse_event_and_data(second_text.trim_end());
-    let second_payload: Value = serde_json::from_str(second_data).expect("completed json");
-    assert_eq!(second_event, "response.completed");
-    assert_eq!(second_payload, completed_event);
 
     let third_chunk = next_body_chunk(&mut active_body).await;
     assert_eq!(third_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
@@ -3962,18 +4060,22 @@ async fn malformed_completed_output_does_not_panic_or_synthesize_delta() {
 
     for (case_name, completed_event) in completed_cases {
         let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+        let response_id = completed_event["response"]["id"]
+            .as_str()
+            .expect("completed response id");
         assert_eq!(
             capture.downstream_events.len(),
             1,
-            "expected malformed case {case_name} to forward response.completed without a synthetic delta"
+            "expected malformed case {case_name} to emit only the terminal failure without a synthetic delta"
         );
         assert_eq!(
-            capture.downstream_events[0].event, "response.completed",
-            "expected malformed case {case_name} to preserve the completed event"
+            capture.downstream_events[0].event, "response.failed",
+            "expected malformed case {case_name} to downgrade the malformed completion into response.failed"
         );
         assert_eq!(
-            capture.downstream_events[0].payload, completed_event,
-            "expected malformed case {case_name} to remain unchanged downstream"
+            capture.downstream_events[0].payload,
+            no_visible_output_failed_event(response_id),
+            "expected malformed case {case_name} to emit the stable no-visible-output failure payload"
         );
         assert_eq!(capture.done_frame, "data: [DONE]");
     }

@@ -12,7 +12,7 @@ Use this file before changing `/v1/responses` handling, SSE translation, Codex b
 
 `/v1/responses` is the primary API.
 
-Threadline bridges VSCode BYOK requests to Codex backend WebSocket sessions while keeping the implementation focused.
+Threadline is a VSCode BYOK to Codex ABI translator for `/v1/responses`, bridging VSCode BYOK requests to Codex backend WebSocket sessions while keeping the implementation focused.
 
 Do not turn Threadline into a general-purpose OpenAI-compatible proxy.
 
@@ -48,11 +48,21 @@ Keep request normalization separate from transport code.
 
 Keep SSE translation separate from upstream WebSocket frame handling.
 
-As a narrow compatibility normalization for the Threadline `/v1/responses` bridge, final visible assistant text may be derived from `response.output_text.done`, `response.output_item.done`, or `response.completed`.
+As a narrow compatibility normalization for the Threadline `/v1/responses` bridge, visible assistant text may be accumulated from `response.output_text.delta`, `response.output_text.done`, assistant `response.output_item.done` messages, and final `response.completed` output.
 
-If Threadline has not already forwarded equivalent visible assistant text downstream, it emits a synthetic downstream `response.output_text.delta` immediately before forwarding the terminal upstream event that carried that final visible text.
+If Threadline has not already forwarded equivalent visible assistant text downstream, it may emit a synthetic downstream `response.output_text.delta` immediately before forwarding the terminal downstream event that carries the final visible text.
 
-When forwarding the final downstream `response.completed`, Threadline may sanitize `response.completed.response.output` to remove Threadline-internal `threadline_*` function calls and compaction-only items while preserving the visible assistant result. Bare `[DONE]` still follows as a separate downstream chunk.
+If earlier visible text was streamed but the final completed assistant message would otherwise be missing or incomplete, Threadline may backfill the final completed assistant message from the accumulated visible assistant text.
+
+When forwarding the final downstream `response.completed`, Threadline may sanitize `response.completed.response.output` to remove Threadline-internal `threadline_*` function calls and compaction-only items while preserving downstream-consumable output.
+
+For ordinary downstream requests, a successful downstream stream may end with `response.completed` only when `response.completed.response.output` still contains VSCode-consumable output after Threadline sanitization.
+
+`image_generation_call.result` remains a valid successful non-text output and may satisfy the final consumable-output requirement even when no visible assistant text is present.
+
+If an ordinary request reaches a terminal state with only internal `threadline_*` items, only compaction-only items, or otherwise no consumable final output, Threadline must end the stream as `response.failed` with a stable no-visible-output failure instead of an empty success.
+
+Auxiliary summary and transient auxiliary behavior remain narrow exceptions to the ordinary no-visible-output failure rule.
 
 When a downstream request includes `previous_response_id`, use it as a continuation marker.
 
@@ -180,7 +190,7 @@ Do not send follow-up tool outputs before the intermediate response completes.
 
 Do not treat the intermediate response completion as the final downstream completion.
 
-Intermediate completions that only finish internal-tool work are consumed inside Threadline and are not final downstream completions.
+Internal `threadline_*` tool events and intermediate completions that only finish internal-tool work are consumed inside Threadline, stay hidden downstream, and are not final downstream completions.
 
 Visible-text normalization is final-only and applies only to the downstream-visible assistant result after internal-tool follow-up has completed.
 
@@ -288,21 +298,31 @@ Public errors must not include tokens, cookies, authorization headers, credentia
 
 Prefer concise user-facing messages plus structured internal logs.
 
-## Upstream error events and SSE
+## Terminal downstream events and SSE
 
 Raw upstream `error` events may contain sensitive or unstable information.
 
 Log them only at debug or trace level after confirming they do not contain secrets.
 
-Upstream `response.failed` is a separate downstream terminal path from raw upstream `error` events.
+Upstream `response.failed` and `response.incomplete` are separate downstream terminal paths from raw upstream `error` events.
+
+Downstream `[DONE]` is only an optional trailer after a terminal downstream event. `[DONE]` alone is never the success signal.
 
 When Threadline receives an upstream `response.failed`, forward it downstream as terminal SSE `event: response.failed`.
 
-The downstream payload should keep stable Responses-style fields: top-level `type` set to `response.failed`, `response.status` set to `failed`, and `response.error.code` plus `response.error.message` populated from stable public error wording.
+When Threadline receives an upstream `response.incomplete`, forward it downstream as terminal SSE `event: response.incomplete`.
+
+Terminal downstream `response.failed` and `response.incomplete` payloads should keep stable, safe Responses-style fields appropriate to the terminal status.
+
+For `response.failed`, use top-level `type` set to `response.failed`, `response.status` set to `failed`, and `response.error.code` plus `response.error.message` populated from stable public error wording.
 
 Include `response.id` when the upstream failure payload provides one.
 
-After emitting the terminal `response.failed` event, terminate the stream with downstream `[DONE]`.
+For `response.incomplete`, preserve safe status-specific fields and do not expose unstable upstream-only internals.
+
+After emitting a terminal downstream `response.failed` or `response.incomplete` event, Threadline may terminate the stream with downstream `[DONE]`.
+
+Successful downstream streams should terminate with `response.completed` only when the final `response.completed.response.output` contains VSCode-consumable output.
 
 Emitting a failed `response.id` downstream does not make that id continuation-safe. Only previously completed markers remain valid for later `previous_response_id` requests.
 
@@ -316,7 +336,7 @@ Keep raw upstream `error` handling and malformed protocol handling separate from
 
 Downstream SSE should represent the final client-facing response stream.
 
-Internal tool calls and intermediate completions should not appear as final assistant output.
+Internal tool calls, internal-tool intermediate completions, and assistantless intermediate terminal states should not appear as final assistant output.
 
 If an upstream sequence contains an internal tool call followed by a follow-up response, downstream should observe the final assistant-facing result, not the internal orchestration.
 
