@@ -314,6 +314,33 @@ impl VisibleTextSourceKey {
             content_index,
         }
     }
+
+    fn dedupe_identity(&self) -> Option<VisibleTextDedupeIdentity> {
+        if let Some(item_id) = self.item_id.as_ref() {
+            return Some(VisibleTextDedupeIdentity::ItemId {
+                item_id: item_id.clone(),
+                content_index: self.content_index,
+            });
+        }
+
+        self.output_index
+            .map(|output_index| VisibleTextDedupeIdentity::OutputIndex {
+                output_index,
+                content_index: self.content_index,
+            })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum VisibleTextDedupeIdentity {
+    ItemId {
+        item_id: String,
+        content_index: Option<u64>,
+    },
+    OutputIndex {
+        output_index: u64,
+        content_index: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,7 +391,7 @@ fn synthesized_output_text_done_delta(event: &Value) -> Option<(VisibleTextSourc
 
 fn message_output_text_delta_payloads(
     item: &Value,
-    output_index: u64,
+    output_index: Option<u64>,
 ) -> Vec<(VisibleTextSourceKey, Value)> {
     if item.get("type").and_then(Value::as_str) != Some("message")
         || item.get("role").and_then(Value::as_str) != Some("assistant")
@@ -387,11 +414,8 @@ fn message_output_text_delta_payloads(
             continue;
         };
 
-        let key = VisibleTextSourceKey::new(
-            item_id.clone(),
-            Some(output_index),
-            Some(content_index as u64),
-        );
+        let key =
+            VisibleTextSourceKey::new(item_id.clone(), output_index, Some(content_index as u64));
         let Some(payload) = response_output_text_delta_payload(&key, text) else {
             continue;
         };
@@ -402,14 +426,11 @@ fn message_output_text_delta_payloads(
 }
 
 fn synthesized_output_item_done_text_delta(event: &Value) -> Vec<(VisibleTextSourceKey, Value)> {
-    let Some(output_index) = event.get("output_index").and_then(Value::as_u64) else {
-        return Vec::new();
-    };
     let Some(item) = event.get("item") else {
         return Vec::new();
     };
 
-    message_output_text_delta_payloads(item, output_index)
+    message_output_text_delta_payloads(item, output_index_from_event(event))
 }
 
 fn synthesized_completed_output_text_delta(event: &Value) -> Vec<(VisibleTextSourceKey, Value)> {
@@ -491,6 +512,36 @@ fn record_visible_assistant_text(
     });
 }
 
+fn track_visible_text_identity(
+    state: &mut ResponseStreamState,
+    key: &VisibleTextSourceKey,
+    text: &str,
+) -> bool {
+    if let Some(identity) = key.dedupe_identity() {
+        state.downstream_visible_text_sources.insert(identity);
+        return true;
+    }
+
+    if state.last_unidentified_visible_text.as_deref() == Some(text) {
+        return false;
+    }
+
+    state.last_unidentified_visible_text = Some(text.to_string());
+    true
+}
+
+fn record_forwarded_visible_text_delta(
+    state: &mut ResponseStreamState,
+    key: VisibleTextSourceKey,
+    delta: &str,
+) {
+    if !track_visible_text_identity(state, &key, delta) {
+        return;
+    }
+
+    record_visible_assistant_text(&mut state.visible_assistant_text, &key, delta);
+}
+
 fn queue_visible_text_delta(
     state: &mut ResponseStreamState,
     key: VisibleTextSourceKey,
@@ -498,13 +549,26 @@ fn queue_visible_text_delta(
     synthetic_delta_source: &'static str,
     response_id: Option<&str>,
 ) -> bool {
-    if !state.downstream_visible_text_sources.insert(key.clone()) {
+    let Some(delta) = payload.get("delta").and_then(Value::as_str) else {
+        return false;
+    };
+
+    if !key
+        .dedupe_identity()
+        .map(|identity| state.downstream_visible_text_sources.insert(identity))
+        .unwrap_or_else(|| {
+            if state.last_unidentified_visible_text.as_deref() == Some(delta) {
+                false
+            } else {
+                state.last_unidentified_visible_text = Some(delta.to_string());
+                true
+            }
+        })
+    {
         return false;
     }
 
-    if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-        record_visible_assistant_text(&mut state.visible_assistant_text, &key, delta);
-    }
+    record_visible_assistant_text(&mut state.visible_assistant_text, &key, delta);
     state
         .queued_synthetic_output_text_deltas
         .push_back(QueuedSyntheticOutputTextDelta {
@@ -591,6 +655,57 @@ fn synthetic_assistant_message(
         ("role".to_string(), Value::String("assistant".to_string())),
         ("content".to_string(), Value::Array(content)),
     ])))
+}
+
+fn has_accumulated_visible_assistant_text(visible_text: &[VisibleAssistantText]) -> bool {
+    visible_text
+        .iter()
+        .any(|entry| !entry.text.trim().is_empty())
+}
+
+fn completed_has_vscode_consumable_output(event: &Value) -> bool {
+    event
+        .get("response")
+        .and_then(|response| response.get("output"))
+        .and_then(Value::as_array)
+        .is_some_and(|output| {
+            output.iter().any(|item| {
+                assistant_message_has_visible_output_text(item)
+                    || (item.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                        && item
+                            .get("result")
+                            .and_then(Value::as_str)
+                            .is_some_and(|result| !result.trim().is_empty()))
+            })
+        })
+}
+
+fn no_visible_output_failed_payload(response_id: Option<&str>) -> Value {
+    let mut response = serde_json::Map::new();
+    if let Some(response_id) = response_id.filter(|value| !value.is_empty()) {
+        response.insert("id".to_string(), Value::String(response_id.to_string()));
+    }
+
+    Value::Object(serde_json::Map::from_iter([
+        (
+            "type".to_string(),
+            Value::String("response.failed".to_string()),
+        ),
+        ("response".to_string(), Value::Object(response)),
+        (
+            "error".to_string(),
+            Value::Object(serde_json::Map::from_iter([
+                (
+                    "code".to_string(),
+                    Value::String("threadline_no_visible_output".to_string()),
+                ),
+                (
+                    "message".to_string(),
+                    Value::String("Response contained no visible output.".to_string()),
+                ),
+            ])),
+        ),
+    ]))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -695,13 +810,15 @@ pub(super) struct ResponseStreamState {
     pub(super) suppressed_internal_output_indexes: HashSet<u64>,
     pub(super) upstream_event_seen: bool,
     pub(super) reconnect_attempted: bool,
-    pub(super) downstream_visible_text_sources: HashSet<VisibleTextSourceKey>,
+    pub(super) downstream_visible_text_sources: HashSet<VisibleTextDedupeIdentity>,
     pub(super) downstream_visible_text_delta_count: usize,
     pub(super) visible_assistant_text: Vec<VisibleAssistantText>,
+    pub(super) last_unidentified_visible_text: Option<String>,
     pub(super) queued_synthetic_output_text_deltas: VecDeque<QueuedSyntheticOutputTextDelta>,
     pub(super) queued_forwarded_event: Option<QueuedForwardedEvent>,
     pub(super) queued_final_completed: Option<QueuedCompletedEvent>,
     pub(super) final_done_pending: bool,
+    pub(super) apply_no_visible_output_failure: bool,
     pub(super) done: bool,
 }
 
@@ -762,6 +879,9 @@ pub(super) fn response_stream(
 
             if let Some(completed) = state.queued_final_completed.take() {
                 let response_id = response_id_from_event(&completed.payload);
+                if let Some(response_id) = response_id {
+                    state.lease.record_completed_marker(response_id).await;
+                }
                 let trace_diagnostics = DownstreamTraceDiagnostics {
                     response_id: response_id.map(ToString::to_string),
                     visible_text_delta_count: Some(state.downstream_visible_text_delta_count),
@@ -787,6 +907,7 @@ pub(super) fn response_stream(
                     "translation_event_forwarded"
                 );
                 debug!(response_id, "terminal_response_forwarded");
+                state.lease.release();
                 state.final_done_pending = true;
                 debug!(response_id, "final_done_queued");
                 return Some((
@@ -943,10 +1064,6 @@ pub(super) fn response_stream(
                 "response.completed" => {
                     let response_id = response_id_from_event(&parsed).map(ToString::to_string);
 
-                    if let Some(response_id) = response_id.as_deref() {
-                        state.lease.record_completed_marker(response_id).await;
-                    }
-
                     if !state.pending_internal_outputs.is_empty() {
                         let Some(response_id) = response_id.as_deref() else {
                             let error = ThreadlineError::InternalToolFailed;
@@ -984,6 +1101,7 @@ pub(super) fn response_stream(
                         state.downstream_visible_text_sources.clear();
                         state.downstream_visible_text_delta_count = 0;
                         state.visible_assistant_text.clear();
+                        state.last_unidentified_visible_text = None;
                         state.queued_synthetic_output_text_deltas.clear();
                         debug!(
                             response_id,
@@ -994,22 +1112,13 @@ pub(super) fn response_stream(
                         continue;
                     }
 
-                    if queue_visible_text_deltas(
-                        &mut state,
-                        synthesized_completed_output_text_delta(&parsed),
-                        "response.completed",
-                        response_id.as_deref(),
-                    ) {
-                        state.lease.release();
-                        let (payload, diagnostics) = sanitized_completed_event_with_diagnostics(
-                            &parsed,
-                            &state.visible_assistant_text,
+                    if !has_accumulated_visible_assistant_text(&state.visible_assistant_text) {
+                        queue_visible_text_deltas(
+                            &mut state,
+                            synthesized_completed_output_text_delta(&parsed),
+                            "response.completed",
+                            response_id.as_deref(),
                         );
-                        state.queued_final_completed = Some(QueuedCompletedEvent {
-                            payload,
-                            diagnostics,
-                        });
-                        continue;
                     }
 
                     let (sanitized_completed, diagnostics) =
@@ -1017,33 +1126,36 @@ pub(super) fn response_stream(
                             &parsed,
                             &state.visible_assistant_text,
                         );
-                    let trace_diagnostics = DownstreamTraceDiagnostics {
-                        response_id: response_id.clone(),
-                        visible_text_delta_count: Some(state.downstream_visible_text_delta_count),
-                        sanitized_internal_function_call_count: Some(
-                            diagnostics.sanitized_internal_function_call_count,
-                        ),
-                        sanitized_compaction_count: Some(diagnostics.sanitized_compaction_count),
-                        completed_visible_message_count: Some(
-                            diagnostics.completed_visible_message_count,
-                        ),
-                        ..Default::default()
-                    };
 
-                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
-                        &sanitized_completed,
-                        DownstreamTraceAction::Terminal,
-                        Some(&trace_diagnostics),
-                    ));
-                    debug!(response_id, event_type, "translation_event_forwarded");
-                    debug!(response_id, "terminal_response_forwarded");
-                    state.lease.release();
-                    state.final_done_pending = true;
-                    debug!(response_id, "final_done_queued");
-                    return Some((
-                        Ok::<Bytes, Infallible>(sse_json_chunk(&event_type, &sanitized_completed)),
-                        state,
-                    ));
+                    if state.apply_no_visible_output_failure
+                        && !completed_has_vscode_consumable_output(&sanitized_completed)
+                    {
+                        let failed_payload =
+                            no_visible_output_failed_payload(response_id.as_deref());
+                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                            &failed_payload,
+                            DownstreamTraceAction::Terminal,
+                            None,
+                        ));
+                        state.lease.mark_upstream_terminal().await;
+                        state.lease.release();
+                        state.final_done_pending = true;
+                        debug!(response_id, event_type, "translation_event_forwarded");
+                        debug!(response_id, "terminal_response_forwarded");
+                        debug!(response_id, "final_done_queued");
+                        return Some((
+                            Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                &failed_payload,
+                            )),
+                            state,
+                        ));
+                    }
+
+                    state.queued_final_completed = Some(QueuedCompletedEvent {
+                        payload: sanitized_completed,
+                        diagnostics,
+                    });
+                    continue;
                 }
                 "response.failed" => {
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
@@ -1096,8 +1208,8 @@ pub(super) fn response_stream(
                     let mut trace_diagnostics = DownstreamTraceDiagnostics::default();
                     if event_type == "response.output_text.delta" {
                         let key = visible_text_delta_source_key(&parsed);
-                        state.downstream_visible_text_sources.insert(key.clone());
                         if let Some(delta) = parsed.get("delta").and_then(Value::as_str) {
+                            record_forwarded_visible_text_delta(&mut state, key, delta);
                             trace_diagnostics.visible_text_length = Some(delta.len());
                         }
                         state.downstream_visible_text_delta_count += 1;
