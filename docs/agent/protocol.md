@@ -48,9 +48,11 @@ Keep request normalization separate from transport code.
 
 Keep SSE translation separate from upstream WebSocket frame handling.
 
-As a narrow compatibility fallback for the Threadline `/v1/responses` bridge, if final assistant body text exists only inside `response.completed.response.output` and Threadline did not forward any real downstream `response.output_text.delta`, Threadline synthesizes one downstream `response.output_text.delta` before forwarding the original `response.completed` event.
+As a narrow compatibility normalization for the Threadline `/v1/responses` bridge, final visible assistant text may be derived from `response.output_text.done`, `response.output_item.done`, or `response.completed`.
 
-This fallback does not rewrite the original final `response.completed` payload, and bare `[DONE]` still follows as a separate downstream chunk.
+If Threadline has not already forwarded equivalent visible assistant text downstream, it emits a synthetic downstream `response.output_text.delta` immediately before forwarding the terminal upstream event that carried that final visible text.
+
+When forwarding the final downstream `response.completed`, Threadline may sanitize `response.completed.response.output` to remove Threadline-internal `threadline_*` function calls and compaction-only items while preserving the visible assistant result. Bare `[DONE]` still follows as a separate downstream chunk.
 
 When a downstream request includes `previous_response_id`, use it as a continuation marker.
 
@@ -178,7 +180,9 @@ Do not send follow-up tool outputs before the intermediate response completes.
 
 Do not treat the intermediate response completion as the final downstream completion.
 
-The completed-only downstream text-delta fallback is final-only and does not apply to intermediate completions that Threadline consumes internally before local tool follow-up.
+Intermediate completions that only finish internal-tool work are consumed inside Threadline and are not final downstream completions.
+
+Visible-text normalization is final-only and applies only to the downstream-visible assistant result after internal-tool follow-up has completed.
 
 Do not expose internal tool call details downstream unless explicitly required for diagnostics and safe to expose.
 
