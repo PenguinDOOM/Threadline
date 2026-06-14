@@ -245,20 +245,6 @@ fn string_length_field(value: Option<&Value>) -> Option<usize> {
     value.and_then(Value::as_str).map(str::len)
 }
 
-fn completed_output_blocks_synthetic_delta(output: &[Value]) -> bool {
-    output
-        .iter()
-        .any(|item| match item.get("type").and_then(Value::as_str) {
-            Some("compaction") => true,
-            Some("function_call") => item
-                .get("name")
-                .or_else(|| item.get("tool_name"))
-                .and_then(Value::as_str)
-                .is_some_and(is_internal_tool_name),
-            _ => false,
-        })
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct VisibleTextSourceKey {
     item_id: Option<String>,
@@ -274,6 +260,12 @@ impl VisibleTextSourceKey {
             content_index,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct VisibleAssistantText {
+    key: VisibleTextSourceKey,
+    text: String,
 }
 
 fn response_output_text_delta_payload(key: &VisibleTextSourceKey, delta: &str) -> Option<Value> {
@@ -375,10 +367,6 @@ fn synthesized_completed_output_text_delta(event: &Value) -> Vec<(VisibleTextSou
         return Vec::new();
     };
 
-    if completed_output_blocks_synthetic_delta(output) {
-        return Vec::new();
-    }
-
     let mut payloads = Vec::new();
     for (output_index, item) in output.iter().enumerate() {
         payloads.extend(message_output_text_delta_payloads(
@@ -390,19 +378,163 @@ fn synthesized_completed_output_text_delta(event: &Value) -> Vec<(VisibleTextSou
     payloads
 }
 
+fn record_visible_assistant_text(
+    visible_text: &mut Vec<VisibleAssistantText>,
+    key: &VisibleTextSourceKey,
+    text: &str,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+
+    if let Some(existing) = visible_text.iter_mut().find(|entry| entry.key == *key) {
+        existing.text.push_str(text);
+        return;
+    }
+
+    visible_text.push(VisibleAssistantText {
+        key: key.clone(),
+        text: text.to_string(),
+    });
+}
+
+fn queue_visible_text_delta(
+    state: &mut ResponseStreamState,
+    key: VisibleTextSourceKey,
+    payload: Value,
+) -> bool {
+    if !state.downstream_visible_text_sources.insert(key.clone()) {
+        return false;
+    }
+
+    if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+        record_visible_assistant_text(&mut state.visible_assistant_text, &key, delta);
+    }
+    state.queued_synthetic_output_text_deltas.push_back(payload);
+    true
+}
+
 fn queue_visible_text_deltas(
     state: &mut ResponseStreamState,
     payloads: Vec<(VisibleTextSourceKey, Value)>,
 ) -> bool {
     let mut queued = false;
     for (key, payload) in payloads {
-        if state.downstream_visible_text_sources.insert(key) {
-            state.queued_synthetic_output_text_deltas.push_back(payload);
+        if queue_visible_text_delta(state, key, payload) {
             queued = true;
         }
     }
 
     queued
+}
+
+fn completed_item_is_sanitized(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("compaction") => true,
+        Some("function_call") => item
+            .get("name")
+            .or_else(|| item.get("tool_name"))
+            .and_then(Value::as_str)
+            .is_some_and(is_internal_tool_name),
+        _ => false,
+    }
+}
+
+fn assistant_message_has_visible_output_text(item: &Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return false;
+    }
+
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("output_text")
+                    && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+            })
+        })
+}
+
+fn synthetic_assistant_message_id(response_id: Option<&str>) -> String {
+    match response_id {
+        Some(response_id) if !response_id.is_empty() => {
+            format!("threadline_synthetic_assistant_{response_id}")
+        }
+        _ => "threadline_synthetic_assistant".to_string(),
+    }
+}
+
+fn synthetic_assistant_message(
+    response_id: Option<&str>,
+    visible_text: &[VisibleAssistantText],
+) -> Option<Value> {
+    let content: Vec<Value> = visible_text
+        .iter()
+        .filter(|entry| !entry.text.trim().is_empty())
+        .map(|entry| {
+            Value::Object(serde_json::Map::from_iter([
+                ("type".to_string(), Value::String("output_text".to_string())),
+                ("text".to_string(), Value::String(entry.text.clone())),
+                ("annotations".to_string(), Value::Array(Vec::new())),
+            ]))
+        })
+        .collect();
+
+    if content.is_empty() {
+        return None;
+    }
+
+    let message_id = visible_text
+        .iter()
+        .find_map(|entry| entry.key.item_id.clone())
+        .unwrap_or_else(|| synthetic_assistant_message_id(response_id));
+
+    Some(Value::Object(serde_json::Map::from_iter([
+        ("id".to_string(), Value::String(message_id)),
+        ("type".to_string(), Value::String("message".to_string())),
+        ("role".to_string(), Value::String("assistant".to_string())),
+        ("content".to_string(), Value::Array(content)),
+    ])))
+}
+
+fn sanitized_completed_event(event: &Value, visible_text: &[VisibleAssistantText]) -> Value {
+    let mut sanitized = event.clone();
+    let response_id = response_id_from_event(event);
+
+    let Some(response) = sanitized.get_mut("response").and_then(Value::as_object_mut) else {
+        return sanitized;
+    };
+
+    let filtered_output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|output| {
+            output
+                .iter()
+                .filter(|item| !completed_item_is_sanitized(item))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let has_visible_assistant_message = filtered_output
+        .iter()
+        .any(assistant_message_has_visible_output_text);
+    let mut final_output = filtered_output;
+
+    if !has_visible_assistant_message {
+        if let Some(message) = synthetic_assistant_message(response_id, visible_text) {
+            final_output.push(message);
+        }
+    }
+
+    response.insert("output".to_string(), Value::Array(final_output));
+    sanitized
 }
 
 pub(super) struct ResponseStreamState {
@@ -417,6 +549,7 @@ pub(super) struct ResponseStreamState {
     pub(super) upstream_event_seen: bool,
     pub(super) reconnect_attempted: bool,
     pub(super) downstream_visible_text_sources: HashSet<VisibleTextSourceKey>,
+    pub(super) visible_assistant_text: Vec<VisibleAssistantText>,
     pub(super) queued_synthetic_output_text_deltas: VecDeque<Value>,
     pub(super) queued_final_completed: Option<Value>,
     pub(super) final_done_pending: bool,
@@ -648,6 +781,7 @@ pub(super) fn response_stream(
                             return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
                         }
                         state.downstream_visible_text_sources.clear();
+                        state.visible_assistant_text.clear();
                         state.queued_synthetic_output_text_deltas.clear();
                         debug!(
                             response_id,
@@ -663,12 +797,18 @@ pub(super) fn response_stream(
                         synthesized_completed_output_text_delta(&parsed),
                     ) {
                         state.lease.release();
-                        state.queued_final_completed = Some(parsed);
+                        state.queued_final_completed = Some(sanitized_completed_event(
+                            &parsed,
+                            &state.visible_assistant_text,
+                        ));
                         continue;
                     }
 
+                    let sanitized_completed =
+                        sanitized_completed_event(&parsed, &state.visible_assistant_text);
+
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
-                        &parsed,
+                        &sanitized_completed,
                         DownstreamTraceAction::Terminal,
                     ));
                     debug!(response_id, event_type, "translation_event_forwarded");
@@ -677,7 +817,7 @@ pub(super) fn response_stream(
                     state.final_done_pending = true;
                     debug!(response_id, "final_done_queued");
                     return Some((
-                        Ok::<Bytes, Infallible>(sse_json_chunk(&event_type, &parsed)),
+                        Ok::<Bytes, Infallible>(sse_json_chunk(&event_type, &sanitized_completed)),
                         state,
                     ));
                 }
@@ -728,13 +868,18 @@ pub(super) fn response_stream(
                 }
                 _ => {
                     if event_type == "response.output_text.delta" {
-                        state
-                            .downstream_visible_text_sources
-                            .insert(visible_text_delta_source_key(&parsed));
+                        let key = visible_text_delta_source_key(&parsed);
+                        state.downstream_visible_text_sources.insert(key.clone());
+                        if let Some(delta) = parsed.get("delta").and_then(Value::as_str) {
+                            record_visible_assistant_text(
+                                &mut state.visible_assistant_text,
+                                &key,
+                                delta,
+                            );
+                        }
                     } else if event_type == "response.output_text.done" {
                         if let Some((key, payload)) = synthesized_output_text_done_delta(&parsed) {
-                            if state.downstream_visible_text_sources.insert(key) {
-                                state.queued_synthetic_output_text_deltas.push_back(payload);
+                            if queue_visible_text_delta(&mut state, key, payload) {
                                 state.queued_synthetic_output_text_deltas.push_back(parsed);
                                 continue;
                             }

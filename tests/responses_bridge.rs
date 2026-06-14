@@ -1477,19 +1477,43 @@ async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_do
 
     assert_eq!(
         frames.len(),
-        2,
-        "expected completed SSE plus bare DONE frame, got body: {body_text}"
+        3,
+        "expected synthetic delta, completed SSE, and bare DONE frame, got body: {body_text}"
     );
 
-    let (event, data) = sse_event_and_data(frames[0]);
+    let (delta_event, delta_data) = sse_event_and_data(frames[0]);
+    let delta_payload: Value = serde_json::from_str(delta_data).expect("delta json");
+    assert_eq!(delta_event, "response.output_text.delta");
+    assert_eq!(
+        delta_payload,
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "done",
+            "output_index": 1,
+            "content_index": 0
+        })
+    );
+
+    let (event, data) = sse_event_and_data(frames[1]);
     let payload: Value = serde_json::from_str(data).expect("completed json");
     assert_eq!(event, "response.completed");
     assert_eq!(payload["response"]["id"], "response-1");
     assert_eq!(
-        payload["response"]["output"][0]["name"], "threadline_echo",
-        "expected payload normalization to stay unchanged for response.completed"
+        payload["response"]["output"],
+        json!([
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "done"
+                    }
+                ]
+            }
+        ])
     );
-    assert_done_frame(frames[1]);
+    assert_done_frame(frames[2]);
 }
 
 #[tokio::test]
@@ -1537,7 +1561,28 @@ async fn completed_with_internal_function_call_and_assistant_text_synthesizes_de
         })
     );
     assert_eq!(capture.downstream_events[1].event, "response.completed");
-    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(
+        capture.downstream_events[1].payload,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-internal-visible-text",
+                "output": [
+                    {
+                        "id": "assistant-item-internal-visible",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "visible completed text"
+                            }
+                        ]
+                    }
+                ]
+            }
+        })
+    );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
@@ -2501,6 +2546,11 @@ async fn capture_compaction_stream(compaction_name_field: &str) -> CompactionStr
     });
     server.send_text(&completed_event.to_string()).await;
 
+    let delta_chunk = next_body_chunk(&mut body_stream).await;
+    let delta_text = String::from_utf8(delta_chunk.to_vec()).expect("utf8 delta chunk");
+    let (delta_sse_event, delta_sse_data) = sse_event_and_data(delta_text.trim_end());
+    let delta_payload: Value = serde_json::from_str(delta_sse_data).expect("delta payload json");
+
     let completed_chunk = next_body_chunk(&mut body_stream).await;
     let completed_text = String::from_utf8(completed_chunk.to_vec()).expect("utf8 completed chunk");
     let (completed_sse_event, completed_sse_data) = sse_event_and_data(completed_text.trim_end());
@@ -2526,6 +2576,10 @@ async fn capture_compaction_stream(compaction_name_field: &str) -> CompactionStr
             DownstreamSseEvent {
                 event: done_sse_event.to_string(),
                 payload: done_payload,
+            },
+            DownstreamSseEvent {
+                event: delta_sse_event.to_string(),
+                payload: delta_payload,
             },
             DownstreamSseEvent {
                 event: completed_sse_event.to_string(),
@@ -2744,21 +2798,43 @@ async fn compaction_output_item_done_is_forwarded_downstream() {
 }
 
 #[tokio::test]
-async fn completed_response_preserves_compaction_output() {
+async fn completed_with_compaction_and_assistant_text_sanitizes_completed_output() {
     let capture = capture_compaction_stream("name").await;
 
-    assert_eq!(capture.downstream_events[2].event, "response.completed");
+    assert_eq!(
+        capture.downstream_events[2].event,
+        "response.output_text.delta"
+    );
     assert_eq!(
         capture.downstream_events[2].payload,
-        capture.upstream_events[2]
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "done",
+            "output_index": 1,
+            "content_index": 0
+        })
     );
+    assert_eq!(capture.downstream_events[3].event, "response.completed");
     assert_eq!(
-        capture.downstream_events[2].payload["response"]["output"][0]["type"],
-        "compaction"
-    );
-    assert_eq!(
-        capture.downstream_events[2].payload["response"]["output"][0]["encrypted_content"],
-        "opaque-completed"
+        capture.downstream_events[3].payload,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-compaction",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "done"
+                            }
+                        ]
+                    }
+                ]
+            }
+        })
     );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
@@ -2850,7 +2926,102 @@ async fn output_text_done_only_text_is_synthesized_as_delta() {
     );
     assert_eq!(capture.downstream_events[1].payload, output_text_done_event);
     assert_eq!(capture.downstream_events[2].event, "response.completed");
-    assert_eq!(capture.downstream_events[2].payload, completed_event);
+    assert_eq!(
+        capture.downstream_events[2].payload,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-output-text-done-only",
+                "output": [
+                    {
+                        "id": "assistant-item-done-only",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "hello from output_text.done",
+                                "annotations": []
+                            }
+                        ]
+                    }
+                ]
+            }
+        })
+    );
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn completed_without_visible_message_inserts_synthetic_assistant_message_from_done_text() {
+    let output_text_done_event = json!({
+        "type": "response.output_text.done",
+        "item_id": "assistant-item-done-only",
+        "output_index": 0,
+        "content_index": 0,
+        "text": "hello from output_text.done"
+    });
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-synthetic-completed-message",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "threadline_echo",
+                    "call_id": "call-1"
+                },
+                {
+                    "id": "cmp-1",
+                    "type": "compaction",
+                    "encrypted_content": "opaque"
+                }
+            ]
+        }
+    });
+
+    let capture =
+        capture_completed_output_stream(vec![output_text_done_event.clone(), completed_event])
+            .await;
+
+    assert_eq!(capture.downstream_events.len(), 3);
+    assert_eq!(
+        capture.downstream_events[0].event,
+        "response.output_text.delta"
+    );
+    assert_eq!(
+        capture.downstream_events[0].payload["delta"],
+        "hello from output_text.done"
+    );
+    assert_eq!(
+        capture.downstream_events[1].event,
+        "response.output_text.done"
+    );
+    assert_eq!(capture.downstream_events[1].payload, output_text_done_event);
+    assert_eq!(capture.downstream_events[2].event, "response.completed");
+    assert_eq!(
+        capture.downstream_events[2].payload,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-synthetic-completed-message",
+                "output": [
+                    {
+                        "id": "assistant-item-done-only",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "hello from output_text.done",
+                                "annotations": []
+                            }
+                        ]
+                    }
+                ]
+            }
+        })
+    );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
@@ -2905,7 +3076,29 @@ async fn output_item_done_message_text_is_synthesized_as_delta() {
     );
     assert_eq!(capture.downstream_events[1].payload, output_item_done_event);
     assert_eq!(capture.downstream_events[2].event, "response.completed");
-    assert_eq!(capture.downstream_events[2].payload, completed_event);
+    assert_eq!(
+        capture.downstream_events[2].payload,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-output-item-done-message",
+                "output": [
+                    {
+                        "id": "assistant-item-done-message",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "hello from output_item.done",
+                                "annotations": []
+                            }
+                        ]
+                    }
+                ]
+            }
+        })
+    );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 

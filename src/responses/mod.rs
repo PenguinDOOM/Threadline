@@ -111,6 +111,7 @@ pub async fn responses_handler(
         upstream_event_seen: false,
         reconnect_attempted,
         downstream_visible_text_sources: std::collections::HashSet::new(),
+        visible_assistant_text: Vec::new(),
         queued_synthetic_output_text_deltas: std::collections::VecDeque::new(),
         queued_final_completed: None,
         final_done_pending: false,

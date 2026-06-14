@@ -620,10 +620,7 @@ async fn internal_tool_intermediate_text_does_not_leak_and_followup_fallback_sti
             .expect("body bytes")
     });
 
-    let _ = server
-        .recv_client_message()
-        .await
-        .expect("initial request");
+    let _ = server.recv_client_message().await.expect("initial request");
 
     server
         .send_text(
@@ -660,6 +657,11 @@ async fn internal_tool_intermediate_text_does_not_leak_and_followup_fallback_sti
             "id": "response-final",
             "output": [
                 {
+                    "type": "function_call",
+                    "name": "threadline_echo",
+                    "call_id": "call-hidden-final"
+                },
+                {
                     "id": "msg-final",
                     "type": "message",
                     "role": "assistant",
@@ -689,7 +691,7 @@ async fn internal_tool_intermediate_text_does_not_leak_and_followup_fallback_sti
             "type": "response.output_text.delta",
             "delta": "final follow-up answer",
             "item_id": "msg-final",
-            "output_index": 0,
+            "output_index": 1,
             "content_index": 0
         })
     );
@@ -698,7 +700,25 @@ async fn internal_tool_intermediate_text_does_not_leak_and_followup_fallback_sti
     assert_eq!(completed_frame.0, "response.completed");
     assert_eq!(
         serde_json::from_str::<Value>(completed_frame.1).expect("completed json"),
-        final_completed
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-final",
+                "output": [
+                    {
+                        "id": "msg-final",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "final follow-up answer"
+                            }
+                        ]
+                    }
+                ]
+            }
+        })
     );
 
     assert_done_frame(frames[2]);
