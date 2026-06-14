@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::mem;
 use std::sync::Arc;
@@ -259,59 +259,25 @@ fn completed_output_blocks_synthetic_delta(output: &[Value]) -> bool {
         })
 }
 
-fn synthesized_completed_output_text_delta(event: &Value) -> Option<Value> {
-    let output = event
-        .get("response")
-        .and_then(|response| response.get("output"))
-        .and_then(Value::as_array)?;
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct VisibleTextSourceKey {
+    item_id: Option<String>,
+    output_index: Option<u64>,
+    content_index: Option<u64>,
+}
 
-    if completed_output_blocks_synthetic_delta(output) {
-        return None;
-    }
-
-    let mut delta = String::new();
-    let mut first_item_id = None;
-    let mut first_output_index = None;
-    let mut first_content_index = None;
-
-    for (output_index, item) in output.iter().enumerate() {
-        if item.get("type").and_then(Value::as_str) != Some("message")
-            || item.get("role").and_then(Value::as_str) != Some("assistant")
-        {
-            continue;
-        }
-
-        let Some(content) = item.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-
-        for (content_index, part) in content.iter().enumerate() {
-            if part.get("type").and_then(Value::as_str) != Some("output_text") {
-                continue;
-            }
-
-            let Some(text) = part.get("text").and_then(Value::as_str) else {
-                continue;
-            };
-
-            if text.trim().is_empty() {
-                continue;
-            }
-
-            if first_output_index.is_none() {
-                first_item_id = item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string);
-                first_output_index = Some(output_index as u64);
-                first_content_index = Some(content_index as u64);
-            }
-
-            delta.push_str(text);
+impl VisibleTextSourceKey {
+    fn new(item_id: Option<String>, output_index: Option<u64>, content_index: Option<u64>) -> Self {
+        Self {
+            item_id,
+            output_index,
+            content_index,
         }
     }
+}
 
-    if delta.is_empty() {
+fn response_output_text_delta_payload(key: &VisibleTextSourceKey, delta: &str) -> Option<Value> {
+    if delta.trim().is_empty() {
         return None;
     }
 
@@ -320,18 +286,123 @@ fn synthesized_completed_output_text_delta(event: &Value) -> Option<Value> {
         "type".to_string(),
         Value::String("response.output_text.delta".to_string()),
     );
-    payload.insert("delta".to_string(), Value::String(delta));
-    if let Some(item_id) = first_item_id {
-        payload.insert("item_id".to_string(), Value::String(item_id));
+    payload.insert("delta".to_string(), Value::String(delta.to_string()));
+
+    if let Some(item_id) = key.item_id.as_ref() {
+        payload.insert("item_id".to_string(), Value::String(item_id.clone()));
     }
-    if let Some(output_index) = first_output_index {
+    if let Some(output_index) = key.output_index {
         payload.insert("output_index".to_string(), Value::from(output_index));
     }
-    if let Some(content_index) = first_content_index {
+    if let Some(content_index) = key.content_index {
         payload.insert("content_index".to_string(), Value::from(content_index));
     }
 
     Some(Value::Object(payload))
+}
+
+fn visible_text_delta_source_key(event: &Value) -> VisibleTextSourceKey {
+    VisibleTextSourceKey::new(
+        string_field(event.get("item_id")),
+        event.get("output_index").and_then(Value::as_u64),
+        event.get("content_index").and_then(Value::as_u64),
+    )
+}
+
+fn synthesized_output_text_done_delta(event: &Value) -> Option<(VisibleTextSourceKey, Value)> {
+    let key = visible_text_delta_source_key(event);
+    let text = event.get("text").and_then(Value::as_str)?;
+    let payload = response_output_text_delta_payload(&key, text)?;
+    Some((key, payload))
+}
+
+fn message_output_text_delta_payloads(
+    item: &Value,
+    output_index: u64,
+) -> Vec<(VisibleTextSourceKey, Value)> {
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return Vec::new();
+    }
+
+    let Some(content) = item.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let item_id = string_field(item.get("id"));
+    let mut payloads = Vec::new();
+    for (content_index, part) in content.iter().enumerate() {
+        if part.get("type").and_then(Value::as_str) != Some("output_text") {
+            continue;
+        }
+
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+
+        let key = VisibleTextSourceKey::new(
+            item_id.clone(),
+            Some(output_index),
+            Some(content_index as u64),
+        );
+        let Some(payload) = response_output_text_delta_payload(&key, text) else {
+            continue;
+        };
+        payloads.push((key, payload));
+    }
+
+    payloads
+}
+
+fn synthesized_output_item_done_text_delta(event: &Value) -> Vec<(VisibleTextSourceKey, Value)> {
+    let Some(output_index) = event.get("output_index").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    let Some(item) = event.get("item") else {
+        return Vec::new();
+    };
+
+    message_output_text_delta_payloads(item, output_index)
+}
+
+fn synthesized_completed_output_text_delta(event: &Value) -> Vec<(VisibleTextSourceKey, Value)> {
+    let Some(output) = event
+        .get("response")
+        .and_then(|response| response.get("output"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    if completed_output_blocks_synthetic_delta(output) {
+        return Vec::new();
+    }
+
+    let mut payloads = Vec::new();
+    for (output_index, item) in output.iter().enumerate() {
+        payloads.extend(message_output_text_delta_payloads(
+            item,
+            output_index as u64,
+        ));
+    }
+
+    payloads
+}
+
+fn queue_visible_text_deltas(
+    state: &mut ResponseStreamState,
+    payloads: Vec<(VisibleTextSourceKey, Value)>,
+) -> bool {
+    let mut queued = false;
+    for (key, payload) in payloads {
+        if state.downstream_visible_text_sources.insert(key) {
+            state.queued_synthetic_output_text_deltas.push_back(payload);
+            queued = true;
+        }
+    }
+
+    queued
 }
 
 pub(super) struct ResponseStreamState {
@@ -345,7 +416,8 @@ pub(super) struct ResponseStreamState {
     pub(super) suppressed_internal_output_indexes: HashSet<u64>,
     pub(super) upstream_event_seen: bool,
     pub(super) reconnect_attempted: bool,
-    pub(super) downstream_output_text_delta_emitted: bool,
+    pub(super) downstream_visible_text_sources: HashSet<VisibleTextSourceKey>,
+    pub(super) queued_synthetic_output_text_deltas: VecDeque<Value>,
     pub(super) queued_final_completed: Option<Value>,
     pub(super) final_done_pending: bool,
     pub(super) done: bool,
@@ -356,6 +428,23 @@ pub(super) fn response_stream(
 ) -> impl futures_util::Stream<Item = Result<Bytes, Infallible>> {
     stream::unfold(state, |mut state| async move {
         loop {
+            if let Some(synthetic_delta) = state.queued_synthetic_output_text_deltas.pop_front() {
+                let event_type = synthetic_delta
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+                    .to_string();
+                trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                    &synthetic_delta,
+                    DownstreamTraceAction::Forwarded,
+                ));
+                debug!(event_type, "translation_event_forwarded");
+                return Some((
+                    Ok::<Bytes, Infallible>(sse_json_chunk(&event_type, &synthetic_delta)),
+                    state,
+                ));
+            }
+
             if let Some(completed) = state.queued_final_completed.take() {
                 let response_id = response_id_from_event(&completed);
                 trace_downstream_sse_event(&downstream_sse_trace_metadata(
@@ -479,6 +568,19 @@ pub(super) fn response_stream(
 
             debug!(event_type, "upstream_event_received");
 
+            if !state.pending_internal_outputs.is_empty()
+                && matches!(
+                    event_type.as_str(),
+                    "response.output_text.delta"
+                        | "response.output_text.done"
+                        | "response.output_item.done"
+                )
+            {
+                trace_suppressed_event(&trace_metadata);
+                debug!(event_type, "translation_event_suppressed_internal_tool");
+                continue;
+            }
+
             if event_type.starts_with("response.output_item.")
                 && event_contains_internal_tool_name(&parsed)
             {
@@ -545,6 +647,8 @@ pub(super) fn response_stream(
                             state.done = true;
                             return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
                         }
+                        state.downstream_visible_text_sources.clear();
+                        state.queued_synthetic_output_text_deltas.clear();
                         debug!(
                             response_id,
                             output_count,
@@ -554,29 +658,13 @@ pub(super) fn response_stream(
                         continue;
                     }
 
-                    if !state.downstream_output_text_delta_emitted
-                        && let Some(synthetic_delta) =
-                            synthesized_completed_output_text_delta(&parsed)
-                    {
+                    if queue_visible_text_deltas(
+                        &mut state,
+                        synthesized_completed_output_text_delta(&parsed),
+                    ) {
                         state.lease.release();
-                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
-                            &synthetic_delta,
-                            DownstreamTraceAction::Forwarded,
-                        ));
-                        debug!(
-                            response_id,
-                            event_type = "response.output_text.delta",
-                            "translation_event_forwarded"
-                        );
-                        state.downstream_output_text_delta_emitted = true;
                         state.queued_final_completed = Some(parsed);
-                        return Some((
-                            Ok::<Bytes, Infallible>(sse_json_chunk(
-                                "response.output_text.delta",
-                                &synthetic_delta,
-                            )),
-                            state,
-                        ));
+                        continue;
                     }
 
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
@@ -640,7 +728,25 @@ pub(super) fn response_stream(
                 }
                 _ => {
                     if event_type == "response.output_text.delta" {
-                        state.downstream_output_text_delta_emitted = true;
+                        state
+                            .downstream_visible_text_sources
+                            .insert(visible_text_delta_source_key(&parsed));
+                    } else if event_type == "response.output_text.done" {
+                        if let Some((key, payload)) = synthesized_output_text_done_delta(&parsed) {
+                            if state.downstream_visible_text_sources.insert(key) {
+                                state.queued_synthetic_output_text_deltas.push_back(payload);
+                                state.queued_synthetic_output_text_deltas.push_back(parsed);
+                                continue;
+                            }
+                        }
+                    } else if event_type == "response.output_item.done"
+                        && queue_visible_text_deltas(
+                            &mut state,
+                            synthesized_output_item_done_text_delta(&parsed),
+                        )
+                    {
+                        state.queued_synthetic_output_text_deltas.push_back(parsed);
+                        continue;
                     }
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
                         &parsed,

@@ -1522,7 +1522,10 @@ async fn completed_with_internal_function_call_and_assistant_text_synthesizes_de
     let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
 
     assert_eq!(capture.downstream_events.len(), 2);
-    assert_eq!(capture.downstream_events[0].event, "response.output_text.delta");
+    assert_eq!(
+        capture.downstream_events[0].event,
+        "response.output_text.delta"
+    );
     assert_eq!(
         capture.downstream_events[0].payload,
         json!({
@@ -2821,13 +2824,16 @@ async fn output_text_done_only_text_is_synthesized_as_delta() {
     });
 
     let capture = capture_completed_output_stream(vec![
-        output_text_done_event,
+        output_text_done_event.clone(),
         completed_event.clone(),
     ])
     .await;
 
-    assert_eq!(capture.downstream_events.len(), 2);
-    assert_eq!(capture.downstream_events[0].event, "response.output_text.delta");
+    assert_eq!(capture.downstream_events.len(), 3);
+    assert_eq!(
+        capture.downstream_events[0].event,
+        "response.output_text.delta"
+    );
     assert_eq!(
         capture.downstream_events[0].payload,
         json!({
@@ -2838,8 +2844,13 @@ async fn output_text_done_only_text_is_synthesized_as_delta() {
             "content_index": 0
         })
     );
-    assert_eq!(capture.downstream_events[1].event, "response.completed");
-    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(
+        capture.downstream_events[1].event,
+        "response.output_text.done"
+    );
+    assert_eq!(capture.downstream_events[1].payload, output_text_done_event);
+    assert_eq!(capture.downstream_events[2].event, "response.completed");
+    assert_eq!(capture.downstream_events[2].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
@@ -2868,13 +2879,16 @@ async fn output_item_done_message_text_is_synthesized_as_delta() {
     });
 
     let capture = capture_completed_output_stream(vec![
-        output_item_done_event,
+        output_item_done_event.clone(),
         completed_event.clone(),
     ])
     .await;
 
-    assert_eq!(capture.downstream_events.len(), 2);
-    assert_eq!(capture.downstream_events[0].event, "response.output_text.delta");
+    assert_eq!(capture.downstream_events.len(), 3);
+    assert_eq!(
+        capture.downstream_events[0].event,
+        "response.output_text.delta"
+    );
     assert_eq!(
         capture.downstream_events[0].payload,
         json!({
@@ -2885,8 +2899,13 @@ async fn output_item_done_message_text_is_synthesized_as_delta() {
             "content_index": 0
         })
     );
-    assert_eq!(capture.downstream_events[1].event, "response.completed");
-    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(
+        capture.downstream_events[1].event,
+        "response.output_item.done"
+    );
+    assert_eq!(capture.downstream_events[1].payload, output_item_done_event);
+    assert_eq!(capture.downstream_events[2].event, "response.completed");
+    assert_eq!(capture.downstream_events[2].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
@@ -2987,8 +3006,8 @@ async fn multiple_done_only_visible_text_sources_are_not_dropped() {
     });
 
     let capture = capture_completed_output_stream(vec![
-        output_text_done_event,
-        output_item_done_event,
+        output_text_done_event.clone(),
+        output_item_done_event.clone(),
         completed_event.clone(),
     ])
     .await;
@@ -3026,22 +3045,19 @@ async fn multiple_done_only_visible_text_sources_are_not_dropped() {
             })
         ]
     );
+    assert_eq!(capture.downstream_events.len(), 6);
     assert_eq!(
-        capture
-            .downstream_events
-            .last()
-            .expect("completed event")
-            .event,
-        "response.completed"
+        capture.downstream_events[1].event,
+        "response.output_text.done"
     );
+    assert_eq!(capture.downstream_events[1].payload, output_text_done_event);
     assert_eq!(
-        capture
-            .downstream_events
-            .last()
-            .expect("completed payload")
-            .payload,
-        completed_event
+        capture.downstream_events[3].event,
+        "response.output_item.done"
     );
+    assert_eq!(capture.downstream_events[3].payload, output_item_done_event);
+    assert_eq!(capture.downstream_events[5].event, "response.completed");
+    assert_eq!(capture.downstream_events[5].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
