@@ -906,9 +906,7 @@ pub(super) fn response_stream(
             if !state.pending_internal_outputs.is_empty()
                 && matches!(
                     event_type.as_str(),
-                    "response.output_text.delta"
-                        | "response.output_text.done"
-                        | "response.output_item.done"
+                    "response.output_text.delta" | "response.output_text.done"
                 )
             {
                 trace_suppressed_event(&trace_metadata);
