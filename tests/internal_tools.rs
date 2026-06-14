@@ -10,7 +10,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
@@ -1760,6 +1760,290 @@ async fn internal_tool_followup_completed_only_text_is_synthesized_as_final_delt
     assert!(!body_text.contains("response.output_item.done"));
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("response-intermediate"));
+}
+
+#[tokio::test]
+async fn internal_tool_followup_output_item_done_message_becomes_final_completed_output() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "surface follow-up output_item.done assistant text as final completed output"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        timeout(
+            Duration::from_secs(2),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("body timeout")
+        .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+
+    let final_done_event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "msg-final",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "final follow-up answer from output_item.done"
+                }
+            ]
+        }
+    });
+    server.send_text(&final_done_event.to_string()).await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 4);
+
+    let delta_frame = sse_event_and_data(frames[0]);
+    assert_eq!(delta_frame.0, "response.output_text.delta");
+    assert_eq!(
+        serde_json::from_str::<Value>(delta_frame.1).expect("delta json"),
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "final follow-up answer from output_item.done",
+            "item_id": "msg-final",
+            "output_index": 0,
+            "content_index": 0
+        })
+    );
+
+    let done_frame = sse_event_and_data(frames[1]);
+    assert_eq!(done_frame.0, "response.output_item.done");
+    assert_eq!(done_frame.1, final_done_event.to_string());
+
+    let completed_frame = sse_event_and_data(frames[2]);
+    let completed_payload: Value = serde_json::from_str(completed_frame.1).expect("completed json");
+    assert_eq!(completed_frame.0, "response.completed");
+    assert_eq!(completed_payload["response"]["id"], "response-final");
+    assert_eq!(
+        completed_payload["response"]["output"][0]["content"][0]["text"],
+        "final follow-up answer from output_item.done"
+    );
+
+    assert_done_frame(frames[3]);
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("response-intermediate"));
+}
+
+#[tokio::test]
+async fn intermediate_internal_tool_completion_does_not_record_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app.clone(),
+        json!({
+            "model": "gpt-5.4",
+            "input": "do not record intermediate internal completion markers"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        timeout(
+            Duration::from_secs(2),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("body timeout")
+        .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("followup request");
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"final answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final"}}"#)
+        .await;
+
+    let _ = body_task.await.expect("body task");
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "invalid-intermediate-resume",
+            "previous_response_id": "response-intermediate"
+        }),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("rejected body");
+    let rejected_payload: Value = serde_json::from_slice(&rejected_body).expect("rejected json");
+    assert_eq!(
+        rejected_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
+async fn internal_tool_followup_failure_emits_response_failed_without_internal_leak() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app.clone(),
+        json!({
+            "model": "gpt-5.4",
+            "input": "normalize internal-tool follow-up failure"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        timeout(
+            Duration::from_secs(2),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("body timeout")
+        .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("followup request");
+
+    server
+        .send_text(
+            r#"{"type":"response.failed","response":{"id":"response-followup-failed","model":"gpt-5.4","usage":{"input_tokens":4,"output_tokens":0,"total_tokens":4}},"error":{"code":"upstream_response_failed","message":"followup failed"}}"#,
+        )
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 2);
+
+    let failed_frame = sse_event_and_data(frames[0]);
+    let failed_payload: Value = serde_json::from_str(failed_frame.1).expect("failed json");
+    assert_eq!(failed_frame.0, "response.failed");
+    assert_eq!(failed_payload["response"]["id"], "response-followup-failed");
+    assert_eq!(
+        failed_payload["response"]["error"]["code"],
+        "upstream_response_failed"
+    );
+    assert_done_frame(frames[1]);
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("response-intermediate"));
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "invalid-followup-failed-resume",
+            "previous_response_id": "response-followup-failed"
+        }),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("rejected body");
+    let rejected_payload: Value = serde_json::from_slice(&rejected_body).expect("rejected json");
+    assert_eq!(
+        rejected_payload["error"]["code"],
+        "previous_response_not_found"
+    );
 }
 
 #[tokio::test]

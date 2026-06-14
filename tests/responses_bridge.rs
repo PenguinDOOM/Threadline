@@ -7,7 +7,7 @@ use axum::http::{Request, Response, StatusCode};
 use futures_util::{StreamExt, future::BoxFuture, stream};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
@@ -1624,6 +1624,184 @@ async fn upstream_response_failed_emits_response_failed_terminal_event() {
 }
 
 #[tokio::test]
+async fn terminal_failed_and_incomplete_payloads_preserve_vscode_terminal_fields() {
+    let failed_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let failed_connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&failed_server),
+        turn_state: None,
+    }]);
+    let failed_app = build_test_router(ThreadlineConfig::default(), Arc::new(failed_connector));
+
+    let failed_response = post_responses(
+        failed_app,
+        json!({"model":"gpt-5.4","input":"failed-terminal-fields"}),
+    )
+    .await;
+    assert_eq!(failed_response.status(), StatusCode::OK);
+    let _ = failed_server
+        .recv_client_message()
+        .await
+        .expect("failed request");
+    failed_server
+        .send_text(
+            r#"{"type":"response.failed","response":{"id":"response-failed-fields","model":"gpt-5.4","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14},"output":[{"id":"assistant-visible","type":"message","role":"assistant","content":[{"type":"output_text","text":"visible failed text"}]}]},"error":{"code":"upstream_response_failed","message":"failed"}}"#,
+        )
+        .await;
+
+    let failed_body = timeout(
+        Duration::from_secs(2),
+        to_bytes(failed_response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("failed body timeout")
+    .expect("failed body");
+    let failed_text = String::from_utf8(failed_body.to_vec()).expect("utf8 failed body");
+    let failed_frames = split_sse_frames(&failed_text);
+    let (failed_event, failed_data) =
+        sse_event_and_data(failed_frames.first().expect("failed frame"));
+    let failed_payload: Value = serde_json::from_str(failed_data).expect("failed payload json");
+
+    assert_eq!(failed_event, "response.failed");
+    assert_eq!(failed_payload["response"]["id"], "response-failed-fields");
+    assert_eq!(failed_payload["response"]["model"], "gpt-5.4");
+    assert_eq!(failed_payload["response"]["usage"]["total_tokens"], 14);
+    assert_eq!(
+        assistant_output_text_from_completed(
+            &json!({"response": failed_payload["response"].clone()})
+        ),
+        "visible failed text"
+    );
+    assert_done_frame(failed_frames[1]);
+
+    let incomplete_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let incomplete_connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&incomplete_server),
+        turn_state: None,
+    }]);
+    let incomplete_app =
+        build_test_router(ThreadlineConfig::default(), Arc::new(incomplete_connector));
+
+    let incomplete_response = post_responses(
+        incomplete_app,
+        json!({"model":"gpt-5.4","input":"incomplete-terminal-fields"}),
+    )
+    .await;
+    assert_eq!(incomplete_response.status(), StatusCode::OK);
+    let _ = incomplete_server
+        .recv_client_message()
+        .await
+        .expect("incomplete request");
+    incomplete_server
+        .send_text(
+            r#"{"type":"response.incomplete","response":{"id":"response-incomplete-fields","model":"gpt-5.4","usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11},"output":[{"id":"assistant-partial","type":"message","role":"assistant","content":[{"type":"output_text","text":"visible partial text"}]}],"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        )
+        .await;
+    incomplete_server.send_close(1000, "incomplete").await;
+
+    let incomplete_body = timeout(
+        Duration::from_secs(2),
+        to_bytes(incomplete_response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("incomplete body timeout")
+    .expect("incomplete body");
+    let incomplete_text =
+        String::from_utf8(incomplete_body.to_vec()).expect("utf8 incomplete body");
+    let incomplete_frames = split_sse_frames(&incomplete_text);
+    let (incomplete_event, incomplete_data) =
+        sse_event_and_data(incomplete_frames.first().expect("incomplete frame"));
+    let incomplete_payload: Value =
+        serde_json::from_str(incomplete_data).expect("incomplete payload json");
+
+    assert_eq!(incomplete_event, "response.incomplete");
+    assert_eq!(
+        incomplete_payload["response"]["id"],
+        "response-incomplete-fields"
+    );
+    assert_eq!(incomplete_payload["response"]["model"], "gpt-5.4");
+    assert_eq!(incomplete_payload["response"]["usage"]["total_tokens"], 11);
+    assert_eq!(
+        incomplete_payload["response"]["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+    assert_eq!(
+        assistant_output_text_from_completed(
+            &json!({"response": incomplete_payload["response"].clone()})
+        ),
+        "visible partial text"
+    );
+    assert_done_frame(incomplete_frames[1]);
+}
+
+#[tokio::test]
+async fn upstream_incomplete_emits_terminal_response_incomplete_without_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"terminal-incomplete"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("incomplete request");
+    server
+        .send_text(
+            r#"{"type":"response.incomplete","response":{"id":"response-incomplete","model":"gpt-5.4","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"output":[{"id":"assistant-partial","type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}],"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        )
+        .await;
+    server.send_close(1000, "incomplete").await;
+
+    let body = timeout(
+        Duration::from_secs(2),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("incomplete body timeout")
+    .expect("incomplete body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("incomplete frame"));
+    let payload: Value = serde_json::from_str(data).expect("incomplete json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.incomplete");
+    assert_eq!(payload["response"]["id"], "response-incomplete");
+    assert_eq!(
+        payload["response"]["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+    assert_done_frame(frames[1]);
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"invalid-incomplete-resume",
+            "previous_response_id":"response-incomplete"
+        }),
+    )
+    .await;
+
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("rejected body");
+    let rejected_payload: Value = serde_json::from_slice(&rejected_body).expect("rejected json");
+    assert_eq!(
+        rejected_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
 async fn response_failed_preserves_prior_completed_marker_for_resume() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -1857,7 +2035,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
 }
 
 #[tokio::test]
-async fn upstream_error_event_emits_a_single_compact_sse_error() {
+async fn upstream_error_event_emits_response_failed_and_done_without_successful_completion() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -1879,48 +2057,97 @@ async fn upstream_error_event_emits_a_single_compact_sse_error() {
         .expect("body");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
-    let payload: Value = serde_json::from_str(data).expect("error json");
+
+    assert!(
+        !body_text.contains("event: error\n"),
+        "raw upstream error must not be forwarded as a raw error event: {body_text}"
+    );
+
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
 
     assert_eq!(
         frames.len(),
-        1,
-        "raw upstream error must not emit terminal response.failed plus DONE frames: {body_text}"
+        2,
+        "raw upstream error must be normalized into downstream response.failed plus DONE frames: {body_text}"
     );
-    assert_eq!(event, "error");
-    assert_eq!(payload["error"]["code"], "upstream_error_event");
+    assert_eq!(event, "response.failed");
+    assert_eq!(payload["type"], "response.failed");
+    assert_eq!(payload["response"]["status"], "failed");
+    assert_eq!(payload["response"]["error"]["code"], "upstream_error_event");
     assert!(
-        payload.get("response").is_none(),
-        "raw upstream error must not be rewritten into a response.failed payload: {payload:?}"
+        payload["response"]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "raw upstream error must surface a stable Threadline error message: {payload:?}"
     );
+    assert!(
+        !body_text.contains("event: response.completed\n"),
+        "raw upstream error must not emit successful completion semantics: {body_text}"
+    );
+    assert_done_frame(frames[1]);
 }
 
 #[tokio::test]
-async fn done_sentinel_is_not_forwarded_as_downstream_data() {
-    let server = Arc::new(ScriptedWebSocketServer::start().await);
-    let connector = RecordingConnector::new(vec![PlannedConnection {
-        server: Arc::clone(&server),
-        turn_state: None,
-    }]);
-    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+async fn upstream_done_or_eof_without_completed_emits_response_failed_not_done_only() {
+    for case_name in ["done", "eof"] {
+        let server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = RecordingConnector::new(vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }]);
+        let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"done"})).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = server.recv_client_message().await.expect("done request");
-    server.send_text("[DONE]").await;
-    server.send_close(1000, "done").await;
+        let response = post_responses(
+            app,
+            json!({"model":"gpt-5.4","input":format!("terminal-{case_name}")}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = server
+            .recv_client_message()
+            .await
+            .expect("terminal request");
 
-    let body = to_bytes(response.into_body(), usize::MAX)
+        match case_name {
+            "done" => {
+                server.send_text("[DONE]").await;
+                server.send_close(1000, "done before completed").await;
+            }
+            "eof" => {
+                server.abort_connection().await;
+            }
+            _ => unreachable!("unexpected terminal case"),
+        }
+
+        let body = timeout(
+            Duration::from_secs(2),
+            to_bytes(response.into_body(), usize::MAX),
+        )
         .await
-        .expect("body");
-    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
-    let payload: Value = serde_json::from_str(data).expect("error json");
+        .expect("terminal body timeout")
+        .expect("terminal body");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        let frames = split_sse_frames(&body_text);
+        let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+        let payload: Value = serde_json::from_str(data).expect("failed json");
 
-    assert_eq!(event, "error");
-    assert_eq!(payload["error"]["code"], "upstream_invalid_json");
-    assert!(!body_text.contains("data: [DONE]"));
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected terminal failed event plus DONE for {case_name}: {body_text}"
+        );
+        assert_eq!(event, "response.failed");
+        assert_eq!(payload["type"], "response.failed");
+        assert_eq!(payload["response"]["status"], "failed");
+        assert!(
+            payload["response"]["error"]["code"]
+                .as_str()
+                .is_some_and(|code| !code.is_empty()),
+            "expected a stable failure code for {case_name}: {payload:?}"
+        );
+        assert_done_frame(frames[1]);
+    }
 }
 
 #[tokio::test]
@@ -2650,6 +2877,48 @@ async fn capture_completed_output_stream(
     }
 }
 
+fn assistant_output_text_from_completed(payload: &Value) -> String {
+    let mut text = String::new();
+
+    let Some(output) = payload["response"]["output"].as_array() else {
+        return text;
+    };
+
+    for item in output {
+        if item["type"] != "message" || item["role"] != "assistant" {
+            continue;
+        }
+
+        let Some(content) = item["content"].as_array() else {
+            continue;
+        };
+
+        for part in content {
+            if part["type"] != "output_text" {
+                continue;
+            }
+
+            if let Some(segment) = part["text"].as_str() {
+                text.push_str(segment);
+            }
+        }
+    }
+
+    text
+}
+
+fn output_text_delta_strings(events: &[DownstreamSseEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| event.event == "response.output_text.delta")
+        .filter_map(|event| {
+            event.payload["delta"]
+                .as_str()
+                .map(|delta| delta.to_string())
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn responses_bridge_apply_patch_added_precedes_delta_with_vs_code_required_metadata() {
     let capture = capture_visible_apply_patch_stream().await;
@@ -3026,7 +3295,7 @@ async fn completed_without_visible_message_inserts_synthetic_assistant_message_f
 }
 
 #[tokio::test]
-async fn output_item_done_message_text_is_synthesized_as_delta() {
+async fn codex_output_item_done_message_becomes_vscode_completed_output() {
     let output_item_done_event = json!({
         "type": "response.output_item.done",
         "output_index": 0,
@@ -3103,31 +3372,18 @@ async fn output_item_done_message_text_is_synthesized_as_delta() {
 }
 
 #[tokio::test]
-async fn streamed_output_text_delta_is_not_duplicated_from_completed_output() {
+async fn direct_output_text_delta_backfills_empty_completed_output() {
     let delta_event = json!({
         "type": "response.output_text.delta",
-        "delta": "hello from stream",
-        "item_id": "assistant-item-2",
+        "delta": "hello from direct delta",
+        "item_id": "assistant-item-direct-delta",
         "output_index": 0,
         "content_index": 0
     });
     let completed_event = json!({
         "type": "response.completed",
         "response": {
-            "id": "response-prior-delta",
-            "output": [
-                {
-                    "id": "assistant-item-2",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "hello from stream"
-                        }
-                    ]
-                }
-            ]
+            "id": "response-direct-delta-backfill"
         }
     });
 
@@ -3136,44 +3392,45 @@ async fn streamed_output_text_delta_is_not_duplicated_from_completed_output() {
 
     assert_eq!(capture.downstream_events.len(), 2);
     assert_eq!(
-        capture
-            .downstream_events
-            .iter()
-            .filter(|event| event.event == "response.output_text.delta")
-            .count(),
-        1,
-        "expected the existing streamed delta to remain unique"
-    );
-    assert_eq!(
-        capture.downstream_events[0].event,
-        "response.output_text.delta"
+        output_text_delta_strings(&capture.downstream_events),
+        vec!["hello from direct delta"]
     );
     assert_eq!(capture.downstream_events[0].payload, delta_event);
     assert_eq!(capture.downstream_events[1].event, "response.completed");
-    assert_eq!(capture.downstream_events[1].payload, completed_event);
+    assert_eq!(
+        assistant_output_text_from_completed(&capture.downstream_events[1].payload),
+        "hello from direct delta"
+    );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
 #[tokio::test]
-async fn multiple_done_only_visible_text_sources_are_not_dropped() {
+async fn visible_text_sources_are_not_duplicated_across_delta_done_item_and_completed() {
+    let delta_event = json!({
+        "type": "response.output_text.delta",
+        "delta": "hello from every source",
+        "item_id": "assistant-item-shared",
+        "output_index": 0,
+        "content_index": 0
+    });
     let output_text_done_event = json!({
         "type": "response.output_text.done",
-        "item_id": "assistant-item-first",
+        "item_id": "assistant-item-shared",
         "output_index": 0,
         "content_index": 0,
-        "text": "first visible text"
+        "text": "hello from every source"
     });
     let output_item_done_event = json!({
         "type": "response.output_item.done",
-        "output_index": 1,
+        "output_index": 0,
         "item": {
-            "id": "assistant-item-second",
+            "id": "assistant-item-shared",
             "type": "message",
             "role": "assistant",
             "content": [
                 {
                     "type": "output_text",
-                    "text": "second visible text"
+                    "text": "hello from every source"
                 }
             ]
         }
@@ -3181,16 +3438,16 @@ async fn multiple_done_only_visible_text_sources_are_not_dropped() {
     let completed_event = json!({
         "type": "response.completed",
         "response": {
-            "id": "response-multiple-visible-sources",
+            "id": "response-visible-dedupe",
             "output": [
                 {
-                    "id": "assistant-item-third",
+                    "id": "assistant-item-shared",
                     "type": "message",
                     "role": "assistant",
                     "content": [
                         {
                             "type": "output_text",
-                            "text": "third visible text"
+                            "text": "hello from every source"
                         }
                     ]
                 }
@@ -3199,109 +3456,264 @@ async fn multiple_done_only_visible_text_sources_are_not_dropped() {
     });
 
     let capture = capture_completed_output_stream(vec![
+        delta_event.clone(),
         output_text_done_event.clone(),
         output_item_done_event.clone(),
         completed_event.clone(),
     ])
     .await;
 
-    let delta_payloads: Vec<Value> = capture
-        .downstream_events
-        .iter()
-        .filter(|event| event.event == "response.output_text.delta")
-        .map(|event| event.payload.clone())
-        .collect();
-
     assert_eq!(
-        delta_payloads,
-        vec![
-            json!({
-                "type": "response.output_text.delta",
-                "delta": "first visible text",
-                "item_id": "assistant-item-first",
-                "output_index": 0,
-                "content_index": 0
-            }),
-            json!({
-                "type": "response.output_text.delta",
-                "delta": "second visible text",
-                "item_id": "assistant-item-second",
-                "output_index": 1,
-                "content_index": 0
-            }),
-            json!({
-                "type": "response.output_text.delta",
-                "delta": "third visible text",
-                "item_id": "assistant-item-third",
-                "output_index": 0,
-                "content_index": 0
-            })
-        ]
+        output_text_delta_strings(&capture.downstream_events),
+        vec!["hello from every source"]
     );
-    assert_eq!(capture.downstream_events.len(), 6);
-    assert_eq!(
-        capture.downstream_events[1].event,
-        "response.output_text.done"
-    );
+    assert_eq!(capture.downstream_events.len(), 4);
+    assert_eq!(capture.downstream_events[0].payload, delta_event);
     assert_eq!(capture.downstream_events[1].payload, output_text_done_event);
+    assert_eq!(capture.downstream_events[2].payload, output_item_done_event);
+    assert_eq!(capture.downstream_events[3].event, "response.completed");
     assert_eq!(
-        capture.downstream_events[3].event,
-        "response.output_item.done"
+        assistant_output_text_from_completed(&capture.downstream_events[3].payload),
+        "hello from every source"
     );
-    assert_eq!(capture.downstream_events[3].payload, output_item_done_event);
-    assert_eq!(capture.downstream_events[5].event, "response.completed");
-    assert_eq!(capture.downstream_events[5].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
 #[tokio::test]
-async fn completed_without_assistant_output_text_does_not_synthesize_delta() {
-    let completed_cases = vec![
-        json!({
-            "type": "response.completed",
-            "response": {
-                "id": "response-function-call-only",
-                "output": [
-                    {
-                        "type": "function_call",
-                        "name": "apply_patch",
-                        "call_id": "call-1"
-                    }
-                ]
-            }
-        }),
-        json!({
-            "type": "response.completed",
-            "response": {
-                "id": "response-non-output-text",
-                "output": [
-                    {
-                        "id": "assistant-item-3",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "refusal",
-                                "refusal": "declined"
-                            }
-                        ]
-                    }
-                ]
-            }
-        }),
-    ];
+async fn internal_only_completed_output_emits_response_failed_without_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    for completed_event in completed_cases {
-        let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
-        assert_eq!(
-            capture.downstream_events.len(),
-            1,
-            "expected only response.completed when no assistant output_text is present"
-        );
-        assert_eq!(capture.downstream_events[0].event, "response.completed");
-        assert_eq!(capture.downstream_events[0].payload, completed_event);
-        assert_eq!(capture.done_frame, "data: [DONE]");
-    }
+    let response = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"internal-only-completed"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("internal-only request");
+
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-internal-only",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "threadline_echo",
+                    "call_id": "call-1",
+                    "arguments": "{\"value\":\"alpha\"}"
+                }
+            ]
+        }
+    });
+    server.send_text(&completed_event.to_string()).await;
+
+    let body = timeout(
+        Duration::from_secs(2),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("internal-only body timeout")
+    .expect("internal-only body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("terminal failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("terminal failed json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_eq!(payload["type"], "response.failed");
+    assert_eq!(
+        payload["response"]["error"]["code"],
+        "threadline_no_visible_output"
+    );
+    assert_done_frame(frames[1]);
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"invalid-internal-only-resume",
+            "previous_response_id":"response-internal-only"
+        }),
+    )
+    .await;
+
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("rejected body");
+    let rejected_payload: Value = serde_json::from_slice(&rejected_body).expect("rejected json");
+    assert_eq!(
+        rejected_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_summary_compaction_only_completed_preserves_transient_behavior() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app.clone(), auxiliary_summary_request(None)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("summary request");
+
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-summary",
+            "output": [
+                {
+                    "id": "cmp-1",
+                    "type": "compaction",
+                    "name": "threadline_echo",
+                    "encrypted_content": "opaque-summary"
+                }
+            ]
+        }
+    });
+    server.send_text(&completed_event.to_string()).await;
+
+    let body = timeout(
+        Duration::from_secs(2),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("summary body timeout")
+    .expect("summary body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("summary completed frame"));
+    let payload: Value = serde_json::from_str(data).expect("summary completed json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.completed");
+    assert_eq!(payload["response"]["id"], "response-summary");
+    assert_done_frame(frames[1]);
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"invalid-summary-resume",
+            "previous_response_id":"response-summary"
+        }),
+    )
+    .await;
+
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("rejected body");
+    let rejected_payload: Value = serde_json::from_slice(&rejected_body).expect("rejected json");
+    assert_eq!(
+        rejected_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
+async fn image_generation_completed_output_remains_successful_without_text() {
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-image-generation",
+            "output": [
+                {
+                    "id": "img-1",
+                    "type": "image_generation_call",
+                    "result": "image-asset-1"
+                }
+            ]
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+
+    assert_eq!(capture.downstream_events.len(), 1);
+    assert!(output_text_delta_strings(&capture.downstream_events).is_empty());
+    assert_eq!(capture.downstream_events[0].event, "response.completed");
+    assert_eq!(capture.downstream_events[0].payload, completed_event);
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn missing_visible_text_identity_fields_do_not_duplicate_or_drop_distinct_text() {
+    let delta_event = json!({
+        "type": "response.output_text.delta",
+        "delta": "repeat"
+    });
+    let output_text_done_event = json!({
+        "type": "response.output_text.done",
+        "text": "repeat"
+    });
+    let output_item_done_event = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": " and distinct"
+                }
+            ]
+        }
+    });
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-missing-identity",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "repeat and distinct"
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![
+        delta_event,
+        output_text_done_event,
+        output_item_done_event,
+        completed_event,
+    ])
+    .await;
+
+    assert_eq!(
+        output_text_delta_strings(&capture.downstream_events),
+        vec!["repeat", " and distinct"]
+    );
+    assert_eq!(
+        assistant_output_text_from_completed(
+            &capture
+                .downstream_events
+                .last()
+                .expect("completed event")
+                .payload
+        ),
+        "repeat and distinct"
+    );
+    assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
 #[tokio::test]
