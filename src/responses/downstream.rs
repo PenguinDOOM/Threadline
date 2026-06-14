@@ -145,20 +145,49 @@ pub(super) fn sse_done_chunk() -> Bytes {
     Bytes::from_static(b"data: [DONE]\n\n")
 }
 
-pub(super) fn sse_terminal_response_failed_chunk(payload: &Value) -> Bytes {
-    let fallback = ThreadlineError::UpstreamResponseFailed.public_error();
-    let error = payload.get("error");
+fn safe_object_clone(value: Option<&Value>) -> Option<Value> {
+    value.and_then(Value::as_object).cloned().map(Value::Object)
+}
+
+fn sanitized_terminal_response(payload: &Value, status: &str) -> Map<String, Value> {
+    let source = payload.get("response").and_then(Value::as_object);
     let mut response = Map::new();
 
-    if let Some(response_id) = payload
-        .get("response")
+    if let Some(response_id) = source
         .and_then(|value| value.get("id"))
         .and_then(safe_scalar_field)
     {
         response.insert("id".to_string(), Value::String(response_id));
     }
 
-    response.insert("status".to_string(), Value::String("failed".to_string()));
+    if let Some(model) = source
+        .and_then(|value| value.get("model"))
+        .and_then(safe_scalar_field)
+    {
+        response.insert("model".to_string(), Value::String(model));
+    }
+
+    if let Some(usage) = safe_object_clone(source.and_then(|value| value.get("usage"))) {
+        response.insert("usage".to_string(), usage);
+    }
+
+    if let Some(output) = payload
+        .get("response")
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_array)
+        .cloned()
+    {
+        response.insert("output".to_string(), Value::Array(output));
+    }
+
+    response.insert("status".to_string(), Value::String(status.to_string()));
+    response
+}
+
+pub(super) fn sse_terminal_response_failed_chunk(payload: &Value) -> Bytes {
+    let fallback = ThreadlineError::UpstreamResponseFailed.public_error();
+    let error = payload.get("error");
+    let mut response = sanitized_terminal_response(payload, "failed");
     response.insert(
         "error".to_string(),
         Value::Object(Map::from_iter([
@@ -195,6 +224,37 @@ pub(super) fn sse_terminal_response_failed_chunk(payload: &Value) -> Bytes {
     )
 }
 
+pub(super) fn sse_terminal_response_incomplete_chunk(payload: &Value) -> Bytes {
+    let mut response = sanitized_terminal_response(payload, "incomplete");
+
+    if let Some(reason) = payload
+        .get("response")
+        .and_then(|value| value.get("incomplete_details"))
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("reason"))
+        .and_then(safe_scalar_field)
+    {
+        response.insert(
+            "incomplete_details".to_string(),
+            Value::Object(Map::from_iter([(
+                "reason".to_string(),
+                Value::String(reason),
+            )])),
+        );
+    }
+
+    sse_json_chunk(
+        "response.incomplete",
+        &Value::Object(Map::from_iter([
+            (
+                "type".to_string(),
+                Value::String("response.incomplete".to_string()),
+            ),
+            ("response".to_string(), Value::Object(response)),
+        ])),
+    )
+}
+
 pub(super) fn safe_scalar_field(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
@@ -215,7 +275,7 @@ mod tests {
     use super::{
         DownstreamRequestClassification, parse_downstream_request, safe_scalar_field,
         sse_done_chunk, sse_error_chunk, sse_json_chunk, sse_payload_chunk,
-        sse_terminal_response_failed_chunk,
+        sse_terminal_response_failed_chunk, sse_terminal_response_incomplete_chunk,
     };
     use crate::errors::ThreadlineError;
     use serde_json::{Value, json};
@@ -454,6 +514,58 @@ mod tests {
                 "event: response.failed\n",
                 "data: {\"response\":{\"error\":{\"code\":\"upstream_response_failed\",\"message\":\"The upstream response.failed event cannot be streamed as a successful downstream response.\"},\"status\":\"failed\"},\"type\":\"response.failed\"}\n\n"
             )
+        );
+    }
+
+    #[test]
+    fn sse_terminal_response_incomplete_chunk_preserves_safe_terminal_fields() {
+        let chunk = sse_terminal_response_incomplete_chunk(&json!({
+            "response": {
+                "id": "response-1",
+                "model": "gpt-5.4",
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 2,
+                    "total_tokens": 6
+                },
+                "output": [
+                    {
+                        "id": "assistant-1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "partial"
+                            }
+                        ]
+                    }
+                ],
+                "incomplete_details": {
+                    "reason": "max_output_tokens",
+                    "ignored": {"nested": true}
+                }
+            }
+        }));
+
+        let payload = std::str::from_utf8(&chunk)
+            .expect("utf8 chunk")
+            .strip_prefix("event: response.incomplete\ndata: ")
+            .and_then(|text| text.strip_suffix("\n\n"))
+            .map(|text| serde_json::from_str::<Value>(text).expect("payload json"))
+            .expect("incomplete payload");
+
+        assert_eq!(payload["type"], "response.incomplete");
+        assert_eq!(payload["response"]["id"], "response-1");
+        assert_eq!(payload["response"]["model"], "gpt-5.4");
+        assert_eq!(payload["response"]["usage"]["total_tokens"], 6);
+        assert_eq!(
+            payload["response"]["output"][0]["content"][0]["text"],
+            "partial"
+        );
+        assert_eq!(
+            payload["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
         );
     }
 

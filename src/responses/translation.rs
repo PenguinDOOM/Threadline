@@ -18,7 +18,7 @@ use crate::ws_pump::LiveUpstreamWebSocket;
 
 use super::downstream::{
     safe_scalar_field, sse_done_chunk, sse_error_chunk, sse_json_chunk,
-    sse_terminal_response_failed_chunk,
+    sse_terminal_response_failed_chunk, sse_terminal_response_incomplete_chunk,
 };
 use super::upstream::{ThreadlineServices, send_followup_tool_outputs};
 
@@ -708,6 +708,53 @@ fn no_visible_output_failed_payload(response_id: Option<&str>) -> Value {
     ]))
 }
 
+fn terminal_failed_payload(
+    response: Option<&Value>,
+    response_id: Option<&str>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Value {
+    let mut response_object = response
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    if !response_object.contains_key("id")
+        && let Some(response_id) = response_id.filter(|value| !value.is_empty())
+    {
+        response_object.insert("id".to_string(), Value::String(response_id.to_string()));
+    }
+
+    Value::Object(serde_json::Map::from_iter([
+        (
+            "type".to_string(),
+            Value::String("response.failed".to_string()),
+        ),
+        ("response".to_string(), Value::Object(response_object)),
+        (
+            "error".to_string(),
+            Value::Object(serde_json::Map::from_iter([
+                ("code".to_string(), Value::String(code.into())),
+                ("message".to_string(), Value::String(message.into())),
+            ])),
+        ),
+    ]))
+}
+
+fn terminal_failed_payload_from_error(
+    response: Option<&Value>,
+    response_id: Option<&str>,
+    error: &ThreadlineError,
+) -> Value {
+    let public = error.public_error();
+    terminal_failed_payload(
+        response,
+        response_id,
+        public.code.into_owned(),
+        public.message.into_owned(),
+    )
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CompletedSanitizationDiagnostics {
     sanitized_internal_function_call_count: usize,
@@ -939,24 +986,68 @@ pub(super) fn response_stream(
                         continue;
                     }
                     Ok(None) => {
+                        let failed_payload = terminal_failed_payload_from_error(
+                            None,
+                            None,
+                            &ThreadlineError::UpstreamWebSocketClosed,
+                        );
+                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                            &failed_payload,
+                            DownstreamTraceAction::Terminal,
+                            None,
+                        ));
                         state.lease.mark_upstream_recoverable().await;
                         state.lease.release();
-                        state.done = true;
+                        state.final_done_pending = true;
                         return Some((
-                            Ok::<Bytes, Infallible>(sse_error_chunk(
-                                &ThreadlineError::UpstreamWebSocketClosed,
+                            Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                &failed_payload,
                             )),
                             state,
                         ));
                     }
                     Err(error) => {
-                        state.done = true;
-                        return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
+                        let failed_payload = terminal_failed_payload_from_error(None, None, &error);
+                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                            &failed_payload,
+                            DownstreamTraceAction::Terminal,
+                            None,
+                        ));
+                        state.lease.mark_upstream_terminal().await;
+                        state.lease.release();
+                        state.final_done_pending = true;
+                        return Some((
+                            Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                &failed_payload,
+                            )),
+                            state,
+                        ));
                     }
                 },
             };
 
             state.upstream_event_seen = true;
+
+            if next.trim() == "[DONE]" {
+                let failed_payload = terminal_failed_payload(
+                    None,
+                    None,
+                    "upstream_done_before_completed",
+                    "The upstream websocket emitted [DONE] before Threadline received a terminal response event.",
+                );
+                trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                    &failed_payload,
+                    DownstreamTraceAction::Terminal,
+                    None,
+                ));
+                state.lease.mark_upstream_terminal().await;
+                state.lease.release();
+                state.final_done_pending = true;
+                return Some((
+                    Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(&failed_payload)),
+                    state,
+                ));
+            }
 
             let parsed = match serde_json::from_str::<Value>(&next) {
                 Ok(parsed) => parsed,
@@ -984,15 +1075,51 @@ pub(super) fn response_stream(
                             DownstreamTraceAction::ErrorTranslated,
                             None,
                         ));
+                        let failed_payload = terminal_failed_payload_from_error(
+                            parsed.get("response"),
+                            response_id_from_event(&parsed),
+                            &error,
+                        );
                         state.lease.mark_upstream_terminal().await;
-                        state.done = true;
-                        return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
+                        state.lease.release();
+                        state.final_done_pending = true;
+                        return Some((
+                            Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                &failed_payload,
+                            )),
+                            state,
+                        ));
                     }
                 };
 
                 if let Some(call) = internal_tool_call {
                     match call.execute() {
                         Ok(output) => {
+                            if state
+                                .pending_internal_outputs
+                                .iter()
+                                .any(|pending| pending.call_id() == output.call_id())
+                            {
+                                let failed_payload = terminal_failed_payload_from_error(
+                                    parsed.get("response"),
+                                    response_id_from_event(&parsed),
+                                    &ThreadlineError::InternalToolFailed,
+                                );
+                                trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                                    &failed_payload,
+                                    DownstreamTraceAction::Terminal,
+                                    None,
+                                ));
+                                state.lease.mark_upstream_terminal().await;
+                                state.lease.release();
+                                state.final_done_pending = true;
+                                return Some((
+                                    Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                        &failed_payload,
+                                    )),
+                                    state,
+                                ));
+                            }
                             state.pending_internal_outputs.push(output);
                             debug!(
                                 pending_internal_output_count =
@@ -1008,9 +1135,20 @@ pub(super) fn response_stream(
                                 DownstreamTraceAction::ErrorTranslated,
                                 None,
                             ));
+                            let failed_payload = terminal_failed_payload_from_error(
+                                parsed.get("response"),
+                                response_id_from_event(&parsed),
+                                &error,
+                            );
                             state.lease.mark_upstream_terminal().await;
-                            state.done = true;
-                            return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
+                            state.lease.release();
+                            state.final_done_pending = true;
+                            return Some((
+                                Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                    &failed_payload,
+                                )),
+                                state,
+                            ));
                         }
                     }
                 }
@@ -1025,10 +1163,11 @@ pub(super) fn response_stream(
             debug!(event_type, "upstream_event_received");
 
             if !state.pending_internal_outputs.is_empty()
-                && matches!(
+                && (matches!(
                     event_type.as_str(),
                     "response.output_text.delta" | "response.output_text.done"
-                )
+                ) || (event_type == "response.output_item.done"
+                    && !synthesized_output_item_done_text_delta(&parsed).is_empty()))
             {
                 trace_suppressed_event(&trace_metadata);
                 debug!(event_type, "translation_event_suppressed_internal_tool");
@@ -1072,9 +1211,20 @@ pub(super) fn response_stream(
                                 DownstreamTraceAction::ErrorTranslated,
                                 None,
                             ));
+                            let failed_payload = terminal_failed_payload_from_error(
+                                parsed.get("response"),
+                                response_id_from_event(&parsed),
+                                &error,
+                            );
                             state.lease.mark_upstream_terminal().await;
-                            state.done = true;
-                            return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
+                            state.lease.release();
+                            state.final_done_pending = true;
+                            return Some((
+                                Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                    &failed_payload,
+                                )),
+                                state,
+                            ));
                         };
 
                         let outputs = mem::take(&mut state.pending_internal_outputs);
@@ -1094,9 +1244,25 @@ pub(super) fn response_stream(
                         )
                         .await
                         {
+                            let failed_payload = terminal_failed_payload_from_error(
+                                parsed.get("response"),
+                                Some(response_id),
+                                &error,
+                            );
+                            trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                                &failed_payload,
+                                DownstreamTraceAction::Terminal,
+                                None,
+                            ));
                             state.lease.mark_upstream_terminal().await;
-                            state.done = true;
-                            return Some((Ok::<Bytes, Infallible>(sse_error_chunk(&error)), state));
+                            state.lease.release();
+                            state.final_done_pending = true;
+                            return Some((
+                                Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                    &failed_payload,
+                                )),
+                                state,
+                            ));
                         }
                         state.downstream_visible_text_sources.clear();
                         state.downstream_visible_text_delta_count = 0;
@@ -1173,6 +1339,22 @@ pub(super) fn response_stream(
                         state,
                     ));
                 }
+                "response.incomplete" => {
+                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                        &parsed,
+                        DownstreamTraceAction::Terminal,
+                        None,
+                    ));
+                    state.lease.mark_upstream_terminal().await;
+                    state.lease.release();
+                    state.final_done_pending = true;
+                    debug!(event_type, "terminal_response_forwarded");
+                    debug!(event_type, "final_done_queued");
+                    return Some((
+                        Ok::<Bytes, Infallible>(sse_terminal_response_incomplete_chunk(&parsed)),
+                        state,
+                    ));
+                }
                 "error" => {
                     let error = parsed.get("error");
                     let error_code = error
@@ -1195,11 +1377,19 @@ pub(super) fn response_stream(
                         DownstreamTraceAction::ErrorTranslated,
                         None,
                     ));
+                    let public_error = ThreadlineError::UpstreamErrorEvent.public_error();
+                    let failed_payload = terminal_failed_payload(
+                        parsed.get("response"),
+                        response_id_from_event(&parsed),
+                        public_error.code.into_owned(),
+                        error_message.unwrap_or_else(|| public_error.message.into_owned()),
+                    );
                     state.lease.mark_upstream_terminal().await;
-                    state.done = true;
+                    state.lease.release();
+                    state.final_done_pending = true;
                     return Some((
-                        Ok::<Bytes, Infallible>(sse_error_chunk(
-                            &ThreadlineError::UpstreamErrorEvent,
+                        Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                            &failed_payload,
                         )),
                         state,
                     ));

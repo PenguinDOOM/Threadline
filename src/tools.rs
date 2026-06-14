@@ -36,6 +36,10 @@ impl PendingInternalToolOutput {
         }
     }
 
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
     pub fn into_followup_input(self) -> Value {
         json!({
             "type": "function_call_output",
@@ -72,6 +76,9 @@ impl InternalToolCall {
             .get("call_id")
             .and_then(Value::as_str)
             .ok_or(ThreadlineError::InternalToolFailed)?;
+        if call_id.trim().is_empty() {
+            return Err(ThreadlineError::InternalToolFailed);
+        }
         let arguments = parse_arguments(item.get("arguments"))?;
 
         debug!(call_id = %call_id, tool_name = name, "internal_tool_detected");
