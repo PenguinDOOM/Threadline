@@ -189,6 +189,27 @@ fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
     payload
 }
 
+fn assistant_text_completed_event(response_id: &str, text: &str) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": text
+                        }
+                    ]
+                }
+            ]
+        }
+    })
+}
+
 fn split_sse_frames(body: &str) -> Vec<&str> {
     body.split("\n\n")
         .filter(|frame| !frame.trim().is_empty())
@@ -241,14 +262,24 @@ fn assert_done_frame(frame: &str) {
     );
 }
 
+fn assert_response_failed_payload(payload: &Value, expected_code: &str) {
+    assert_eq!(payload["type"], "response.failed");
+    assert_eq!(payload["response"]["status"], "failed");
+    assert_eq!(payload["response"]["error"]["code"], expected_code);
+    assert!(
+        payload["response"]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "expected a stable non-empty terminal failure message: {payload:?}"
+    );
+}
+
 async fn seed_marker(app: axum::Router, server: &ScriptedWebSocketServer, marker: &str) {
     let response = post_responses(app, json!({"model":"gpt-5.4","input":"seed"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
-        .send_text(&format!(
-            "{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{marker}\"}}}}"
-        ))
+        .send_text(&assistant_text_completed_event(marker, "seed completion").to_string())
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -278,33 +309,17 @@ async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
         .expect("body");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
-    let payload: Value = serde_json::from_str(data).expect("error json");
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
 
-    assert_eq!(frames.len(), 1);
-    assert_eq!(event, "error");
-    assert_eq!(
-        payload,
-        json!({
-            "error": {
-                "code": "upstream_websocket_closed",
-                "message": "The upstream Codex websocket closed before Threadline finished streaming the response.",
-                "type": "bad_gateway_error"
-            }
-        })
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_response_failed_payload(&payload, "upstream_websocket_closed");
+    assert!(
+        !body_text.contains("event: error\n"),
+        "expected terminal websocket close to use the downstream response.failed contract: {body_text}"
     );
-    assert_eq!(
-        data,
-        json!({
-            "error": {
-                "code": "upstream_websocket_closed",
-                "message": "The upstream Codex websocket closed before Threadline finished streaming the response.",
-                "type": "bad_gateway_error"
-            }
-        })
-        .to_string()
-    );
-    assert!(!body_text.contains("data: [DONE]"));
+    assert_done_frame(frames[1]);
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 1);
@@ -388,7 +403,7 @@ async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstre
     assert!(reconnect_payload.get("response").is_none());
     assert_eq!(reconnect_payload["previous_response_id"], "response-1");
     reconnect_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
+        .send_text(&assistant_text_completed_event("response-2", "resume completion").to_string())
         .await;
 
     let body = timeout(Duration::from_secs(1), body_task)
@@ -397,20 +412,37 @@ async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstre
         .expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("completed frame"));
-    let payload: Value = serde_json::from_str(data).expect("completed json");
+    let (delta_event, delta_data, completed_frame, done_frame) = match frames.as_slice() {
+        [delta_frame, completed_frame, done_frame] => {
+            let (delta_event, delta_data) = sse_event_and_data(delta_frame);
+            (
+                Some(delta_event),
+                Some(delta_data),
+                *completed_frame,
+                *done_frame,
+            )
+        }
+        [completed_frame, done_frame] => (None, None, *completed_frame, *done_frame),
+        other => panic!(
+            "unexpected successful reconnect frame sequence: expected [completed, done] or [delta, completed, done], got {other:?}"
+        ),
+    };
+    let (completed_event, completed_data) = sse_event_and_data(completed_frame);
+    let completed_payload: Value = serde_json::from_str(completed_data).expect("completed json");
 
-    assert_eq!(frames.len(), 2);
-    assert_eq!(event, "response.completed");
+    if let (Some(delta_event), Some(delta_data)) = (delta_event, delta_data) {
+        let delta_payload: Value = serde_json::from_str(delta_data).expect("delta json");
+        assert_eq!(delta_event, "response.output_text.delta");
+        assert_eq!(delta_payload["delta"], "resume completion");
+    }
+
+    assert_eq!(completed_event, "response.completed");
     assert_eq!(
-        payload,
-        json!({"type":"response.completed","response":{"id":"response-2"}})
+        completed_payload,
+        assistant_text_completed_event("response-2", "resume completion")
     );
-    assert_eq!(
-        data,
-        json!({"type":"response.completed","response":{"id":"response-2"}}).to_string()
-    );
-    assert_done_frame(frames[1]);
+
+    assert_done_frame(done_frame);
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 3);
@@ -478,19 +510,23 @@ async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
     let (created_event, created_data) = sse_event_and_data(frames.first().expect("created frame"));
-    let (error_event, error_data) = sse_event_and_data(frames.get(1).expect("error frame"));
+    let (failed_event, failed_data) = sse_event_and_data(frames.get(1).expect("failed frame"));
     let created_payload: Value = serde_json::from_str(created_data).expect("created json");
-    let error_payload: Value = serde_json::from_str(error_data).expect("error json");
+    let failed_payload: Value = serde_json::from_str(failed_data).expect("failed json");
 
-    assert_eq!(frames.len(), 2);
+    assert_eq!(frames.len(), 3);
     assert_eq!(created_event, "response.created");
     assert_eq!(
         created_payload,
         json!({"type":"response.created","response":{"id":"response-created"}})
     );
-    assert_eq!(error_event, "error");
-    assert_eq!(error_payload["error"]["code"], "upstream_websocket_closed");
-    assert!(!body_text.contains("data: [DONE]"));
+    assert_eq!(failed_event, "response.failed");
+    assert_response_failed_payload(&failed_payload, "upstream_websocket_closed");
+    assert!(
+        !body_text.contains("event: error\n"),
+        "expected terminal websocket close to use the downstream response.failed contract: {body_text}"
+    );
+    assert_done_frame(frames[2]);
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 2);
@@ -574,13 +610,17 @@ async fn reconnect_fallback_attempts_only_once() {
         .expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
-    let payload: Value = serde_json::from_str(data).expect("error json");
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
 
-    assert_eq!(frames.len(), 1);
-    assert_eq!(event, "error");
-    assert_eq!(payload["error"]["code"], "upstream_websocket_closed");
-    assert!(!body_text.contains("data: [DONE]"));
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_response_failed_payload(&payload, "upstream_websocket_closed");
+    assert!(
+        !body_text.contains("event: error\n"),
+        "expected terminal websocket close to use the downstream response.failed contract: {body_text}"
+    );
+    assert_done_frame(frames[1]);
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 3);
@@ -666,33 +706,17 @@ async fn reconnect_fallback_attempts_only_once_after_pre_stream_send_failure() {
         .expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("error frame"));
-    let payload: Value = serde_json::from_str(data).expect("error json");
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
 
-    assert_eq!(frames.len(), 1);
-    assert_eq!(event, "error");
-    assert_eq!(
-        payload,
-        json!({
-            "error": {
-                "code": "upstream_websocket_closed",
-                "message": "The upstream Codex websocket closed before Threadline finished streaming the response.",
-                "type": "bad_gateway_error"
-            }
-        })
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_response_failed_payload(&payload, "upstream_websocket_closed");
+    assert!(
+        !body_text.contains("event: error\n"),
+        "expected terminal websocket close to use the downstream response.failed contract: {body_text}"
     );
-    assert_eq!(
-        data,
-        json!({
-            "error": {
-                "code": "upstream_websocket_closed",
-                "message": "The upstream Codex websocket closed before Threadline finished streaming the response.",
-                "type": "bad_gateway_error"
-            }
-        })
-        .to_string()
-    );
-    assert!(!body_text.contains("data: [DONE]"));
+    assert_done_frame(frames[1]);
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 3);
