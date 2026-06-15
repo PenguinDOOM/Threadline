@@ -663,24 +663,123 @@ fn has_accumulated_visible_assistant_text(visible_text: &[VisibleAssistantText])
         .any(|entry| !entry.text.trim().is_empty())
 }
 
-fn completed_has_vscode_consumable_output(event: &Value) -> bool {
-    event
+fn is_forwarded_external_tool_call_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("function_call")
+        && item
+            .get("name")
+            .or_else(|| item.get("tool_name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| !is_internal_tool_name(name))
+}
+
+fn has_image_generation_result(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("image_generation_call")
+        && item
+            .get("result")
+            .and_then(Value::as_str)
+            .is_some_and(|result| !result.trim().is_empty())
+}
+
+fn is_forwarded_marker_like_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("compaction") | Some("context")
+    )
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct DownstreamObservableOutputState {
+    forwarded_visible_text_delta_count: usize,
+    forwarded_external_tool_call_count: usize,
+    forwarded_image_generation_count: usize,
+    forwarded_marker_like_output_count: usize,
+    final_visible_message_count: usize,
+    final_external_tool_call_count: usize,
+    final_image_generation_count: usize,
+    final_marker_like_output_count: usize,
+    last_upstream_event_type: Option<String>,
+}
+
+impl DownstreamObservableOutputState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn has_observable_output(&self) -> bool {
+        self.forwarded_visible_text_delta_count > 0
+            || self.forwarded_external_tool_call_count > 0
+            || self.forwarded_image_generation_count > 0
+            || self.forwarded_marker_like_output_count > 0
+            || self.final_visible_message_count > 0
+            || self.final_external_tool_call_count > 0
+            || self.final_image_generation_count > 0
+            || self.final_marker_like_output_count > 0
+    }
+}
+
+fn record_forwarded_observable_output(
+    observable_output: &mut DownstreamObservableOutputState,
+    event_type: &str,
+    event: &Value,
+) {
+    match event_type {
+        "response.output_text.delta" => {
+            observable_output.forwarded_visible_text_delta_count += 1;
+        }
+        "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
+            observable_output.forwarded_external_tool_call_count += 1;
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            let Some(item) = event.get("item") else {
+                return;
+            };
+
+            if is_forwarded_external_tool_call_item(item) {
+                observable_output.forwarded_external_tool_call_count += 1;
+            } else if has_image_generation_result(item) {
+                observable_output.forwarded_image_generation_count += 1;
+            } else if is_forwarded_marker_like_item(item) {
+                observable_output.forwarded_marker_like_output_count += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn record_completed_observable_output(
+    observable_output: &mut DownstreamObservableOutputState,
+    event: &Value,
+    diagnostics: &CompletedSanitizationDiagnostics,
+) {
+    observable_output.final_visible_message_count = diagnostics.completed_visible_message_count;
+    observable_output.final_external_tool_call_count = 0;
+    observable_output.final_image_generation_count = 0;
+    observable_output.final_marker_like_output_count = 0;
+
+    let Some(output) = event
         .get("response")
         .and_then(|response| response.get("output"))
         .and_then(Value::as_array)
-        .is_some_and(|output| {
-            output.iter().any(|item| {
-                assistant_message_has_visible_output_text(item)
-                    || (item.get("type").and_then(Value::as_str) == Some("image_generation_call")
-                        && item
-                            .get("result")
-                            .and_then(Value::as_str)
-                            .is_some_and(|result| !result.trim().is_empty()))
-            })
-        })
+    else {
+        return;
+    };
+
+    for item in output {
+        if is_forwarded_external_tool_call_item(item) {
+            observable_output.final_external_tool_call_count += 1;
+        } else if has_image_generation_result(item) {
+            observable_output.final_image_generation_count += 1;
+        } else if is_forwarded_marker_like_item(item) {
+            observable_output.final_marker_like_output_count += 1;
+        }
+    }
 }
 
-fn no_visible_output_failed_payload(response_id: Option<&str>) -> Value {
+fn has_downstream_observable_output(state: &ResponseStreamState) -> bool {
+    state.observable_output.has_observable_output()
+}
+
+fn no_observable_output_failed_payload(response_id: Option<&str>) -> Value {
     let mut response = serde_json::Map::new();
     if let Some(response_id) = response_id.filter(|value| !value.is_empty()) {
         response.insert("id".to_string(), Value::String(response_id.to_string()));
@@ -697,11 +796,11 @@ fn no_visible_output_failed_payload(response_id: Option<&str>) -> Value {
             Value::Object(serde_json::Map::from_iter([
                 (
                     "code".to_string(),
-                    Value::String("threadline_no_visible_output".to_string()),
+                    Value::String("threadline_no_observable_output".to_string()),
                 ),
                 (
                     "message".to_string(),
-                    Value::String("Response contained no visible output.".to_string()),
+                    Value::String("Response contained no observable output.".to_string()),
                 ),
             ])),
         ),
@@ -857,6 +956,7 @@ pub(super) struct ResponseStreamState {
     pub(super) suppressed_internal_output_indexes: HashSet<u64>,
     pub(super) upstream_event_seen: bool,
     pub(super) reconnect_attempted: bool,
+    pub(super) observable_output: DownstreamObservableOutputState,
     pub(super) downstream_visible_text_sources: HashSet<VisibleTextDedupeIdentity>,
     pub(super) downstream_visible_text_delta_count: usize,
     pub(super) visible_assistant_text: Vec<VisibleAssistantText>,
@@ -865,7 +965,7 @@ pub(super) struct ResponseStreamState {
     pub(super) queued_forwarded_event: Option<QueuedForwardedEvent>,
     pub(super) queued_final_completed: Option<QueuedCompletedEvent>,
     pub(super) final_done_pending: bool,
-    pub(super) apply_no_visible_output_failure: bool,
+    pub(super) apply_no_observable_output_failure: bool,
     pub(super) done: bool,
 }
 
@@ -1065,6 +1165,8 @@ pub(super) fn response_stream(
 
             let trace_metadata = UpstreamEventTraceMetadata::from_event(&parsed);
             trace_upstream_event(&trace_metadata);
+            state.observable_output.last_upstream_event_type =
+                Some(trace_metadata.event_type.clone());
 
             if state.execute_internal_tools {
                 let internal_tool_call = match InternalToolCall::from_event(&parsed) {
@@ -1269,6 +1371,7 @@ pub(super) fn response_stream(
                         state.visible_assistant_text.clear();
                         state.last_unidentified_visible_text = None;
                         state.queued_synthetic_output_text_deltas.clear();
+                        state.observable_output.reset();
                         debug!(
                             response_id,
                             output_count,
@@ -1292,12 +1395,17 @@ pub(super) fn response_stream(
                             &parsed,
                             &state.visible_assistant_text,
                         );
+                    record_completed_observable_output(
+                        &mut state.observable_output,
+                        &sanitized_completed,
+                        &diagnostics,
+                    );
 
-                    if state.apply_no_visible_output_failure
-                        && !completed_has_vscode_consumable_output(&sanitized_completed)
+                    if state.apply_no_observable_output_failure
+                        && !has_downstream_observable_output(&state)
                     {
                         let failed_payload =
-                            no_visible_output_failed_payload(response_id.as_deref());
+                            no_observable_output_failed_payload(response_id.as_deref());
                         trace_downstream_sse_event(&downstream_sse_trace_metadata(
                             &failed_payload,
                             DownstreamTraceAction::Terminal,
@@ -1402,6 +1510,11 @@ pub(super) fn response_stream(
                             record_forwarded_visible_text_delta(&mut state, key, delta);
                             trace_diagnostics.visible_text_length = Some(delta.len());
                         }
+                        record_forwarded_observable_output(
+                            &mut state.observable_output,
+                            &event_type,
+                            &parsed,
+                        );
                         state.downstream_visible_text_delta_count += 1;
                         trace_diagnostics.response_id =
                             response_id_from_event(&parsed).map(ToString::to_string);
@@ -1432,6 +1545,11 @@ pub(super) fn response_stream(
                             Some(QueuedForwardedEvent { payload: parsed });
                         continue;
                     }
+                    record_forwarded_observable_output(
+                        &mut state.observable_output,
+                        &event_type,
+                        &parsed,
+                    );
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
                         &parsed,
                         DownstreamTraceAction::Forwarded,

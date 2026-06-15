@@ -3645,7 +3645,7 @@ async fn visible_text_sources_are_not_duplicated_across_delta_done_item_and_comp
 }
 
 #[tokio::test]
-async fn empty_terminal_completion_emits_no_observable_output_failure() {
+async fn empty_response_completed_emits_no_observable_output_failure() {
     let capture = capture_completed_output_stream(vec![json!({
         "type": "response.completed",
         "response": {
@@ -3660,6 +3660,50 @@ async fn empty_terminal_completion_emits_no_observable_output_failure() {
         capture.downstream_events[0].payload,
         no_observable_output_failed_event("response-empty-terminal")
     );
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn external_tool_call_only_response_completed_remains_successful() {
+    let tool_done_event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "fc-visible-only",
+            "type": "function_call",
+            "call_id": "call-visible-only",
+            "name": "apply_patch",
+            "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+        }
+    });
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-visible-tool-only",
+            "output": [
+                {
+                    "id": "fc-visible-only",
+                    "type": "function_call",
+                    "call_id": "call-visible-only",
+                    "name": "apply_patch",
+                    "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+                }
+            ]
+        }
+    });
+
+    let capture =
+        capture_completed_output_stream(vec![tool_done_event.clone(), completed_event.clone()])
+            .await;
+
+    assert_eq!(capture.downstream_events.len(), 2);
+    assert_eq!(
+        capture.downstream_events[0].event,
+        "response.output_item.done"
+    );
+    assert_eq!(capture.downstream_events[0].payload, tool_done_event);
+    assert_eq!(capture.downstream_events[1].event, "response.completed");
+    assert_eq!(capture.downstream_events[1].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
@@ -3858,6 +3902,83 @@ async fn image_generation_completed_output_remains_successful_without_text() {
     assert_eq!(capture.downstream_events[0].event, "response.completed");
     assert_eq!(capture.downstream_events[0].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn forwarded_tool_event_does_not_hide_upstream_response_failed() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"visible-tool-then-upstream-failed"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("visible tool request");
+
+    let tool_done_event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "fc-visible-failed",
+            "type": "function_call",
+            "call_id": "call-visible-failed",
+            "name": "apply_patch",
+            "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+        }
+    });
+    let failed_event = json!({
+        "type": "response.failed",
+        "response": {
+            "id": "response-visible-tool-failed"
+        },
+        "error": {
+            "code": "upstream_response_failed",
+            "message": "failed"
+        }
+    });
+    server.send_text(&tool_done_event.to_string()).await;
+    server.send_text(&failed_event.to_string()).await;
+
+    let body = timeout(
+        Duration::from_secs(2),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("body timeout")
+    .expect("body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 3);
+    let tool_frame = sse_event_and_data(frames[0]);
+    let tool_payload: Value = serde_json::from_str(tool_frame.1).expect("tool json");
+    assert_eq!(tool_frame.0, "response.output_item.done");
+    assert_eq!(tool_payload, tool_done_event);
+
+    let failed_frame = sse_event_and_data(frames[1]);
+    let failed_payload: Value = serde_json::from_str(failed_frame.1).expect("failed json");
+    assert_eq!(failed_frame.0, "response.failed");
+    assert_eq!(failed_payload["type"], "response.failed");
+    assert_eq!(
+        failed_payload["response"]["id"],
+        "response-visible-tool-failed"
+    );
+    assert_eq!(
+        failed_payload["response"]["error"]["code"],
+        "upstream_response_failed"
+    );
+    assert_eq!(failed_payload["response"]["error"]["message"], "failed");
+    assert_done_frame(frames[2]);
 }
 
 #[tokio::test]

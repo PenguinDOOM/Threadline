@@ -110,6 +110,7 @@ pub async fn responses_handler(
         suppressed_internal_output_indexes: std::collections::HashSet::new(),
         upstream_event_seen: false,
         reconnect_attempted,
+        observable_output: Default::default(),
         downstream_visible_text_sources: std::collections::HashSet::new(),
         downstream_visible_text_delta_count: 0,
         visible_assistant_text: Vec::new(),
@@ -118,7 +119,8 @@ pub async fn responses_handler(
         queued_forwarded_event: None,
         queued_final_completed: None,
         final_done_pending: false,
-        apply_no_visible_output_failure: classification == DownstreamRequestClassification::Normal,
+        apply_no_observable_output_failure: classification
+            == DownstreamRequestClassification::Normal,
         done: false,
     });
 

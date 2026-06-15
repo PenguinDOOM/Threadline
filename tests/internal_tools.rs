@@ -1591,7 +1591,7 @@ async fn intermediate_internal_tool_completion_keeps_marker_active_until_followu
 }
 
 #[tokio::test]
-async fn internal_tool_intermediate_completion_does_not_emit_downstream_failure_before_followup_request() {
+async fn internal_tool_intermediate_completion_sends_followup_without_downstream_failure() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -1646,7 +1646,10 @@ async fn internal_tool_intermediate_completion_does_not_emit_downstream_failure_
     ))
     .expect("followup request json");
     assert_eq!(followup_request["type"], "response.create");
-    assert_eq!(followup_request["previous_response_id"], "response-intermediate");
+    assert_eq!(
+        followup_request["previous_response_id"],
+        "response-intermediate"
+    );
 
     server
         .send_text(r#"{"type":"response.output_text.delta","delta":"final answer"}"#)
@@ -1659,7 +1662,10 @@ async fn internal_tool_intermediate_completion_does_not_emit_downstream_failure_
     let completed_frame = next_sse_frame(&mut body_stream, &mut pending).await;
     let done_sentinel = next_sse_frame(&mut body_stream, &mut pending).await;
 
-    assert_eq!(sse_event_and_data(&delta_frame).0, "response.output_text.delta");
+    assert_eq!(
+        sse_event_and_data(&delta_frame).0,
+        "response.output_text.delta"
+    );
     assert_eq!(sse_event_and_data(&completed_frame).0, "response.completed");
     assert_done_frame(&done_sentinel);
     assert!(
@@ -2478,7 +2484,7 @@ async fn visible_followup_function_call_argument_delta_is_forwarded_when_output_
 }
 
 #[tokio::test]
-async fn final_empty_completion_after_internal_tool_followup_resets_observability() {
+async fn internal_tool_followup_empty_final_does_not_reuse_intermediate_observability() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -2530,7 +2536,10 @@ async fn final_empty_completion_after_internal_tool_followup_resets_observabilit
     ))
     .expect("followup request json");
     assert_eq!(followup_request["type"], "response.create");
-    assert_eq!(followup_request["previous_response_id"], "response-intermediate");
+    assert_eq!(
+        followup_request["previous_response_id"],
+        "response-intermediate"
+    );
 
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-final-empty"}}"#)
