@@ -177,15 +177,15 @@ fn assistant_text_completed_event(response_id: &str, text: &str) -> Value {
     })
 }
 
-fn no_visible_output_failed_event(response_id: &str) -> Value {
+fn no_observable_output_failed_event(response_id: &str) -> Value {
     json!({
         "type": "response.failed",
         "response": {
             "id": response_id,
             "status": "failed",
             "error": {
-                "code": "threadline_no_visible_output",
-                "message": "Response contained no visible output."
+                "code": "threadline_no_observable_output",
+                "message": "Response contained no observable output."
             }
         }
     })
@@ -3112,10 +3112,10 @@ async fn responses_bridge_visible_function_call_payloads_are_forwarded_without_m
             "expected downstream SSE event name to match upstream event type for index {index}"
         );
     }
-    assert_eq!(capture.downstream_events[5].event, "response.failed");
+    assert_eq!(capture.downstream_events[5].event, "response.completed");
     assert_eq!(
         capture.downstream_events[5].payload,
-        no_visible_output_failed_event("response-apply-patch")
+        capture.upstream_events[5]
     );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
@@ -3204,6 +3204,73 @@ async fn completed_with_compaction_and_assistant_text_sanitizes_completed_output
         })
     );
     assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn compaction_output_item_done_counts_as_observable_output_when_forwarded() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"compaction-only"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("compaction-only request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"cmp_1","type":"compaction","tool_name":"threadline_echo","encrypted_content":"opaque-done"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-compaction-only"}}"#)
+        .await;
+
+    let body = timeout(
+        Duration::from_secs(2),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("compaction-only body timeout")
+    .expect("compaction-only body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 3);
+    let done_frame = sse_event_and_data(frames[0]);
+    let completed_frame = sse_event_and_data(frames[1]);
+
+    assert_eq!(done_frame.0, "response.output_item.done");
+    assert_eq!(
+        serde_json::from_str::<Value>(done_frame.1).expect("compaction done json"),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "cmp_1",
+                "type": "compaction",
+                "tool_name": "threadline_echo",
+                "encrypted_content": "opaque-done"
+            }
+        })
+    );
+    assert_eq!(completed_frame.0, "response.completed");
+    assert_eq!(
+        serde_json::from_str::<Value>(completed_frame.1).expect("compaction completed json"),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-compaction-only"
+            }
+        })
+    );
+    assert_done_frame(frames[2]);
 }
 
 #[tokio::test]
@@ -3578,6 +3645,52 @@ async fn visible_text_sources_are_not_duplicated_across_delta_done_item_and_comp
 }
 
 #[tokio::test]
+async fn empty_terminal_completion_emits_no_observable_output_failure() {
+    let capture = capture_completed_output_stream(vec![json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-empty-terminal"
+        }
+    })])
+    .await;
+
+    assert_eq!(capture.downstream_events.len(), 1);
+    assert_eq!(capture.downstream_events[0].event, "response.failed");
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        no_observable_output_failed_event("response-empty-terminal")
+    );
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn unknown_marker_like_completed_output_remains_non_observable() {
+    let capture = capture_completed_output_stream(vec![json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-unknown-marker",
+            "output": [
+                {
+                    "id": "marker-1",
+                    "type": "state_marker",
+                    "encrypted_content": "opaque-marker"
+                }
+            ]
+        }
+    })])
+    .await;
+
+    assert_eq!(capture.downstream_events.len(), 1);
+    assert_eq!(capture.downstream_events[0].event, "response.failed");
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        no_observable_output_failed_event("response-unknown-marker")
+    );
+    assert_eq!(capture.done_frame, "data: [DONE]");
+    assert!(output_text_delta_strings(&capture.downstream_events).is_empty());
+}
+
+#[tokio::test]
 async fn internal_only_completed_output_emits_response_failed_without_marker() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -3630,7 +3743,7 @@ async fn internal_only_completed_output_emits_response_failed_without_marker() {
     assert_eq!(payload["type"], "response.failed");
     assert_eq!(
         payload["response"]["error"]["code"],
-        "threadline_no_visible_output"
+        "threadline_no_observable_output"
     );
     assert_done_frame(frames[1]);
 
@@ -4074,8 +4187,8 @@ async fn malformed_completed_output_does_not_panic_or_synthesize_delta() {
         );
         assert_eq!(
             capture.downstream_events[0].payload,
-            no_visible_output_failed_event(response_id),
-            "expected malformed case {case_name} to emit the stable no-visible-output failure payload"
+            no_observable_output_failed_event(response_id),
+            "expected malformed case {case_name} to emit the stable no-observable-output failure payload"
         );
         assert_eq!(capture.done_frame, "data: [DONE]");
     }

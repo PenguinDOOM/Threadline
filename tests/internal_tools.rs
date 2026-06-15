@@ -1176,14 +1176,9 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
         }
     });
     let completed_payload = json!({
-        "type": "response.failed",
+        "type": "response.completed",
         "response": {
-            "id": "response-visible",
-            "status": "failed",
-            "error": {
-                "code": "threadline_no_visible_output",
-                "message": "Response contained no visible output."
-            }
+            "id": "response-visible"
         }
     });
 
@@ -1194,7 +1189,7 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
         serde_json::from_str::<Value>(tool_frame.1).expect("tool payload json"),
         tool_payload
     );
-    assert_eq!(completed_frame.0, "response.failed");
+    assert_eq!(completed_frame.0, "response.completed");
     assert_eq!(completed_frame.1, completed_payload.to_string());
     assert_eq!(
         serde_json::from_str::<Value>(completed_frame.1).expect("completed payload json"),
@@ -1266,14 +1261,9 @@ async fn non_internal_tool_added_and_done_events_stream_before_response_complete
         }
     });
     let completed_payload = json!({
-        "type": "response.failed",
+        "type": "response.completed",
         "response": {
-            "id": "response-visible",
-            "status": "failed",
-            "error": {
-                "code": "threadline_no_visible_output",
-                "message": "Response contained no visible output."
-            }
+            "id": "response-visible"
         }
     });
 
@@ -1293,7 +1283,7 @@ async fn non_internal_tool_added_and_done_events_stream_before_response_complete
 
     let completed_frame = next_sse_frame(&mut body_stream, &mut pending).await;
     let (completed_event, completed_data) = sse_event_and_data(&completed_frame);
-    assert_eq!(completed_event, "response.failed");
+    assert_eq!(completed_event, "response.completed");
     assert_eq!(completed_data, completed_payload.to_string());
 
     let done_sentinel = next_sse_frame(&mut body_stream, &mut pending).await;
@@ -1303,6 +1293,87 @@ async fn non_internal_tool_added_and_done_events_stream_before_response_complete
         "expected EOF after DONE"
     );
     assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn explicit_upstream_failure_remains_terminal_failure_after_forwarded_external_tool_event() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "forward tool before terminal upstream failure",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "downstream_tool",
+                    "description": "visible tool",
+                    "parameters": {"type": "object"}
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-visible","name":"downstream_tool","arguments":"{}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.failed","response":{"id":"response-visible-failed"},"error":{"code":"upstream_response_failed","message":"failed after visible tool"}}"#,
+        )
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 3);
+    let tool_frame = sse_event_and_data(frames[0]);
+    assert_eq!(tool_frame.0, "response.output_item.done");
+    assert_eq!(
+        serde_json::from_str::<Value>(tool_frame.1).expect("tool payload json"),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call-visible",
+                "name": "downstream_tool",
+                "arguments": "{}"
+            }
+        })
+    );
+
+    let failed_frame = sse_event_and_data(frames[1]);
+    let failed_payload: Value = serde_json::from_str(failed_frame.1).expect("failed json");
+    assert_eq!(failed_frame.0, "response.failed");
+    assert_eq!(failed_payload["response"]["id"], "response-visible-failed");
+    assert_eq!(
+        failed_payload["response"]["error"]["code"],
+        "upstream_response_failed"
+    );
+    assert_eq!(
+        failed_payload["response"]["error"]["message"],
+        "failed after visible tool"
+    );
+    assert_done_frame(frames[2]);
 }
 
 #[tokio::test]
@@ -1517,6 +1588,84 @@ async fn intermediate_internal_tool_completion_keeps_marker_active_until_followu
     );
 
     assert_done_frame(frames[2]);
+}
+
+#[tokio::test]
+async fn internal_tool_intermediate_completion_does_not_emit_downstream_failure_before_followup_request() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "hold downstream terminal state until internal follow-up request exists"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body_stream = response.into_body().into_data_stream();
+    let mut pending = String::new();
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let premature_frame = timeout(
+        Duration::from_millis(100),
+        next_sse_frame(&mut body_stream, &mut pending),
+    )
+    .await;
+    assert!(
+        premature_frame.is_err(),
+        "expected no downstream terminal frame before the internal follow-up request is observed"
+    );
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+    assert_eq!(followup_request["previous_response_id"], "response-intermediate");
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"final answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final"}}"#)
+        .await;
+
+    let delta_frame = next_sse_frame(&mut body_stream, &mut pending).await;
+    let completed_frame = next_sse_frame(&mut body_stream, &mut pending).await;
+    let done_sentinel = next_sse_frame(&mut body_stream, &mut pending).await;
+
+    assert_eq!(sse_event_and_data(&delta_frame).0, "response.output_text.delta");
+    assert_eq!(sse_event_and_data(&completed_frame).0, "response.completed");
+    assert_done_frame(&done_sentinel);
+    assert!(
+        body_stream.next().await.is_none(),
+        "expected EOF after DONE"
+    );
 }
 
 #[tokio::test]
@@ -2298,14 +2447,9 @@ async fn visible_followup_function_call_argument_delta_is_forwarded_when_output_
         }
     });
     let final_completed = json!({
-        "type": "response.failed",
+        "type": "response.completed",
         "response": {
-            "id": "response-final",
-            "status": "failed",
-            "error": {
-                "code": "threadline_no_visible_output",
-                "message": "Response contained no visible output."
-            }
+            "id": "response-final"
         }
     });
 
@@ -2324,11 +2468,88 @@ async fn visible_followup_function_call_argument_delta_is_forwarded_when_output_
     assert_eq!(done_frame.1, visible_done.to_string());
 
     let completed_frame = sse_event_and_data(frames[3]);
-    assert_eq!(completed_frame.0, "response.failed");
+    assert_eq!(completed_frame.0, "response.completed");
     assert_eq!(completed_frame.1, final_completed.to_string());
 
     assert_done_frame(frames[4]);
     assert!(!body_text.contains("call-internal"));
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("response-intermediate"));
+}
+
+#[tokio::test]
+async fn final_empty_completion_after_internal_tool_followup_resets_observability() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "final empty completion after internal follow-up"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        timeout(
+            Duration::from_secs(2),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("body timeout")
+        .expect("body bytes")
+    });
+
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+    assert_eq!(followup_request["previous_response_id"], "response-intermediate");
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-final-empty"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+
+    assert_eq!(frames.len(), 2);
+    let failed_frame = sse_event_and_data(frames[0]);
+    let failed_payload: Value = serde_json::from_str(failed_frame.1).expect("failed json");
+    assert_eq!(failed_frame.0, "response.failed");
+    assert_eq!(failed_payload["response"]["id"], "response-final-empty");
+    assert_eq!(
+        failed_payload["response"]["error"]["code"],
+        "threadline_no_observable_output"
+    );
+    assert_done_frame(frames[1]);
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("response-intermediate"));
 }
