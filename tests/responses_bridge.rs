@@ -287,6 +287,37 @@ fn auxiliary_summary_input_item() -> Value {
 fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
     let mut payload = json!({
         "model": "gpt-5.4",
+        "context_management": {
+            "type": "compaction",
+            "compact_threshold": 12345
+        },
+        "tools": [
+            {
+                "type": "function",
+                "name": "user_tool",
+                "description": "User-defined tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "type": "function",
+                "name": "threadline_echo",
+                "description": "Threadline internal tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "type": "string"
+                        }
+                    },
+                    "required": ["value"],
+                    "additionalProperties": false
+                }
+            }
+        ],
         "input": [
             {
                 "type": "message",
@@ -605,6 +636,16 @@ async fn summary_request_does_not_forward_previous_response_id_upstream() {
     .expect("summary request json");
     assert_eq!(payload["type"], "response.create");
     assert!(payload.get("previous_response_id").is_none());
+    assert_eq!(
+        payload["context_management"],
+        json!({
+            "type": "compaction",
+            "compact_threshold": 12345
+        })
+    );
+    let tools = payload["tools"].as_array().expect("tools array");
+    assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
+    assert!(!tools.iter().any(|tool| tool["name"] == "threadline_echo"));
 }
 
 #[tokio::test]
@@ -617,13 +658,7 @@ async fn summary_request_with_context_management_keeps_context_management_but_om
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let mut payload = auxiliary_summary_request(Some("response-1"));
-    payload["context_management"] = json!({
-        "type": "compaction",
-        "compact_threshold": 12345
-    });
-
-    let response = post_responses(app, payload).await;
+    let response = post_responses(app, auxiliary_summary_request(Some("response-1"))).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let forwarded: Value = serde_json::from_str(&message_text(
@@ -641,6 +676,9 @@ async fn summary_request_with_context_management_keeps_context_management_but_om
             "compact_threshold": 12345
         })
     );
+    let tools = forwarded["tools"].as_array().expect("tools array");
+    assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
+    assert!(!tools.iter().any(|tool| tool["name"] == "threadline_echo"));
 }
 
 #[tokio::test]

@@ -303,6 +303,57 @@ mod tests {
         })
     }
 
+    fn sanitized_observed_auxiliary_summary_request() -> Value {
+        json!({
+            "model": "gpt-5.4",
+            "previous_response_id": "resp_123",
+            "context_management": {
+                "type": "compaction",
+                "compact_threshold": 12345
+            },
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "user_tool",
+                    "description": "User-defined tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "threadline_echo",
+                    "description": "Threadline internal tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": "string"
+                            }
+                        },
+                        "required": ["value"],
+                        "additionalProperties": false
+                    }
+                }
+            ],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Continue from the earlier answer."
+                        }
+                    ]
+                },
+                auxiliary_summary_input_item()
+            ]
+        })
+    }
+
     #[test]
     fn parse_downstream_request_extracts_previous_response_id_and_payload() {
         let request = parse_downstream_request(json!({
@@ -320,23 +371,8 @@ mod tests {
 
     #[test]
     fn parse_downstream_request_identifies_auxiliary_summary_request() {
-        let request = parse_downstream_request(json!({
-            "previous_response_id": "resp_123",
-            "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Continue from the earlier answer."
-                        }
-                    ]
-                },
-                auxiliary_summary_input_item()
-            ]
-        }))
-        .expect("parse request");
+        let request = parse_downstream_request(sanitized_observed_auxiliary_summary_request())
+            .expect("parse request");
 
         assert_eq!(
             request.classification,
