@@ -56,13 +56,17 @@ If earlier visible text was streamed but the final completed assistant message w
 
 When forwarding the final downstream `response.completed`, Threadline may sanitize `response.completed.response.output` to remove Threadline-internal `threadline_*` function calls and compaction-only items while preserving downstream-consumable output.
 
-For ordinary downstream requests, a successful downstream stream may end with `response.completed` only when `response.completed.response.output` still contains VSCode-consumable output after Threadline sanitization.
+For ordinary downstream requests, a successful downstream stream may end with `response.completed` only when Threadline has already produced downstream-observable output for that request.
 
-`image_generation_call.result` remains a valid successful non-text output and may satisfy the final consumable-output requirement even when no visible assistant text is present.
+For this ordinary-request success rule, downstream-observable output is limited to downstream-visible assistant text, forwarded external non-`threadline_*` tool calls, `image_generation_call.result`, and concrete downstream-consumable compaction, context, or state-marker output only when Threadline explicitly preserves or forwards that output downstream.
 
-If an ordinary request reaches a terminal state with only internal `threadline_*` items, only compaction-only items, or otherwise no consumable final output, Threadline must end the stream as `response.failed` with a stable no-visible-output failure instead of an empty success.
+Internal `threadline_*` tool events, intermediate completions that only finish internal-tool work, hidden compaction-only items, and other hidden marker-like payloads do not themselves satisfy the downstream-observable-output requirement.
 
-Auxiliary summary and transient auxiliary behavior remain narrow exceptions to the ordinary no-visible-output failure rule.
+`image_generation_call.result` remains a valid successful non-text output and may satisfy the downstream-observable-output requirement even when no visible assistant text is present.
+
+If an ordinary request reaches a terminal state without downstream-observable output, including terminal states with only internal `threadline_*` items, only hidden intermediate completions, only compaction-only items that Threadline did not preserve downstream, or other non-observable marker-like payloads, Threadline must end the stream as `response.failed` with a stable `threadline_no_observable_output` failure instead of an empty success.
+
+Auxiliary summary and transient auxiliary behavior remain narrow exceptions to the ordinary no-observable-output failure rule.
 
 When a downstream request includes `previous_response_id`, use it as a continuation marker.
 
@@ -322,7 +326,9 @@ For `response.incomplete`, preserve safe status-specific fields and do not expos
 
 After emitting a terminal downstream `response.failed` or `response.incomplete` event, Threadline may terminate the stream with downstream `[DONE]`.
 
-Successful downstream streams should terminate with `response.completed` only when the final `response.completed.response.output` contains VSCode-consumable output.
+Successful downstream streams should terminate with `response.completed` only when Threadline has already forwarded or preserved concrete downstream-observable output for that request, such as downstream-visible assistant text, forwarded external non-`threadline_*` tool calls, `image_generation_call.result`, or other downstream-consumable output that Threadline explicitly preserves downstream.
+
+A non-empty final `response.completed.response.output` is not by itself the success criterion, and external non-`threadline_*` tool-call-only responses remain valid successful completions when that forwarded tool output is the downstream-observable result.
 
 Emitting a failed `response.id` downstream does not make that id continuation-safe. Only previously completed markers remain valid for later `previous_response_id` requests.
 
