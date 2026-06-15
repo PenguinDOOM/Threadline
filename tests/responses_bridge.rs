@@ -1,4 +1,7 @@
 use std::collections::VecDeque;
+use std::io::{self, Write};
+use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -11,6 +14,7 @@ use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
+use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
 
 #[path = "support/scripted_ws.rs"]
@@ -2623,6 +2627,116 @@ struct CompletedOutputStreamCapture {
     done_frame: String,
 }
 
+type SharedTraceBytes = Arc<StdMutex<Vec<u8>>>;
+type ActiveTraceBytes = StdMutex<Option<SharedTraceBytes>>;
+
+struct SharedLogBuffer {
+    bytes: SharedTraceBytes,
+}
+
+impl SharedLogBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    fn logs(&self) -> String {
+        String::from_utf8(self.bytes.lock().expect("log buffer lock").clone())
+            .expect("utf8 trace logs")
+    }
+}
+
+static TRACE_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ACTIVE_TRACE_BUFFER: OnceLock<ActiveTraceBytes> = OnceLock::new();
+static TRACE_SUBSCRIBER_INIT: OnceLock<()> = OnceLock::new();
+
+fn trace_capture_lock() -> &'static Mutex<()> {
+    TRACE_CAPTURE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn active_trace_buffer() -> &'static ActiveTraceBytes {
+    ACTIVE_TRACE_BUFFER.get_or_init(|| StdMutex::new(None))
+}
+
+fn ensure_test_trace_subscriber() {
+    TRACE_SUBSCRIBER_INIT.get_or_init(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(GlobalTraceCapture)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("global trace subscriber should only initialize once");
+    });
+}
+
+#[derive(Clone, Copy)]
+struct GlobalTraceCapture;
+
+struct GlobalTraceWriter;
+
+impl Write for GlobalTraceWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(bytes) = active_trace_buffer()
+            .lock()
+            .expect("active trace buffer lock")
+            .as_ref()
+        {
+            bytes
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for GlobalTraceCapture {
+    type Writer = GlobalTraceWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        GlobalTraceWriter
+    }
+}
+
+struct TraceCaptureGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    log_buffer: SharedLogBuffer,
+}
+
+impl TraceCaptureGuard {
+    async fn begin() -> Self {
+        let lock = trace_capture_lock().lock().await;
+        ensure_test_trace_subscriber();
+        let log_buffer = SharedLogBuffer::new();
+        *active_trace_buffer()
+            .lock()
+            .expect("active trace buffer lock") = Some(Arc::clone(&log_buffer.bytes));
+        Self {
+            _lock: lock,
+            log_buffer,
+        }
+    }
+
+    fn logs(&self) -> String {
+        self.log_buffer.logs()
+    }
+}
+
+impl Drop for TraceCaptureGuard {
+    fn drop(&mut self) {
+        *active_trace_buffer()
+            .lock()
+            .expect("active trace buffer lock") = None;
+    }
+}
+
 async fn capture_visible_apply_patch_stream() -> ApplyPatchStreamCapture {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -3661,6 +3775,60 @@ async fn empty_response_completed_emits_no_observable_output_failure() {
         no_observable_output_failed_event("response-empty-terminal")
     );
     assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn no_observable_output_diagnostics_do_not_log_arguments_or_encrypted_content() {
+    let trace_guard = TraceCaptureGuard::begin().await;
+    let response_id = "response-no-observable-diagnostics";
+    let raw_arguments = "{\"api_key\":\"secret-123\"}";
+    let encrypted_content = "opaque-encrypted-payload";
+    let capture = capture_completed_output_stream(vec![json!({
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "output": [
+                {
+                    "id": "fc-internal-only",
+                    "type": "function_call",
+                    "call_id": "call-internal-only",
+                    "name": "threadline_echo",
+                    "arguments": raw_arguments
+                },
+                {
+                    "id": "compaction-internal-only",
+                    "type": "compaction",
+                    "encrypted_content": encrypted_content
+                }
+            ]
+        }
+    })])
+    .await;
+
+    assert_eq!(capture.downstream_events.len(), 1);
+    assert_eq!(capture.downstream_events[0].event, "response.failed");
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        no_observable_output_failed_event(response_id)
+    );
+
+    let logs = trace_guard.logs();
+    let guard_line = logs
+        .lines()
+        .find(|line| {
+            line.contains("responses_translation_no_observable_output_guard")
+                && line.contains(response_id)
+        })
+        .expect("guard diagnostics trace line");
+
+    assert!(guard_line.contains(response_id));
+    assert!(guard_line.contains("completed_output_item_types"));
+    assert!(guard_line.contains("function_call"));
+    assert!(guard_line.contains("compaction"));
+    assert!(!guard_line.contains(raw_arguments));
+    assert!(!guard_line.contains(encrypted_content));
+    assert!(!guard_line.contains("arguments="));
+    assert!(!guard_line.contains("encrypted_content="));
 }
 
 #[tokio::test]

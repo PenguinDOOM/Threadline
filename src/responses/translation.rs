@@ -80,6 +80,8 @@ const RESPONSES_TRANSLATION_UPSTREAM_EVENT: &str = "responses_translation_upstre
 const RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT: &str =
     "responses_translation_downstream_sse_event";
 const RESPONSES_TRANSLATION_EVENT_SUPPRESSED: &str = "responses_translation_event_suppressed";
+const RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD: &str =
+    "responses_translation_no_observable_output_guard";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DownstreamTraceAction {
@@ -191,6 +193,19 @@ struct DownstreamSseTraceMetadata {
     completed_visible_message_count: Option<usize>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct NoObservableOutputGuardDiagnostics {
+    response_id: Option<String>,
+    pending_internal_outputs_count: usize,
+    suppressed_internal_tool_call_count: usize,
+    forwarded_external_tool_call_count: usize,
+    forwarded_compaction_or_marker_count: usize,
+    visible_assistant_text_len: usize,
+    completed_output_item_types: Vec<String>,
+    upstream_last_event_type: Option<String>,
+    is_intermediate_completed: bool,
+}
+
 fn downstream_sse_trace_metadata(
     event: &Value,
     action: DownstreamTraceAction,
@@ -288,6 +303,21 @@ fn trace_suppressed_event(metadata: &UpstreamEventTraceMetadata) {
         compaction_id = ?metadata.compaction_id,
         has_encrypted_content = ?metadata.has_encrypted_content,
         "{RESPONSES_TRANSLATION_EVENT_SUPPRESSED}"
+    );
+}
+
+fn trace_no_observable_output_guard(metadata: &NoObservableOutputGuardDiagnostics) {
+    debug!(
+        response_id = ?metadata.response_id,
+        pending_internal_outputs_count = metadata.pending_internal_outputs_count,
+        suppressed_internal_tool_call_count = metadata.suppressed_internal_tool_call_count,
+        forwarded_external_tool_call_count = metadata.forwarded_external_tool_call_count,
+        forwarded_compaction_or_marker_count = metadata.forwarded_compaction_or_marker_count,
+        visible_assistant_text_len = metadata.visible_assistant_text_len,
+        completed_output_item_types = ?metadata.completed_output_item_types,
+        upstream_last_event_type = ?metadata.upstream_last_event_type,
+        is_intermediate_completed = metadata.is_intermediate_completed,
+        "{RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD}"
     );
 }
 
@@ -777,6 +807,42 @@ fn record_completed_observable_output(
 
 fn has_downstream_observable_output(state: &ResponseStreamState) -> bool {
     state.observable_output.has_observable_output()
+}
+
+fn no_observable_output_guard_diagnostics(
+    state: &ResponseStreamState,
+    completed_event: &Value,
+    diagnostics: &CompletedSanitizationDiagnostics,
+) -> NoObservableOutputGuardDiagnostics {
+    NoObservableOutputGuardDiagnostics {
+        response_id: response_id_from_event(completed_event).map(ToString::to_string),
+        pending_internal_outputs_count: state.pending_internal_outputs.len(),
+        suppressed_internal_tool_call_count: state.suppressed_internal_output_indexes.len()
+            + diagnostics.sanitized_internal_function_call_count,
+        forwarded_external_tool_call_count: state.observable_output.forwarded_external_tool_call_count
+            + state.observable_output.final_external_tool_call_count,
+        forwarded_compaction_or_marker_count: state.observable_output.forwarded_marker_like_output_count
+            + state.observable_output.final_marker_like_output_count,
+        visible_assistant_text_len: state
+            .visible_assistant_text
+            .iter()
+            .map(|entry| entry.text.len())
+            .sum(),
+        completed_output_item_types: completed_event
+            .get("response")
+            .and_then(|response| response.get("output"))
+            .and_then(Value::as_array)
+            .map(|output| {
+                output
+                    .iter()
+                    .filter_map(|item| item.get("type").and_then(Value::as_str))
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        upstream_last_event_type: state.observable_output.last_upstream_event_type.clone(),
+        is_intermediate_completed: !state.pending_internal_outputs.is_empty(),
+    }
 }
 
 fn no_observable_output_failed_payload(response_id: Option<&str>) -> Value {
@@ -1404,6 +1470,12 @@ pub(super) fn response_stream(
                     if state.apply_no_observable_output_failure
                         && !has_downstream_observable_output(&state)
                     {
+                        let guard_diagnostics = no_observable_output_guard_diagnostics(
+                            &state,
+                            &parsed,
+                            &diagnostics,
+                        );
+                        trace_no_observable_output_guard(&guard_diagnostics);
                         let failed_payload =
                             no_observable_output_failed_payload(response_id.as_deref());
                         trace_downstream_sse_event(&downstream_sse_trace_metadata(
@@ -1590,9 +1662,11 @@ mod tests {
 
     use super::{
         CompletedSanitizationDiagnostics, DownstreamTraceAction, DownstreamTraceDiagnostics,
-        RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT, RESPONSES_TRANSLATION_EVENT_SUPPRESSED,
-        RESPONSES_TRANSLATION_UPSTREAM_EVENT, UpstreamEventTraceMetadata, VisibleAssistantText,
-        VisibleTextSourceKey, downstream_sse_trace_metadata,
+        RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT,
+        RESPONSES_TRANSLATION_EVENT_SUPPRESSED,
+        RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD,
+        RESPONSES_TRANSLATION_UPSTREAM_EVENT, UpstreamEventTraceMetadata,
+        VisibleAssistantText, VisibleTextSourceKey, downstream_sse_trace_metadata,
         sanitized_completed_event_with_diagnostics,
     };
 
@@ -1858,6 +1932,10 @@ mod tests {
         assert_eq!(
             RESPONSES_TRANSLATION_EVENT_SUPPRESSED,
             "responses_translation_event_suppressed"
+        );
+        assert_eq!(
+            RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD,
+            "responses_translation_no_observable_output_guard"
         );
     }
 }
