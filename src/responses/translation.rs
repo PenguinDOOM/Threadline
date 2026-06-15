@@ -819,9 +819,13 @@ fn no_observable_output_guard_diagnostics(
         pending_internal_outputs_count: state.pending_internal_outputs.len(),
         suppressed_internal_tool_call_count: state.suppressed_internal_output_indexes.len()
             + diagnostics.sanitized_internal_function_call_count,
-        forwarded_external_tool_call_count: state.observable_output.forwarded_external_tool_call_count
+        forwarded_external_tool_call_count: state
+            .observable_output
+            .forwarded_external_tool_call_count
             + state.observable_output.final_external_tool_call_count,
-        forwarded_compaction_or_marker_count: state.observable_output.forwarded_marker_like_output_count
+        forwarded_compaction_or_marker_count: state
+            .observable_output
+            .forwarded_marker_like_output_count
             + state.observable_output.final_marker_like_output_count,
         visible_assistant_text_len: state
             .visible_assistant_text
@@ -1470,11 +1474,8 @@ pub(super) fn response_stream(
                     if state.apply_no_observable_output_failure
                         && !has_downstream_observable_output(&state)
                     {
-                        let guard_diagnostics = no_observable_output_guard_diagnostics(
-                            &state,
-                            &parsed,
-                            &diagnostics,
-                        );
+                        let guard_diagnostics =
+                            no_observable_output_guard_diagnostics(&state, &parsed, &diagnostics);
                         trace_no_observable_output_guard(&guard_diagnostics);
                         let failed_payload =
                             no_observable_output_failed_payload(response_id.as_deref());
@@ -1662,12 +1663,10 @@ mod tests {
 
     use super::{
         CompletedSanitizationDiagnostics, DownstreamTraceAction, DownstreamTraceDiagnostics,
-        RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT,
-        RESPONSES_TRANSLATION_EVENT_SUPPRESSED,
-        RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD,
-        RESPONSES_TRANSLATION_UPSTREAM_EVENT, UpstreamEventTraceMetadata,
-        VisibleAssistantText, VisibleTextSourceKey, downstream_sse_trace_metadata,
-        sanitized_completed_event_with_diagnostics,
+        RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT, RESPONSES_TRANSLATION_EVENT_SUPPRESSED,
+        RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD, RESPONSES_TRANSLATION_UPSTREAM_EVENT,
+        UpstreamEventTraceMetadata, VisibleAssistantText, VisibleTextSourceKey,
+        downstream_sse_trace_metadata, sanitized_completed_event_with_diagnostics,
     };
 
     #[test]
