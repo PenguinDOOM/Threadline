@@ -42,6 +42,12 @@ pub async fn responses_handler(
     validate_request_model(&request.payload)?;
     let auth = state.services.auth_provider().load()?;
     let classification = request.classification;
+    let previous_response_id_present = request.previous_response_id.is_some();
+    let context_management_present = request.payload.contains_key("context_management");
+    debug!(
+        request_class = request_class_label(classification),
+        previous_response_id_present, context_management_present, "responses_request_routed"
+    );
     let mut upstream_request = request.payload;
     match classification {
         DownstreamRequestClassification::Normal => inject_internal_tools(&mut upstream_request),
@@ -147,6 +153,13 @@ fn strip_threadline_tools(payload: &mut serde_json::Map<String, Value>) {
             .and_then(Value::as_str)
             .is_some_and(is_internal_tool_name)
     });
+}
+
+fn request_class_label(classification: DownstreamRequestClassification) -> &'static str {
+    match classification {
+        DownstreamRequestClassification::Normal => "normal",
+        DownstreamRequestClassification::AuxiliarySummary => "auxiliary_summary",
+    }
 }
 
 async fn attempt_pre_first_event_reconnect(

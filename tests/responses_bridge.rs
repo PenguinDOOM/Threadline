@@ -719,6 +719,89 @@ async fn summary_request_without_previous_response_id_uses_auxiliary_session() {
 }
 
 #[tokio::test]
+async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_request_content() {
+    let trace_guard = TraceCaptureGuard::begin().await;
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let normal_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&normal_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+    let raw_request_secret = "secret-123";
+    let raw_request_account = "acct_123456789";
+
+    let summary = post_responses(app.clone(), auxiliary_summary_request(Some("response-1"))).await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let _ = summary_server
+        .recv_client_message()
+        .await
+        .expect("summary request");
+    summary_server
+        .send_text(
+            &assistant_text_completed_event("response-summary-diagnostics", "summary completion")
+                .to_string(),
+        )
+        .await;
+    let _ = to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .expect("summary body");
+
+    let normal = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input": format!("Account {raw_request_account} credential {raw_request_secret}")
+        }),
+    )
+    .await;
+    assert_eq!(normal.status(), StatusCode::OK);
+    let _ = normal_server
+        .recv_client_message()
+        .await
+        .expect("normal request");
+    normal_server
+        .send_text(
+            &assistant_text_completed_event("response-normal-diagnostics", "normal completion")
+                .to_string(),
+        )
+        .await;
+    let _ = to_bytes(normal.into_body(), usize::MAX)
+        .await
+        .expect("normal body");
+
+    let logs = trace_guard.logs();
+    let summary_line = logs
+        .lines()
+        .find(|line| {
+            line.contains("responses_request_routed")
+                && line.contains("request_class=\"auxiliary_summary\"")
+        })
+        .expect("summary routing diagnostics trace line");
+    assert!(summary_line.contains("previous_response_id_present=true"));
+    assert!(summary_line.contains("context_management_present=true"));
+    assert!(!summary_line.contains("response-1"));
+    assert!(!summary_line.contains(auxiliary_summary_text()));
+
+    let normal_line = logs
+        .lines()
+        .find(|line| {
+            line.contains("responses_request_routed") && line.contains("request_class=\"normal\"")
+        })
+        .expect("normal routing diagnostics trace line");
+    assert!(normal_line.contains("previous_response_id_present=false"));
+    assert!(normal_line.contains("context_management_present=false"));
+    assert!(!normal_line.contains(raw_request_secret));
+    assert!(!normal_line.contains(raw_request_account));
+}
+
+#[tokio::test]
 async fn summary_response_id_is_not_registered_as_continuation_marker() {
     let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
