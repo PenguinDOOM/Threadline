@@ -160,6 +160,56 @@ mod tests {
     }
 
     #[test]
+    fn build_response_create_payload_preserves_context_management_and_previous_response_id() {
+        let payload = build_response_create_payload(json!({
+            "model": "gpt-test",
+            "instructions": "keep",
+            "previous_response_id": "resp_123",
+            "context_management": {
+                "type": "compaction",
+                "compact_threshold": 12345
+            },
+            "reasoning": {
+                "effort": "high",
+                "summary": "auto"
+            },
+            "include": ["reasoning.encrypted_content"],
+            "max_output_tokens": 32,
+            "max_tokens": 64,
+            "max_completion_tokens": 96,
+            "truncation": "auto"
+        }))
+        .expect("response.create payload");
+
+        assert_eq!(payload["type"], "response.create");
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["instructions"], "keep");
+        assert_eq!(payload["previous_response_id"], "resp_123");
+        assert_eq!(
+            payload["context_management"],
+            json!({
+                "type": "compaction",
+                "compact_threshold": 12345
+            })
+        );
+        assert_eq!(
+            payload["reasoning"],
+            json!({
+                "effort": "high",
+                "summary": "auto"
+            })
+        );
+        assert_eq!(
+            payload["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+        assert!(payload.get("max_output_tokens").is_none());
+        assert!(payload.get("max_tokens").is_none());
+        assert!(payload.get("max_completion_tokens").is_none());
+        assert!(payload.get("truncation").is_none());
+    }
+
+    #[test]
     fn build_followup_tool_outputs_payload_preserves_previous_response_id_and_output_shape() {
         let payload = build_followup_tool_outputs_payload(
             json!({
