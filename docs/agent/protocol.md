@@ -54,17 +54,19 @@ If Threadline has not already forwarded equivalent visible assistant text downst
 
 If earlier visible text was streamed but the final completed assistant message would otherwise be missing or incomplete, Threadline may backfill the final completed assistant message from the accumulated visible assistant text.
 
-When forwarding the final downstream `response.completed`, Threadline may sanitize `response.completed.response.output` to remove Threadline-internal `threadline_*` function calls and compaction-only items while preserving downstream-consumable output.
+When forwarding the final downstream `response.completed`, Threadline may sanitize `response.completed.response.output` to remove Threadline-internal `threadline_*` function calls while preserving downstream-consumable output, including preserved compaction, context, or other marker-like items that remain part of the completed downstream output.
 
 For ordinary downstream requests, a successful downstream stream may end with `response.completed` only when Threadline has already produced downstream-observable output for that request.
 
-For this ordinary-request success rule, downstream-observable output is limited to downstream-visible assistant text, forwarded external non-`threadline_*` tool calls, `image_generation_call.result`, and concrete downstream-consumable compaction, context, or state-marker output only when Threadline explicitly preserves or forwards that output downstream.
+For this ordinary-request success rule, downstream-observable output is limited to downstream-visible assistant text, forwarded external non-`threadline_*` tool calls, `image_generation_call.result`, and concrete downstream-consumable compaction, context, or state-marker output when Threadline explicitly forwards that output downstream or retains it in the completed downstream output.
 
-Internal `threadline_*` tool events, intermediate completions that only finish internal-tool work, hidden compaction-only items, and other hidden marker-like payloads do not themselves satisfy the downstream-observable-output requirement.
+Server-side `context_management` compaction remains distinct from client-side auxiliary summary behavior. Do not treat preserved compaction, context, or marker-like output as summary-only behavior merely because `context_management` fields are present.
+
+Internal `threadline_*` tool events, intermediate completions that only finish internal-tool work, and other marker-like payloads that Threadline neither forwards downstream nor retains in the completed downstream output do not themselves satisfy the downstream-observable-output requirement.
 
 `image_generation_call.result` remains a valid successful non-text output and may satisfy the downstream-observable-output requirement even when no visible assistant text is present.
 
-If an ordinary request reaches a terminal state without downstream-observable output, including terminal states with only internal `threadline_*` items, only hidden intermediate completions, only compaction-only items that Threadline did not preserve downstream, or other non-observable marker-like payloads, Threadline must end the stream as `response.failed` with a stable `threadline_no_observable_output` failure instead of an empty success.
+If an ordinary request reaches a terminal state without downstream-observable output, including terminal states with only internal `threadline_*` items, only hidden intermediate completions, only compaction-only items that Threadline neither forwards downstream nor retains in the completed downstream output, or other non-observable marker-like payloads, Threadline must end the stream as `response.failed` with a stable `threadline_no_observable_output` failure instead of an empty success.
 
 Auxiliary summary and transient auxiliary behavior remain narrow exceptions to the ordinary no-observable-output failure rule.
 
@@ -326,7 +328,7 @@ For `response.incomplete`, preserve safe status-specific fields and do not expos
 
 After emitting a terminal downstream `response.failed` or `response.incomplete` event, Threadline may terminate the stream with downstream `[DONE]`.
 
-Successful downstream streams should terminate with `response.completed` only when Threadline has already forwarded or preserved concrete downstream-observable output for that request, such as downstream-visible assistant text, forwarded external non-`threadline_*` tool calls, `image_generation_call.result`, or other downstream-consumable output that Threadline explicitly preserves downstream.
+Successful downstream streams should terminate with `response.completed` only when Threadline has already forwarded or preserved concrete downstream-observable output for that request, such as downstream-visible assistant text, forwarded external non-`threadline_*` tool calls, `image_generation_call.result`, or other downstream-consumable output that Threadline explicitly forwards downstream or retains in the completed downstream output.
 
 A non-empty final `response.completed.response.output` is not by itself the success criterion, and external non-`threadline_*` tool-call-only responses remain valid successful completions when that forwarded tool output is the downstream-observable result.
 

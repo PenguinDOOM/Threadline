@@ -1763,7 +1763,35 @@ mod tests {
     }
 
     #[test]
-    fn completed_sanitization_reports_counts_without_payload_bodies() {
+    fn sanitized_completed_event_preserves_compaction_output() {
+        let parsed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-compaction-only",
+                "output": [
+                    {
+                        "type": "compaction",
+                        "id": "compaction-1",
+                        "encrypted_content": "opaque-compaction-payload"
+                    }
+                ]
+            }
+        });
+
+        let (sanitized, diagnostics) = sanitized_completed_event_with_diagnostics(&parsed, &[]);
+        let sanitized_output = sanitized["response"]["output"]
+            .as_array()
+            .expect("sanitized output array");
+
+        assert_eq!(diagnostics, CompletedSanitizationDiagnostics::default());
+        assert_eq!(sanitized_output.len(), 1);
+        assert_eq!(sanitized_output[0]["type"], "compaction");
+        assert_eq!(sanitized_output[0]["id"], "compaction-1");
+        assert_eq!(sanitized_output[0]["encrypted_content"], "opaque-compaction-payload");
+    }
+
+    #[test]
+    fn sanitized_completed_event_removes_internal_function_calls_but_preserves_compaction() {
         let encrypted_content = "opaque-compaction-payload";
         let internal_arguments = "{\"token\":\"secret\"}";
         let visible_text = vec![VisibleAssistantText {
@@ -1801,12 +1829,15 @@ mod tests {
             diagnostics,
             CompletedSanitizationDiagnostics {
                 sanitized_internal_function_call_count: 1,
-                sanitized_compaction_count: 1,
+                sanitized_compaction_count: 0,
                 completed_visible_message_count: 1,
             }
         );
-        assert_eq!(sanitized_output.len(), 1);
-        assert_eq!(sanitized_output[0]["type"], "message");
+        assert_eq!(sanitized_output.len(), 2);
+        assert_eq!(sanitized_output[0]["type"], "compaction");
+        assert_eq!(sanitized_output[0]["id"], "compaction-1");
+        assert_eq!(sanitized_output[0]["encrypted_content"], encrypted_content);
+        assert_eq!(sanitized_output[1]["type"], "message");
         assert!(!diagnostics_debug.contains(encrypted_content));
         assert!(!diagnostics_debug.contains(internal_arguments));
     }
@@ -1859,17 +1890,19 @@ mod tests {
             diagnostics,
             CompletedSanitizationDiagnostics {
                 sanitized_internal_function_call_count: 1,
-                sanitized_compaction_count: 1,
+                sanitized_compaction_count: 0,
                 completed_visible_message_count: 0,
             }
         );
-        assert_eq!(sanitized_output.len(), 3);
+        assert_eq!(sanitized_output.len(), 4);
         assert_eq!(sanitized_output[0]["id"], "fc-external");
         assert_eq!(sanitized_output[0]["name"], "apply_patch");
         assert_eq!(sanitized_output[1]["id"], "img-1");
         assert_eq!(sanitized_output[1]["type"], "image_generation_call");
         assert_eq!(sanitized_output[2]["id"], "ctx-1");
         assert_eq!(sanitized_output[2]["type"], "context");
+        assert_eq!(sanitized_output[3]["id"], "cmp-1");
+        assert_eq!(sanitized_output[3]["type"], "compaction");
     }
 
     #[test]

@@ -3400,7 +3400,7 @@ async fn compaction_output_item_done_is_forwarded_downstream() {
 }
 
 #[tokio::test]
-async fn completed_with_compaction_and_assistant_text_sanitizes_completed_output() {
+async fn completed_response_preserves_assistant_text_and_compaction_output() {
     let capture = capture_compaction_stream("name").await;
 
     assert_eq!(
@@ -3425,6 +3425,12 @@ async fn completed_with_compaction_and_assistant_text_sanitizes_completed_output
                 "id": "response-compaction",
                 "output": [
                     {
+                        "id": "cmp_1",
+                        "type": "compaction",
+                        "name": "threadline_echo",
+                        "encrypted_content": "opaque-completed"
+                    },
+                    {
                         "type": "message",
                         "role": "assistant",
                         "content": [
@@ -3438,6 +3444,32 @@ async fn completed_with_compaction_and_assistant_text_sanitizes_completed_output
             }
         })
     );
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn completed_response_preserves_compaction_output() {
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-completed-compaction-only",
+            "output": [
+                {
+                    "id": "cmp-completed-only",
+                    "type": "compaction",
+                    "tool_name": "threadline_echo",
+                    "encrypted_content": "opaque-completed-only"
+                }
+            ]
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+
+    assert_eq!(capture.downstream_events.len(), 1);
+    assert!(output_text_delta_strings(&capture.downstream_events).is_empty());
+    assert_eq!(capture.downstream_events[0].event, "response.completed");
+    assert_eq!(capture.downstream_events[0].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
@@ -3506,6 +3538,32 @@ async fn compaction_output_item_done_counts_as_observable_output_when_forwarded(
         })
     );
     assert_done_frame(frames[2]);
+}
+
+#[tokio::test]
+async fn compaction_only_completed_output_counts_as_observable_output() {
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-compaction-observable-only",
+            "output": [
+                {
+                    "id": "cmp-observable-only",
+                    "type": "compaction",
+                    "name": "threadline_echo",
+                    "encrypted_content": "opaque-observable-only"
+                }
+            ]
+        }
+    });
+
+    let capture = capture_completed_output_stream(vec![completed_event.clone()]).await;
+
+    assert_eq!(capture.downstream_events.len(), 1);
+    assert_eq!(capture.downstream_events[0].event, "response.completed");
+    assert_eq!(capture.downstream_events[0].payload, completed_event);
+    assert_ne!(capture.downstream_events[0].event, "response.failed");
+    assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
 #[tokio::test]
@@ -3675,6 +3733,11 @@ async fn completed_without_visible_message_inserts_synthetic_assistant_message_f
             "response": {
                 "id": "response-synthetic-completed-message",
                 "output": [
+                    {
+                        "id": "cmp-1",
+                        "type": "compaction",
+                        "encrypted_content": "opaque"
+                    },
                     {
                         "id": "assistant-item-done-only",
                         "type": "message",
@@ -3917,8 +3980,8 @@ async fn no_observable_output_diagnostics_do_not_log_arguments_or_encrypted_cont
                     "arguments": raw_arguments
                 },
                 {
-                    "id": "compaction-internal-only",
-                    "type": "compaction",
+                    "id": "state-marker-internal-only",
+                    "type": "state_marker",
                     "encrypted_content": encrypted_content
                 }
             ]
@@ -3945,7 +4008,7 @@ async fn no_observable_output_diagnostics_do_not_log_arguments_or_encrypted_cont
     assert!(guard_line.contains(response_id));
     assert!(guard_line.contains("completed_output_item_types"));
     assert!(guard_line.contains("function_call"));
-    assert!(guard_line.contains("compaction"));
+    assert!(guard_line.contains("state_marker"));
     assert!(!guard_line.contains(raw_arguments));
     assert!(!guard_line.contains(encrypted_content));
     assert!(!guard_line.contains("arguments="));
@@ -3953,7 +4016,7 @@ async fn no_observable_output_diagnostics_do_not_log_arguments_or_encrypted_cont
 }
 
 #[tokio::test]
-async fn external_tool_call_only_response_completed_remains_successful() {
+async fn external_function_call_completed_output_remains_visible() {
     let tool_done_event = json!({
         "type": "response.output_item.done",
         "output_index": 0,
@@ -4024,7 +4087,7 @@ async fn unknown_marker_like_completed_output_remains_non_observable() {
 }
 
 #[tokio::test]
-async fn internal_only_completed_output_emits_response_failed_without_marker() {
+async fn internal_function_call_completed_output_remains_sanitized_and_non_observable() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -4144,7 +4207,7 @@ async fn auxiliary_summary_compaction_only_completed_preserves_transient_behavio
 
     assert_eq!(frames.len(), 2);
     assert_eq!(event, "response.completed");
-    assert_eq!(payload["response"]["id"], "response-summary");
+    assert_eq!(payload, completed_event);
     assert_done_frame(frames[1]);
 
     let rejected = post_responses(
