@@ -199,10 +199,7 @@ mod tests {
                 "summary": "auto"
             })
         );
-        assert_eq!(
-            payload["include"],
-            json!(["reasoning.encrypted_content"])
-        );
+        assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
         assert!(payload.get("max_output_tokens").is_none());
         assert!(payload.get("max_tokens").is_none());
         assert!(payload.get("max_completion_tokens").is_none());

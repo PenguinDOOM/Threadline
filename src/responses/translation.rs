@@ -1782,7 +1782,10 @@ mod tests {
         assert_eq!(sanitized_output.len(), 1);
         assert_eq!(sanitized_output[0]["type"], "compaction");
         assert_eq!(sanitized_output[0]["id"], "compaction-1");
-        assert_eq!(sanitized_output[0]["encrypted_content"], "opaque-compaction-payload");
+        assert_eq!(
+            sanitized_output[0]["encrypted_content"],
+            "opaque-compaction-payload"
+        );
     }
 
     #[test]
