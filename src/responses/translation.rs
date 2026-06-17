@@ -954,10 +954,6 @@ fn sanitized_completed_event_with_diagnostics(
     let mut final_output = original_output
         .iter()
         .filter_map(|item| match item.get("type").and_then(Value::as_str) {
-            Some("compaction") => {
-                diagnostics.sanitized_compaction_count += 1;
-                None
-            }
             Some("function_call")
                 if item
                     .get("name")
@@ -975,8 +971,7 @@ fn sanitized_completed_event_with_diagnostics(
     let has_visible_assistant_message = final_output
         .iter()
         .any(assistant_message_has_visible_output_text);
-    let mut output_changed = diagnostics.sanitized_internal_function_call_count > 0
-        || diagnostics.sanitized_compaction_count > 0;
+    let mut output_changed = diagnostics.sanitized_internal_function_call_count > 0;
 
     if !has_visible_assistant_message
         && let Some(message) = synthetic_assistant_message(response_id, visible_text)
