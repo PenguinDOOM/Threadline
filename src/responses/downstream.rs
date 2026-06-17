@@ -303,6 +303,76 @@ mod tests {
         })
     }
 
+    fn manual_summary_text() -> &'static str {
+        concat!(
+            "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results",
+            "\n\n",
+            "Structure your summary using the enhanced format provided in the system message",
+            "\n",
+            "Include all important tool calls and their results"
+        )
+    }
+
+    fn manual_summary_input_item() -> Value {
+        json!({
+            "type": "message",
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": manual_summary_text()
+                }
+            ]
+        })
+    }
+
+    fn manual_simple_summary_text() -> &'static str {
+        concat!(
+            "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results",
+            "\n\n",
+            "Include all important tool calls and their results"
+        )
+    }
+
+    fn manual_simple_summary_input_item() -> Value {
+        json!({
+            "type": "message",
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": manual_simple_summary_text()
+                }
+            ]
+        })
+    }
+
+    fn simple_history_context_text() -> &'static str {
+        "The following is a compressed version of the preceeding history in the current conversation"
+    }
+
+    fn simple_history_context_input_item() -> Value {
+        json!({
+            "type": "message",
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": simple_history_context_text()
+                }
+            ]
+        })
+    }
+
+    fn classify_input(input: Vec<Value>) -> DownstreamRequestClassification {
+        parse_downstream_request(json!({
+            "previous_response_id": "resp_123",
+            "input": input
+        }))
+        .expect("parse request")
+        .classification
+    }
+
     fn sanitized_observed_auxiliary_summary_request() -> Value {
         json!({
             "model": "gpt-5.4",
@@ -484,6 +554,173 @@ mod tests {
             request.classification,
             DownstreamRequestClassification::Normal
         );
+    }
+
+    #[test]
+    fn parse_downstream_request_classifies_manual_full_summary_prompt_fingerprints() {
+        assert_eq!(
+            classify_input(vec![
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Continue from the earlier answer."
+                        }
+                    ]
+                }),
+                manual_summary_input_item(),
+            ]),
+            DownstreamRequestClassification::AuxiliarySummary
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_classifies_manual_simple_summary_prompt_fingerprints() {
+        assert_eq!(
+            classify_input(vec![
+                manual_simple_summary_input_item(),
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Acknowledge the compaction request."
+                        }
+                    ]
+                }),
+            ]),
+            DownstreamRequestClassification::AuxiliarySummary
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_user_role_manual_summary_quote_only() {
+        assert_eq!(
+            classify_input(vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Quoted prompt: {}", manual_summary_text())
+                    }
+                ]
+            })]),
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_classifies_auto_background_compaction_in_non_final_shapes() {
+        for (name, input) in [
+            (
+                "auto_summary_followed_by_user_message",
+                vec![
+                    auxiliary_summary_input_item(),
+                    json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Please keep this request moving."
+                            }
+                        ]
+                    }),
+                ],
+            ),
+            (
+                "auto_summary_before_non_message_item",
+                vec![
+                    auxiliary_summary_input_item(),
+                    json!({
+                        "type": "input_text",
+                        "text": "Resume after compaction."
+                    }),
+                ],
+            ),
+        ] {
+            assert_eq!(
+                classify_input(input),
+                DownstreamRequestClassification::AuxiliarySummary,
+                "fixture should classify as auxiliary summary: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_downstream_request_classifies_simple_history_context_only_with_summary_prompt() {
+        for (name, input) in [
+            (
+                "simple_history_plus_manual_summary_prompt",
+                vec![simple_history_context_input_item(), manual_summary_input_item()],
+            ),
+            (
+                "simple_history_plus_auto_summary_prompt",
+                vec![simple_history_context_input_item(), auxiliary_summary_input_item()],
+            ),
+        ] {
+            assert_eq!(
+                classify_input(input),
+                DownstreamRequestClassification::AuxiliarySummary,
+                "fixture should classify as auxiliary summary: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_downstream_request_keeps_ordinary_and_quoted_summary_shapes_normal() {
+        for (name, input) in [
+            (
+                "ordinary_user_prompt",
+                vec![json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Please continue the earlier task."
+                        }
+                    ]
+                })],
+            ),
+            (
+                "simple_history_only_context",
+                vec![simple_history_context_input_item()],
+            ),
+            (
+                "user_role_full_prompt_quote_with_simple_history_context",
+                vec![
+                    simple_history_context_input_item(),
+                    json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": concat!(
+                                    "Quoted prompt: ",
+                                    "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results",
+                                    "\n\n",
+                                    "Structure your summary using the enhanced format provided in the system message",
+                                    "\n",
+                                    "Include all important tool calls and their results"
+                                )
+                            }
+                        ]
+                    }),
+                ],
+            ),
+        ] {
+            assert_eq!(
+                classify_input(input),
+                DownstreamRequestClassification::Normal,
+                "fixture should remain normal: {name}"
+            );
+        }
     }
 
     #[test]
