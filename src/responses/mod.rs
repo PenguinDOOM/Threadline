@@ -42,11 +42,39 @@ pub async fn responses_handler(
     validate_request_model(&request.payload)?;
     let auth = state.services.auth_provider().load()?;
     let classification = request.classification;
+    let routing_diagnostics = request.routing_diagnostics();
     let previous_response_id_present = request.previous_response_id.is_some();
     let context_management_present = request.payload.contains_key("context_management");
     debug!(
         request_class = request_class_label(classification),
-        previous_response_id_present, context_management_present, "responses_request_routed"
+        previous_response_id_present,
+        context_management_present,
+        manual_summary_prompt_hit = routing_diagnostics.summary_hits.manual_summary_prompt_hit,
+        manual_structure_instruction_hit = routing_diagnostics
+            .summary_hits
+            .manual_structure_instruction_hit,
+        manual_tool_results_instruction_hit = routing_diagnostics
+            .summary_hits
+            .manual_tool_results_instruction_hit,
+        auto_context_too_large_hit = routing_diagnostics.summary_hits.auto_context_too_large_hit,
+        auto_summary_tags_hit = routing_diagnostics.summary_hits.auto_summary_tags_hit,
+        auto_only_task_hit = routing_diagnostics.summary_hits.auto_only_task_hit,
+        simple_history_context_hit = routing_diagnostics.summary_hits.simple_history_context_hit,
+        summary_instruction_like_hit = routing_diagnostics
+            .summary_hits
+            .summary_instruction_like_hit,
+        tool_choice = routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
+        tools_count = routing_diagnostics.tools_count,
+        input_item_count = routing_diagnostics.input_item_count,
+        last_input_role = routing_diagnostics
+            .last_input_role
+            .as_deref()
+            .unwrap_or("none"),
+        last_input_type = routing_diagnostics
+            .last_input_type
+            .as_deref()
+            .unwrap_or("none"),
+        "responses_request_routed"
     );
     let mut upstream_request = request.payload;
     match classification {

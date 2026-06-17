@@ -4,12 +4,20 @@ use serde_json::{Map, Value};
 
 use crate::errors::ThreadlineError;
 
-const SUMMARY_PROMPT_PREFIX: &str =
+const AUTO_CONTEXT_TOO_LARGE_PROMPT: &str =
     "The conversation has grown too large for the context window and must be compacted now";
-const SUMMARY_TAGS_INSTRUCTION: &str =
+const AUTO_SUMMARY_TAGS_INSTRUCTION: &str =
     "Output your summary wrapped in <summary> and </summary> tags";
-const SUMMARY_ONLY_TASK_INSTRUCTION: &str =
+const AUTO_ONLY_TASK_INSTRUCTION: &str =
     "Your ONLY task right now is to produce a comprehensive summary";
+const MANUAL_SUMMARY_PROMPT: &str = "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results";
+const MANUAL_STRUCTURE_INSTRUCTION: &str =
+    "Structure your summary using the enhanced format provided in the system message";
+const MANUAL_TOOL_RESULTS_INSTRUCTION: &str = "Include all important tool calls and their results";
+const SIMPLE_HISTORY_CONTEXT_OBSERVED: &str =
+    "The following is a compressed version of the preceeding history in the current conversation";
+const SIMPLE_HISTORY_CONTEXT_CORRECTED: &str =
+    "The following is a compressed version of the preceding history in the current conversation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum DownstreamRequestClassification {
@@ -24,8 +32,16 @@ pub(super) struct DownstreamResponsesRequest {
     pub(super) previous_response_id: Option<String>,
     #[serde(skip)]
     pub(super) classification: DownstreamRequestClassification,
+    #[serde(skip)]
+    routing_diagnostics: DownstreamRequestRoutingDiagnostics,
     #[serde(flatten)]
     pub(super) payload: serde_json::Map<String, Value>,
+}
+
+impl DownstreamResponsesRequest {
+    pub(super) fn routing_diagnostics(&self) -> &DownstreamRequestRoutingDiagnostics {
+        &self.routing_diagnostics
+    }
 }
 
 pub(super) fn parse_downstream_request(
@@ -33,103 +49,296 @@ pub(super) fn parse_downstream_request(
 ) -> Result<DownstreamResponsesRequest, ThreadlineError> {
     let mut request = serde_json::from_value::<DownstreamResponsesRequest>(payload)
         .map_err(|_| ThreadlineError::InvalidResponsesRequest)?;
-    request.classification = classify_request(&request.payload);
+    let routing_diagnostics = collect_request_routing_diagnostics(&request.payload);
+    request.classification = classify_request(&routing_diagnostics);
+    request.routing_diagnostics = routing_diagnostics;
     Ok(request)
 }
 
-fn classify_request(payload: &serde_json::Map<String, Value>) -> DownstreamRequestClassification {
-    if is_auxiliary_summary_request(payload.get("input")) {
+fn classify_request(
+    routing_diagnostics: &DownstreamRequestRoutingDiagnostics,
+) -> DownstreamRequestClassification {
+    if is_auxiliary_summary_request(&routing_diagnostics.summary_hits) {
         DownstreamRequestClassification::AuxiliarySummary
     } else {
         DownstreamRequestClassification::Normal
     }
 }
 
-fn is_auxiliary_summary_request(input: Option<&Value>) -> bool {
+fn is_auxiliary_summary_request(summary_hits: &SummaryFingerprintHits) -> bool {
+    summary_hits.matches_auxiliary_summary()
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct DownstreamRequestRoutingDiagnostics {
+    pub(super) summary_hits: SummaryFingerprintHits,
+    pub(super) tool_choice: Option<String>,
+    pub(super) tools_count: usize,
+    pub(super) input_item_count: usize,
+    pub(super) last_input_role: Option<String>,
+    pub(super) last_input_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct SummaryFingerprintHits {
+    pub(super) manual_summary_prompt_hit: bool,
+    pub(super) manual_structure_instruction_hit: bool,
+    pub(super) manual_tool_results_instruction_hit: bool,
+    pub(super) auto_context_too_large_hit: bool,
+    pub(super) auto_summary_tags_hit: bool,
+    pub(super) auto_only_task_hit: bool,
+    pub(super) simple_history_context_hit: bool,
+    pub(super) summary_instruction_like_hit: bool,
+    manual_summary_prompt_instruction_like: bool,
+    manual_structure_instruction_instruction_like: bool,
+    manual_tool_results_instruction_instruction_like: bool,
+    auto_context_too_large_instruction_like: bool,
+    auto_summary_tags_instruction_like: bool,
+    auto_only_task_instruction_like: bool,
+    simple_history_context_instruction_like: bool,
+}
+
+impl SummaryFingerprintHits {
+    fn matches_auxiliary_summary(&self) -> bool {
+        let manual_primary = self.manual_summary_prompt_instruction_like;
+        let manual_secondary = self.manual_structure_instruction_instruction_like
+            || self.manual_tool_results_instruction_instruction_like
+            || self.simple_history_context_instruction_like;
+        let auto_primary = self.auto_context_too_large_instruction_like;
+        let auto_secondary = self.auto_summary_tags_instruction_like
+            || self.auto_only_task_instruction_like
+            || self.simple_history_context_instruction_like;
+
+        (manual_primary && manual_secondary) || (auto_primary && auto_secondary)
+    }
+
+    fn record_text(&mut self, text: &str, context: SummaryObservationContext<'_>) {
+        let instruction_like = context.is_summary_instruction_like();
+
+        if text.contains(MANUAL_SUMMARY_PROMPT) {
+            self.manual_summary_prompt_hit = true;
+            self.manual_summary_prompt_instruction_like |= instruction_like;
+        }
+        if text.contains(MANUAL_STRUCTURE_INSTRUCTION) {
+            self.manual_structure_instruction_hit = true;
+            self.manual_structure_instruction_instruction_like |= instruction_like;
+        }
+        if text.contains(MANUAL_TOOL_RESULTS_INSTRUCTION) {
+            self.manual_tool_results_instruction_hit = true;
+            self.manual_tool_results_instruction_instruction_like |= instruction_like;
+        }
+        if text.contains(AUTO_CONTEXT_TOO_LARGE_PROMPT) {
+            self.auto_context_too_large_hit = true;
+            self.auto_context_too_large_instruction_like |= instruction_like;
+        }
+        if text.contains(AUTO_SUMMARY_TAGS_INSTRUCTION) {
+            self.auto_summary_tags_hit = true;
+            self.auto_summary_tags_instruction_like |= instruction_like;
+        }
+        if text.contains(AUTO_ONLY_TASK_INSTRUCTION) {
+            self.auto_only_task_hit = true;
+            self.auto_only_task_instruction_like |= instruction_like;
+        }
+        if text.contains(SIMPLE_HISTORY_CONTEXT_OBSERVED)
+            || text.contains(SIMPLE_HISTORY_CONTEXT_CORRECTED)
+        {
+            self.simple_history_context_hit = true;
+            self.simple_history_context_instruction_like |= instruction_like;
+        }
+
+        self.summary_instruction_like_hit |= instruction_like
+            && (self.manual_summary_prompt_instruction_like
+                || self.manual_structure_instruction_instruction_like
+                || self.manual_tool_results_instruction_instruction_like
+                || self.auto_context_too_large_instruction_like
+                || self.auto_summary_tags_instruction_like
+                || self.auto_only_task_instruction_like
+                || self.simple_history_context_instruction_like);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum InputSourceCategory {
+    SummaryInstructionLike,
+    OrdinaryUserContent,
+    #[default]
+    UnknownInputContent,
+}
+
+impl InputSourceCategory {
+    fn from_role(role: Option<&str>) -> Self {
+        match role {
+            Some("system" | "developer") => Self::SummaryInstructionLike,
+            Some("user") => Self::OrdinaryUserContent,
+            Some(_) | None => Self::UnknownInputContent,
+        }
+    }
+
+    fn is_summary_instruction_like(self) -> bool {
+        matches!(self, Self::SummaryInstructionLike)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SummaryObservationContext<'a> {
+    message_role: Option<&'a str>,
+    content_item_type: Option<&'a str>,
+    under_content_array: bool,
+    _final_input_item: bool,
+    source_category: InputSourceCategory,
+}
+
+impl SummaryObservationContext<'_> {
+    fn is_summary_instruction_like(self) -> bool {
+        self.under_content_array
+            && self.content_item_type == Some("input_text")
+            && self.source_category.is_summary_instruction_like()
+    }
+}
+
+fn collect_request_routing_diagnostics(
+    payload: &serde_json::Map<String, Value>,
+) -> DownstreamRequestRoutingDiagnostics {
+    let input = payload.get("input");
+
+    DownstreamRequestRoutingDiagnostics {
+        summary_hits: collect_summary_fingerprints(input),
+        tool_choice: safe_value_type_label(payload.get("tool_choice")),
+        tools_count: payload
+            .get("tools")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        input_item_count: input.map_or(0, input_item_count),
+        last_input_role: input.and_then(last_input_role),
+        last_input_type: input.and_then(last_input_type),
+    }
+}
+
+fn collect_summary_fingerprints(input: Option<&Value>) -> SummaryFingerprintHits {
     let Some(input) = input else {
-        return false;
+        return SummaryFingerprintHits::default();
     };
 
-    let Some(summary_text) = final_summary_instruction_text(input) else {
-        return false;
-    };
-
-    let fingerprints = collect_summary_fingerprints(input);
-    fingerprints.all_present() && text_matches_summary_fingerprints(summary_text)
-}
-
-fn final_summary_instruction_text(input: &Value) -> Option<&str> {
-    let final_item = input.as_array()?.last()?.as_object()?;
-
-    if final_item.get("type")?.as_str()? != "message" {
-        return None;
-    }
-
-    if final_item.get("role")?.as_str()? != "system" {
-        return None;
-    }
-
-    let content = final_item.get("content")?.as_array()?;
-    if content.len() != 1 {
-        return None;
-    }
-
-    let content_item = content.first()?.as_object()?;
-    if content_item.get("type")?.as_str()? != "input_text" {
-        return None;
-    }
-
-    content_item.get("text")?.as_str()
-}
-
-#[derive(Default)]
-struct SummaryFingerprints {
-    has_prompt_prefix: bool,
-    has_summary_tags_instruction: bool,
-    has_summary_only_task_instruction: bool,
-}
-
-impl SummaryFingerprints {
-    fn all_present(&self) -> bool {
-        self.has_prompt_prefix
-            && self.has_summary_tags_instruction
-            && self.has_summary_only_task_instruction
-    }
-
-    fn record_text(&mut self, text: &str) {
-        self.has_prompt_prefix |= text.starts_with(SUMMARY_PROMPT_PREFIX);
-        self.has_summary_tags_instruction |= text.contains(SUMMARY_TAGS_INSTRUCTION);
-        self.has_summary_only_task_instruction |= text.contains(SUMMARY_ONLY_TASK_INSTRUCTION);
-    }
-}
-
-fn collect_summary_fingerprints(value: &Value) -> SummaryFingerprints {
-    let mut fingerprints = SummaryFingerprints::default();
-    collect_summary_fingerprints_into(value, &mut fingerprints);
+    let mut fingerprints = SummaryFingerprintHits::default();
+    collect_summary_fingerprints_into_input(input, &mut fingerprints);
     fingerprints
 }
 
-fn collect_summary_fingerprints_into(value: &Value, fingerprints: &mut SummaryFingerprints) {
+fn collect_summary_fingerprints_into_input(
+    value: &Value,
+    fingerprints: &mut SummaryFingerprintHits,
+) {
     match value {
-        Value::String(text) => fingerprints.record_text(text),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let context = SummaryObservationContext {
+                    _final_input_item: index + 1 == items.len(),
+                    ..SummaryObservationContext::default()
+                };
+                collect_summary_fingerprints_from_input_item(item, context, fingerprints);
+            }
+        }
+        _ => collect_summary_fingerprints_into(
+            value,
+            SummaryObservationContext::default(),
+            fingerprints,
+        ),
+    }
+}
+
+fn collect_summary_fingerprints_from_input_item<'a>(
+    value: &'a Value,
+    mut context: SummaryObservationContext<'a>,
+    fingerprints: &mut SummaryFingerprintHits,
+) {
+    if let Some(item) = value.as_object() {
+        context.content_item_type = item.get("type").and_then(Value::as_str);
+        if context.content_item_type == Some("message") {
+            context.message_role = item.get("role").and_then(Value::as_str);
+            context.source_category = InputSourceCategory::from_role(context.message_role);
+
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for content_item in content {
+                    let mut content_context = context;
+                    content_context.under_content_array = true;
+                    content_context.content_item_type = content_item
+                        .as_object()
+                        .and_then(|object| object.get("type"))
+                        .and_then(Value::as_str);
+                    collect_summary_fingerprints_into(content_item, content_context, fingerprints);
+                }
+                return;
+            }
+        }
+    }
+
+    collect_summary_fingerprints_into(value, context, fingerprints);
+}
+
+fn collect_summary_fingerprints_into<'a>(
+    value: &'a Value,
+    context: SummaryObservationContext<'a>,
+    fingerprints: &mut SummaryFingerprintHits,
+) {
+    match value {
+        Value::String(text) => fingerprints.record_text(text, context),
         Value::Array(values) => {
             for value in values {
-                collect_summary_fingerprints_into(value, fingerprints);
+                collect_summary_fingerprints_into(value, context, fingerprints);
             }
         }
         Value::Object(values) => {
             for value in values.values() {
-                collect_summary_fingerprints_into(value, fingerprints);
+                collect_summary_fingerprints_into(value, context, fingerprints);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-fn text_matches_summary_fingerprints(text: &str) -> bool {
-    text.starts_with(SUMMARY_PROMPT_PREFIX)
-        && text.contains(SUMMARY_TAGS_INSTRUCTION)
-        && text.contains(SUMMARY_ONLY_TASK_INSTRUCTION)
+fn input_item_count(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => items.len(),
+        Value::Null => 0,
+        _ => 1,
+    }
+}
+
+fn last_input_role(value: &Value) -> Option<String> {
+    let value = match value {
+        Value::Array(items) => items.last()?,
+        _ => value,
+    };
+
+    value
+        .as_object()
+        .and_then(|object| object.get("role"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn last_input_type(value: &Value) -> Option<String> {
+    let value = match value {
+        Value::Array(items) => items.last()?,
+        _ => value,
+    };
+
+    safe_value_type_label(Some(value))
+}
+
+fn safe_value_type_label(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(_) => Some("string".to_string()),
+        Value::Array(_) => Some("array".to_string()),
+        Value::Object(object) => object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some("object".to_string())),
+        Value::Bool(_) => Some("bool".to_string()),
+        Value::Number(_) => Some("number".to_string()),
+        Value::Null => Some("null".to_string()),
+    }
 }
 
 pub(super) fn sse_payload_chunk(event: &str, payload: &str) -> Bytes {
@@ -656,11 +865,17 @@ mod tests {
         for (name, input) in [
             (
                 "simple_history_plus_manual_summary_prompt",
-                vec![simple_history_context_input_item(), manual_summary_input_item()],
+                vec![
+                    simple_history_context_input_item(),
+                    manual_summary_input_item(),
+                ],
             ),
             (
                 "simple_history_plus_auto_summary_prompt",
-                vec![simple_history_context_input_item(), auxiliary_summary_input_item()],
+                vec![
+                    simple_history_context_input_item(),
+                    auxiliary_summary_input_item(),
+                ],
             ),
         ] {
             assert_eq!(
