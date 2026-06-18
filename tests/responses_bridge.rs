@@ -1118,8 +1118,25 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
         .expect("summary routing diagnostics trace line");
     assert!(summary_line.contains("previous_response_id_present=true"));
     assert!(summary_line.contains("context_management_present=true"));
+    assert!(summary_line.contains("tool_choice=\"none\""));
+    assert!(summary_line.contains("tools_count=2"));
+    assert!(summary_line.contains("input_item_count=2"));
+    assert!(summary_line.contains("last_input_role=\"system\""));
+    assert!(summary_line.contains("last_input_type=\"message\""));
+    assert!(summary_line.contains("manual_summary_prompt_hit=false"));
+    assert!(summary_line.contains("manual_structure_instruction_hit=false"));
+    assert!(summary_line.contains("manual_tool_results_instruction_hit=false"));
+    assert!(summary_line.contains("auto_context_too_large_hit=true"));
+    assert!(summary_line.contains("auto_summary_tags_hit=true"));
+    assert!(summary_line.contains("auto_only_task_hit=true"));
+    assert!(summary_line.contains("simple_history_context_hit=false"));
+    assert!(summary_line.contains("new_auto_detailed_summary_hit=false"));
+    assert!(summary_line.contains("new_auto_user_history_hit=false"));
+    assert!(summary_line.contains("new_auto_user_final_summary_prompt_hit=false"));
+    assert!(summary_line.contains("summary_instruction_like_hit=true"));
     assert!(!summary_line.contains("response-1"));
     assert!(!summary_line.contains(auxiliary_summary_text()));
+    assert!(!summary_line.contains("{\"model\":\"gpt-5.4\""));
 
     let normal_line = logs
         .lines()
@@ -1129,8 +1146,25 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
         .expect("normal routing diagnostics trace line");
     assert!(normal_line.contains("previous_response_id_present=false"));
     assert!(normal_line.contains("context_management_present=false"));
+    assert!(normal_line.contains("tool_choice=\"none\""));
+    assert!(normal_line.contains("tools_count=0"));
+    assert!(normal_line.contains("input_item_count=1"));
+    assert!(normal_line.contains("last_input_role=\"none\""));
+    assert!(normal_line.contains("last_input_type=\"string\""));
+    assert!(normal_line.contains("manual_summary_prompt_hit=false"));
+    assert!(normal_line.contains("manual_structure_instruction_hit=false"));
+    assert!(normal_line.contains("manual_tool_results_instruction_hit=false"));
+    assert!(normal_line.contains("auto_context_too_large_hit=false"));
+    assert!(normal_line.contains("auto_summary_tags_hit=false"));
+    assert!(normal_line.contains("auto_only_task_hit=false"));
+    assert!(normal_line.contains("simple_history_context_hit=false"));
+    assert!(normal_line.contains("new_auto_detailed_summary_hit=false"));
+    assert!(normal_line.contains("new_auto_user_history_hit=false"));
+    assert!(normal_line.contains("new_auto_user_final_summary_prompt_hit=false"));
+    assert!(normal_line.contains("summary_instruction_like_hit=false"));
     assert!(!normal_line.contains(raw_request_secret));
     assert!(!normal_line.contains(raw_request_account));
+    assert!(!normal_line.contains("{\"model\":\"gpt-5.4\""));
 }
 
 #[tokio::test]
@@ -2006,14 +2040,39 @@ async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
     let logs = trace_guard.logs();
     let rerouted_line = logs
         .lines()
-        .find(|line| line.contains("retained_session_conflict_rerouted"))
+        .rev()
+        .find(|line| {
+            line.contains("retained_session_conflict_rerouted")
+                && line.contains("fallback_summary_input_hit=true")
+                && line.contains("tools_count=2")
+                && line.contains("input_item_count=2")
+        })
         .expect("rerouted diagnostics trace line");
+    assert!(rerouted_line.contains("request_class=\"normal\""));
+    assert!(rerouted_line.contains("previous_response_id_present=true"));
+    assert!(rerouted_line.contains("context_management_present=true"));
     assert!(rerouted_line.contains("manual_summary_prompt_hit=true"));
+    assert!(rerouted_line.contains("manual_structure_instruction_hit=true"));
+    assert!(rerouted_line.contains("manual_tool_results_instruction_hit=true"));
+    assert!(rerouted_line.contains("auto_context_too_large_hit=false"));
+    assert!(rerouted_line.contains("auto_summary_tags_hit=false"));
+    assert!(rerouted_line.contains("auto_only_task_hit=false"));
+    assert!(rerouted_line.contains("simple_history_context_hit=false"));
+    assert!(rerouted_line.contains("new_auto_detailed_summary_hit=false"));
+    assert!(rerouted_line.contains("new_auto_user_history_hit=false"));
+    assert!(rerouted_line.contains("new_auto_user_final_summary_prompt_hit=false"));
+    assert!(rerouted_line.contains("summary_instruction_like_hit=false"));
     assert!(rerouted_line.contains("fallback_summary_input_hit=true"));
+    assert!(rerouted_line.contains("tool_choice=\"none\""));
     assert!(rerouted_line.contains("tools_count=2"));
+    assert!(rerouted_line.contains("input_item_count=2"));
+    assert!(rerouted_line.contains("last_input_role=\"none\""));
+    assert!(rerouted_line.contains("last_input_type=\"input_text\""));
     assert!(!rerouted_line.contains(raw_request_secret));
     assert!(!rerouted_line.contains(raw_request_account));
     assert!(!rerouted_line.contains(manual_summary_text()));
+    assert!(!rerouted_line.contains("response-1"));
+    assert!(!rerouted_line.contains("{\"model\":\"gpt-5.4\""));
 }
 
 #[tokio::test]

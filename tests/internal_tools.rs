@@ -188,6 +188,79 @@ fn auxiliary_summary_request_with_tools(tools: Vec<Value>) -> Value {
     })
 }
 
+fn new_auto_system_summary_text() -> &'static str {
+    "Your task is to create a comprehensive, detailed summary of the entire conversation that captures all essential information needed to seamlessly continue the work without any loss of context"
+}
+
+fn new_auto_compressed_history_text() -> &'static str {
+    concat!(
+        "The following is a compressed version of the preceeding history in the current conversation. ",
+        "The first message is kept, some history may be truncated after that:"
+    )
+}
+
+fn new_auto_final_summary_prompt_text() -> &'static str {
+    concat!(
+        "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results that triggered this summarization. ",
+        "Structure your summary using the enhanced format provided in the system message.\n",
+        "Focus particularly on:\n",
+        "- The specific agent commands/tools that were just executed\n",
+        "- The results returned from these recent tool calls (truncate if very long but preserve key information)\n",
+        "- What the agent was actively working on when the token budget was exceeded\n",
+        "- How these recent operations connect to the overall user goals\n",
+        "Include all important tool calls and their results as part of the appropriate sections, with special emphasis on the most recent operations."
+    )
+}
+
+fn new_auto_summary_request_with_tools(tools: Vec<Value>) -> Value {
+    json!({
+        "model": "gpt-5.4",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Continue from the earlier answer."
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": new_auto_system_summary_text()
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": new_auto_compressed_history_text()
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": new_auto_final_summary_prompt_text()
+                    }
+                ]
+            }
+        ],
+        "tools": tools
+    })
+}
+
 fn shell_program() -> String {
     if cfg!(windows) {
         "pwsh".to_string()
@@ -1107,6 +1180,69 @@ async fn summary_request_does_not_execute_threadline_tool_call_events() {
     );
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("call-1"));
+}
+
+#[tokio::test]
+async fn summary_request_new_auto_shape_does_not_inject_or_execute_threadline_tools() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        new_auto_summary_request_with_tools(vec![
+            downstream_function_tool("downstream_tool"),
+            downstream_function_tool("threadline_echo"),
+        ]),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let first_request: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("initial request"),
+    ))
+    .expect("initial request json");
+    let tools = first_request["tools"].as_array().expect("tools array");
+
+    assert!(tools.iter().any(|tool| tool["name"] == "downstream_tool"));
+    assert!(
+        !tools.iter().any(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("threadline_"))
+        }),
+        "expected new auto summary request to strip threadline_* tools before streaming"
+    );
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-summary-new-auto"}}"#)
+        .await;
+
+    let maybe_followup =
+        tokio::time::timeout(Duration::from_millis(100), server.recv_client_message()).await;
+    assert!(
+        !matches!(maybe_followup, Ok(Some(_))),
+        "expected new auto summary request to avoid internal tool follow-up traffic"
+    );
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("response.output_item.done"));
 }
 
 #[tokio::test]

@@ -72,6 +72,15 @@ pub async fn responses_handler(
         auto_summary_tags_hit = routing_diagnostics.summary_hits.auto_summary_tags_hit,
         auto_only_task_hit = routing_diagnostics.summary_hits.auto_only_task_hit,
         simple_history_context_hit = routing_diagnostics.summary_hits.simple_history_context_hit,
+        new_auto_detailed_summary_hit = routing_diagnostics
+            .summary_hits
+            .new_auto_detailed_summary_hit,
+        new_auto_user_history_hit = routing_diagnostics
+            .summary_hits
+            .new_auto_user_history_hit,
+        new_auto_user_final_summary_prompt_hit = routing_diagnostics
+            .summary_hits
+            .new_auto_user_final_summary_prompt_hit,
         summary_instruction_like_hit = routing_diagnostics
             .summary_hits
             .summary_instruction_like_hit,
@@ -142,6 +151,7 @@ pub async fn responses_handler(
                     }
 
                     debug!(
+                        request_class = request_class_label(classification),
                         previous_response_id_present,
                         context_management_present,
                         manual_summary_prompt_hit =
@@ -159,6 +169,15 @@ pub async fn responses_handler(
                         auto_only_task_hit = routing_diagnostics.summary_hits.auto_only_task_hit,
                         simple_history_context_hit =
                             routing_diagnostics.summary_hits.simple_history_context_hit,
+                        new_auto_detailed_summary_hit = routing_diagnostics
+                            .summary_hits
+                            .new_auto_detailed_summary_hit,
+                        new_auto_user_history_hit = routing_diagnostics
+                            .summary_hits
+                            .new_auto_user_history_hit,
+                        new_auto_user_final_summary_prompt_hit = routing_diagnostics
+                            .summary_hits
+                            .new_auto_user_final_summary_prompt_hit,
                         summary_instruction_like_hit = routing_diagnostics
                             .summary_hits
                             .summary_instruction_like_hit,
