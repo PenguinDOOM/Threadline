@@ -10,6 +10,7 @@ const AUTO_SUMMARY_TAGS_INSTRUCTION: &str =
     "Output your summary wrapped in <summary> and </summary> tags";
 const AUTO_ONLY_TASK_INSTRUCTION: &str =
     "Your ONLY task right now is to produce a comprehensive summary";
+const NEW_AUTO_DETAILED_SUMMARY_INSTRUCTION: &str = "Your task is to create a comprehensive, detailed summary of the entire conversation that captures all essential information needed to seamlessly continue the work without any loss of context";
 const MANUAL_SUMMARY_PROMPT: &str = "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results";
 const MANUAL_STRUCTURE_INSTRUCTION: &str =
     "Structure your summary using the enhanced format provided in the system message";
@@ -102,6 +103,9 @@ pub(super) struct SummaryFingerprintHits {
     pub(super) auto_summary_tags_hit: bool,
     pub(super) auto_only_task_hit: bool,
     pub(super) simple_history_context_hit: bool,
+    pub(super) new_auto_detailed_summary_hit: bool,
+    pub(super) new_auto_user_history_hit: bool,
+    pub(super) new_auto_user_final_summary_prompt_hit: bool,
     pub(super) summary_instruction_like_hit: bool,
     manual_summary_prompt_instruction_like: bool,
     manual_structure_instruction_instruction_like: bool,
@@ -110,6 +114,7 @@ pub(super) struct SummaryFingerprintHits {
     auto_summary_tags_instruction_like: bool,
     auto_only_task_instruction_like: bool,
     simple_history_context_instruction_like: bool,
+    new_auto_detailed_summary_instruction_like: bool,
 }
 
 impl SummaryFingerprintHits {
@@ -122,12 +127,36 @@ impl SummaryFingerprintHits {
         let auto_secondary = self.auto_summary_tags_instruction_like
             || self.auto_only_task_instruction_like
             || self.simple_history_context_instruction_like;
+        let new_auto = self.new_auto_detailed_summary_instruction_like
+            && self.new_auto_user_history_hit
+            && self.new_auto_user_final_summary_prompt_hit;
 
-        (manual_primary && manual_secondary) || (auto_primary && auto_secondary)
+        (manual_primary && manual_secondary) || (auto_primary && auto_secondary) || new_auto
     }
 
     fn record_text(&mut self, text: &str, context: SummaryObservationContext<'_>) {
         self.record_text_with_instruction_like(text, context.is_summary_instruction_like());
+
+        if text.contains(NEW_AUTO_DETAILED_SUMMARY_INSTRUCTION) {
+            self.new_auto_detailed_summary_hit = true;
+            self.new_auto_detailed_summary_instruction_like |=
+                context.is_summary_instruction_like();
+        }
+
+        if context.is_user_input_text()
+            && (text.contains(SIMPLE_HISTORY_CONTEXT_OBSERVED)
+                || text.contains(SIMPLE_HISTORY_CONTEXT_CORRECTED))
+        {
+            self.new_auto_user_history_hit = true;
+        }
+
+        if context.is_user_input_text()
+            && text.contains(MANUAL_SUMMARY_PROMPT)
+            && text.contains(MANUAL_STRUCTURE_INSTRUCTION)
+            && text.contains(MANUAL_TOOL_RESULTS_INSTRUCTION)
+        {
+            self.new_auto_user_final_summary_prompt_hit = true;
+        }
     }
 
     fn record_text_with_instruction_like(&mut self, text: &str, instruction_like: bool) {
@@ -219,6 +248,12 @@ impl SummaryObservationContext<'_> {
         self.under_content_array
             && self.content_item_type == Some("input_text")
             && self.source_category.is_summary_instruction_like()
+    }
+
+    fn is_user_input_text(self) -> bool {
+        self.under_content_array
+            && self.content_item_type == Some("input_text")
+            && self.source_category == InputSourceCategory::OrdinaryUserContent
     }
 }
 
@@ -634,6 +669,60 @@ mod tests {
         })
     }
 
+    fn new_auto_system_summary_text() -> &'static str {
+        "Your task is to create a comprehensive, detailed summary of the entire conversation that captures all essential information needed to seamlessly continue the work without any loss of context"
+    }
+
+    fn new_auto_compressed_history_text() -> &'static str {
+        "The following is a compressed version of the preceeding history in the current conversation"
+    }
+
+    fn new_auto_compressed_history_text_corrected() -> &'static str {
+        "The following is a compressed version of the preceding history in the current conversation"
+    }
+
+    fn new_auto_final_summary_prompt_text() -> &'static str {
+        concat!(
+            "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results that triggered this summarization.",
+            " Structure your summary using the enhanced format provided in the system message.\n",
+            "Focus particularly on:\n",
+            "- The specific agent commands/tools that were just executed\n",
+            "- The results returned from these recent tool calls (truncate if very long but preserve key information)\n",
+            "- What the agent was actively working on when the token budget was exceeded\n",
+            "- How these recent operations connect to the overall user goals\n",
+            "Include all important tool calls and their results as part of the appropriate sections, with special emphasis on the most recent operations."
+        )
+    }
+
+    fn input_text_message(role: &str, text: &str) -> Value {
+        json!({
+            "type": "message",
+            "role": role,
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": text
+                }
+            ]
+        })
+    }
+
+    fn new_auto_system_summary_input_item() -> Value {
+        input_text_message("system", new_auto_system_summary_text())
+    }
+
+    fn new_auto_compressed_history_input_item() -> Value {
+        input_text_message("user", new_auto_compressed_history_text())
+    }
+
+    fn new_auto_compressed_history_input_item_corrected() -> Value {
+        input_text_message("user", new_auto_compressed_history_text_corrected())
+    }
+
+    fn new_auto_final_summary_prompt_input_item() -> Value {
+        input_text_message("user", new_auto_final_summary_prompt_text())
+    }
+
     fn classify_input(input: Vec<Value>) -> DownstreamRequestClassification {
         parse_downstream_request(json!({
             "previous_response_id": "resp_123",
@@ -880,6 +969,139 @@ mod tests {
                 ]
             })]),
             DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_classifies_new_auto_compaction_prompt_fingerprints() {
+        assert_eq!(
+            classify_input(vec![
+                new_auto_system_summary_input_item(),
+                new_auto_compressed_history_input_item(),
+                new_auto_final_summary_prompt_input_item(),
+            ]),
+            DownstreamRequestClassification::AuxiliarySummary
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_new_auto_user_quote_only() {
+        assert_eq!(
+            classify_input(vec![
+                new_auto_compressed_history_input_item(),
+                new_auto_final_summary_prompt_input_item(),
+            ]),
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_new_auto_partial_fingerprints() {
+        for (name, input) in [
+            (
+                "system_plus_history_only",
+                vec![
+                    new_auto_system_summary_input_item(),
+                    new_auto_compressed_history_input_item(),
+                ],
+            ),
+            (
+                "system_plus_final_prompt_only",
+                vec![
+                    new_auto_system_summary_input_item(),
+                    new_auto_final_summary_prompt_input_item(),
+                ],
+            ),
+            (
+                "history_plus_final_prompt_only",
+                vec![
+                    new_auto_compressed_history_input_item(),
+                    new_auto_final_summary_prompt_input_item(),
+                ],
+            ),
+            ("system_only", vec![new_auto_system_summary_input_item()]),
+            (
+                "history_only",
+                vec![new_auto_compressed_history_input_item()],
+            ),
+            (
+                "final_prompt_only",
+                vec![new_auto_final_summary_prompt_input_item()],
+            ),
+        ] {
+            assert_eq!(
+                classify_input(input),
+                DownstreamRequestClassification::Normal,
+                "fixture should remain normal: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_new_auto_fingerprints_outside_input_text() {
+        let request = parse_downstream_request(json!({
+            "previous_response_id": "resp_123",
+            "metadata": {
+                "system_prompt": new_auto_system_summary_text(),
+                "history": new_auto_compressed_history_text(),
+                "final_prompt": new_auto_final_summary_prompt_text()
+            },
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "echo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "summary": {
+                                "type": "string",
+                                "description": new_auto_final_summary_prompt_text()
+                            }
+                        }
+                    }
+                }
+            ],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": new_auto_system_summary_text()
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Please continue the earlier task."
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("parse request");
+
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_classifies_new_auto_compaction_prompt_with_corrected_history_spelling()
+     {
+        assert_eq!(
+            classify_input(vec![
+                new_auto_system_summary_input_item(),
+                new_auto_compressed_history_input_item_corrected(),
+                new_auto_final_summary_prompt_input_item(),
+            ]),
+            DownstreamRequestClassification::AuxiliarySummary
         );
     }
 
