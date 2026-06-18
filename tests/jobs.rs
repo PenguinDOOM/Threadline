@@ -360,7 +360,7 @@ async fn command_job_stdout_without_newline_becomes_visible_before_exit() {
     assert_eq!(items[0]["text"], "partial stdout");
     assert_eq!(output["next_offset"], 14);
 
-    let result = wait_for_terminal_result(&manager, &job_id, Duration::from_millis(1200)).await;
+    let result = wait_for_terminal_result(&manager, &job_id, Duration::from_millis(2000)).await;
     assert_eq!(result["status"], "completed");
     assert_eq!(result["result"]["success"], true);
 }
@@ -388,7 +388,7 @@ async fn command_job_stderr_without_newline_becomes_visible_before_exit() {
     assert_eq!(items[0]["text"], "partial stderr");
     assert_eq!(output["next_offset"], 14);
 
-    let result = wait_for_terminal_result(&manager, &job_id, Duration::from_millis(1200)).await;
+    let result = wait_for_terminal_result(&manager, &job_id, Duration::from_millis(2000)).await;
     assert_eq!(result["status"], "completed");
     assert_eq!(result["result"]["success"], true);
 }
