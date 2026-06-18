@@ -271,6 +271,79 @@ fn auxiliary_summary_text() -> &'static str {
     )
 }
 
+fn manual_summary_text() -> &'static str {
+    concat!(
+        "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results",
+        "\n\n",
+        "Structure your summary using the enhanced format provided in the system message",
+        "\n",
+        "Include all important tool calls and their results"
+    )
+}
+
+fn manual_simple_summary_text() -> &'static str {
+    concat!(
+        "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results",
+        "\n\n",
+        "Include all important tool calls and their results"
+    )
+}
+
+fn simple_history_context_text() -> &'static str {
+    "The following is a compressed version of the preceeding history in the current conversation"
+}
+
+#[derive(Clone, Copy)]
+enum SummaryRequestShape {
+    Auto,
+    ManualFull,
+    ManualSimple,
+}
+
+impl SummaryRequestShape {
+    fn response_id(self) -> &'static str {
+        match self {
+            Self::Auto => "response-summary-auto",
+            Self::ManualFull => "response-summary-manual-full",
+            Self::ManualSimple => "response-summary-manual-simple",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ManualFull => "manual_full",
+            Self::ManualSimple => "manual_simple",
+        }
+    }
+
+    fn summary_input_item(self) -> Value {
+        match self {
+            Self::Auto => auxiliary_summary_input_item(),
+            Self::ManualFull => json!({
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": manual_summary_text()
+                    }
+                ]
+            }),
+            Self::ManualSimple => json!({
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": manual_simple_summary_text()
+                    }
+                ]
+            }),
+        }
+    }
+}
+
 fn auxiliary_summary_input_item() -> Value {
     json!({
         "type": "message",
@@ -284,7 +357,40 @@ fn auxiliary_summary_input_item() -> Value {
     })
 }
 
-fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
+fn quoted_manual_summary_prompt_input_item() -> Value {
+    json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": concat!(
+                    "Quoted prompt: ",
+                    "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results",
+                    "\n\n",
+                    "Structure your summary using the enhanced format provided in the system message",
+                    "\n",
+                    "Include all important tool calls and their results"
+                )
+            }
+        ]
+    })
+}
+
+fn simple_history_context_input_item() -> Value {
+    json!({
+        "type": "message",
+        "role": "system",
+        "content": [
+            {
+                "type": "input_text",
+                "text": simple_history_context_text()
+            }
+        ]
+    })
+}
+
+fn summary_request_with_input(previous_response_id: Option<&str>, input: Vec<Value>) -> Value {
     let mut payload = json!({
         "model": "gpt-5.4",
         "context_management": {
@@ -318,8 +424,28 @@ fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
                 }
             }
         ],
-        "input": [
-            {
+        "input": input
+    });
+
+    if let Some(previous_response_id) = previous_response_id {
+        payload["previous_response_id"] = json!(previous_response_id);
+    }
+
+    payload
+}
+
+fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
+    summary_request_with_shape(previous_response_id, SummaryRequestShape::Auto)
+}
+
+fn summary_request_with_shape(
+    previous_response_id: Option<&str>,
+    shape: SummaryRequestShape,
+) -> Value {
+    summary_request_with_input(
+        previous_response_id,
+        vec![
+            json!({
                 "type": "message",
                 "role": "user",
                 "content": [
@@ -328,16 +454,10 @@ fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
                         "text": "Continue from the earlier answer."
                     }
                 ]
-            },
-            auxiliary_summary_input_item()
-        ]
-    });
-
-    if let Some(previous_response_id) = previous_response_id {
-        payload["previous_response_id"] = json!(previous_response_id);
-    }
-
-    payload
+            }),
+            shape.summary_input_item(),
+        ],
+    )
 }
 
 async fn next_body_chunk(
@@ -616,6 +736,83 @@ async fn summary_request_with_unknown_previous_response_id_uses_auxiliary_sessio
 }
 
 #[tokio::test]
+async fn summary_request_manual_and_auto_shapes_with_active_previous_response_id_use_auxiliary_session()
+ {
+    for shape in [
+        SummaryRequestShape::Auto,
+        SummaryRequestShape::ManualFull,
+        SummaryRequestShape::ManualSimple,
+    ] {
+        let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+        let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = RecordingConnector::new(vec![
+            PlannedConnection {
+                server: Arc::clone(&retained_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&summary_server),
+                turn_state: None,
+            },
+        ]);
+        let app = build_test_router(
+            ThreadlineConfig {
+                retained_session_capacity: 1,
+                ..ThreadlineConfig::default()
+            },
+            Arc::new(connector),
+        );
+
+        let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+        assert_eq!(
+            initial.status(),
+            StatusCode::OK,
+            "seed status for {}",
+            shape.label()
+        );
+        let _ = retained_server
+            .recv_client_message()
+            .await
+            .expect("seed request");
+        retained_server
+            .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+            .await;
+        let _ = to_bytes(initial.into_body(), usize::MAX)
+            .await
+            .expect("seed body");
+
+        let active = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"followup",
+                "previous_response_id":"response-1"
+            }),
+        )
+        .await;
+        assert_eq!(
+            active.status(),
+            StatusCode::OK,
+            "active status for {}",
+            shape.label()
+        );
+        let _ = retained_server
+            .recv_client_message()
+            .await
+            .expect("active followup request");
+
+        let summary =
+            post_responses(app, summary_request_with_shape(Some("response-1"), shape)).await;
+        assert_eq!(
+            summary.status(),
+            StatusCode::OK,
+            "summary status for {}",
+            shape.label()
+        );
+    }
+}
+
+#[tokio::test]
 async fn summary_request_does_not_forward_previous_response_id_upstream() {
     let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -646,6 +843,71 @@ async fn summary_request_does_not_forward_previous_response_id_upstream() {
     let tools = payload["tools"].as_array().expect("tools array");
     assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
     assert!(!tools.iter().any(|tool| tool["name"] == "threadline_echo"));
+}
+
+#[tokio::test]
+async fn summary_request_manual_and_auto_shapes_omit_previous_response_id_and_preserve_only_non_threadline_tools_upstream()
+ {
+    for shape in [
+        SummaryRequestShape::Auto,
+        SummaryRequestShape::ManualFull,
+        SummaryRequestShape::ManualSimple,
+    ] {
+        let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = RecordingConnector::new(vec![PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        }]);
+        let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+        let response =
+            post_responses(app, summary_request_with_shape(Some("response-1"), shape)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "response status for {}",
+            shape.label()
+        );
+
+        let payload: Value = serde_json::from_str(&message_text(
+            summary_server
+                .recv_client_message()
+                .await
+                .expect("summary request"),
+        ))
+        .expect("summary request json");
+        assert_eq!(
+            payload["type"],
+            "response.create",
+            "payload type for {}",
+            shape.label()
+        );
+        assert!(
+            payload.get("previous_response_id").is_none(),
+            "previous_response_id should be omitted for {}",
+            shape.label()
+        );
+        assert_eq!(
+            payload["context_management"],
+            json!({
+                "type": "compaction",
+                "compact_threshold": 12345
+            }),
+            "context_management for {}",
+            shape.label()
+        );
+        let tools = payload["tools"].as_array().expect("tools array");
+        assert!(
+            tools.iter().any(|tool| tool["name"] == "user_tool"),
+            "user tool should remain for {}",
+            shape.label()
+        );
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "threadline_echo"),
+            "threadline tool should be stripped for {}",
+            shape.label()
+        );
+    }
 }
 
 #[tokio::test]
@@ -838,6 +1100,142 @@ async fn summary_response_id_is_not_registered_as_continuation_marker() {
         .expect("rejected body");
     let payload: Value = serde_json::from_slice(&body).expect("rejected json body");
     assert_eq!(payload["error"]["code"], "previous_response_not_found");
+}
+
+#[tokio::test]
+async fn summary_request_manual_and_auto_response_ids_are_not_registered_as_continuation_markers() {
+    for shape in [
+        SummaryRequestShape::Auto,
+        SummaryRequestShape::ManualFull,
+        SummaryRequestShape::ManualSimple,
+    ] {
+        let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = RecordingConnector::new(vec![PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        }]);
+        let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+        let summary = post_responses(
+            app.clone(),
+            summary_request_with_shape(Some("response-1"), shape),
+        )
+        .await;
+        assert_eq!(
+            summary.status(),
+            StatusCode::OK,
+            "summary status for {}",
+            shape.label()
+        );
+        let _ = summary_server
+            .recv_client_message()
+            .await
+            .expect("summary request");
+        summary_server
+            .send_text(&format!(
+                "{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{}\"}}}}",
+                shape.response_id()
+            ))
+            .await;
+        let _ = to_bytes(summary.into_body(), usize::MAX)
+            .await
+            .expect("summary body");
+
+        let rejected = post_responses(
+            app,
+            json!({
+                "model":"gpt-5.4",
+                "input":"resume",
+                "previous_response_id":shape.response_id()
+            }),
+        )
+        .await;
+        assert_eq!(
+            rejected.status(),
+            StatusCode::BAD_REQUEST,
+            "rejected status for {}",
+            shape.label()
+        );
+        let body = to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .expect("rejected body");
+        let payload: Value = serde_json::from_slice(&body).expect("rejected json body");
+        assert_eq!(
+            payload["error"]["code"],
+            "previous_response_not_found",
+            "error code for {}",
+            shape.label()
+        );
+    }
+}
+
+#[tokio::test]
+async fn summary_request_negative_shapes_with_active_previous_response_id_remain_conflicts() {
+    for (name, input) in [
+        (
+            "quote_only",
+            vec![quoted_manual_summary_prompt_input_item()],
+        ),
+        (
+            "simple_history_only",
+            vec![simple_history_context_input_item()],
+        ),
+        (
+            "quote_plus_simple_history",
+            vec![
+                simple_history_context_input_item(),
+                quoted_manual_summary_prompt_input_item(),
+            ],
+        ),
+    ] {
+        let server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = RecordingConnector::new(vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }]);
+        let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+        let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+        assert_eq!(initial.status(), StatusCode::OK, "seed status for {name}");
+        let _ = server.recv_client_message().await.expect("seed request");
+        server
+            .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+            .await;
+        let _ = to_bytes(initial.into_body(), usize::MAX)
+            .await
+            .expect("seed body");
+
+        let active = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"followup",
+                "previous_response_id":"response-1"
+            }),
+        )
+        .await;
+        assert_eq!(active.status(), StatusCode::OK, "active status for {name}");
+        let _ = server
+            .recv_client_message()
+            .await
+            .expect("active followup request");
+
+        let conflict =
+            post_responses(app, summary_request_with_input(Some("response-1"), input)).await;
+        assert_eq!(
+            conflict.status(),
+            StatusCode::CONFLICT,
+            "conflict status for {name}"
+        );
+        let body = to_bytes(conflict.into_body(), usize::MAX)
+            .await
+            .expect("conflict body");
+        let payload: Value = serde_json::from_slice(&body).expect("conflict json body");
+        assert_eq!(
+            payload["error"]["code"], "retained_session_conflict",
+            "conflict code for {name}"
+        );
+    }
 }
 
 #[tokio::test]
