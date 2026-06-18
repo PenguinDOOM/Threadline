@@ -69,6 +69,20 @@ fn is_auxiliary_summary_request(summary_hits: &SummaryFingerprintHits) -> bool {
     summary_hits.matches_auxiliary_summary()
 }
 
+pub(super) fn looks_like_auxiliary_summary_conflict_fallback(
+    payload: &serde_json::Map<String, Value>,
+) -> bool {
+    if !payload.contains_key("context_management") {
+        return false;
+    }
+
+    let Some(input) = payload.get("input") else {
+        return false;
+    };
+
+    collect_conflict_fallback_summary_fingerprints(input).matches_auxiliary_summary()
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct DownstreamRequestRoutingDiagnostics {
     pub(super) summary_hits: SummaryFingerprintHits,
@@ -113,7 +127,17 @@ impl SummaryFingerprintHits {
     }
 
     fn record_text(&mut self, text: &str, context: SummaryObservationContext<'_>) {
-        let instruction_like = context.is_summary_instruction_like();
+        self.record_text_with_instruction_like(text, context.is_summary_instruction_like());
+    }
+
+    fn record_text_with_instruction_like(&mut self, text: &str, instruction_like: bool) {
+        let had_instruction_like_hit = self.manual_summary_prompt_instruction_like
+            || self.manual_structure_instruction_instruction_like
+            || self.manual_tool_results_instruction_instruction_like
+            || self.auto_context_too_large_instruction_like
+            || self.auto_summary_tags_instruction_like
+            || self.auto_only_task_instruction_like
+            || self.simple_history_context_instruction_like;
 
         if text.contains(MANUAL_SUMMARY_PROMPT) {
             self.manual_summary_prompt_hit = true;
@@ -146,14 +170,16 @@ impl SummaryFingerprintHits {
             self.simple_history_context_instruction_like |= instruction_like;
         }
 
-        self.summary_instruction_like_hit |= instruction_like
-            && (self.manual_summary_prompt_instruction_like
-                || self.manual_structure_instruction_instruction_like
-                || self.manual_tool_results_instruction_instruction_like
-                || self.auto_context_too_large_instruction_like
-                || self.auto_summary_tags_instruction_like
-                || self.auto_only_task_instruction_like
-                || self.simple_history_context_instruction_like);
+        let has_instruction_like_hit = self.manual_summary_prompt_instruction_like
+            || self.manual_structure_instruction_instruction_like
+            || self.manual_tool_results_instruction_instruction_like
+            || self.auto_context_too_large_instruction_like
+            || self.auto_summary_tags_instruction_like
+            || self.auto_only_task_instruction_like
+            || self.simple_history_context_instruction_like;
+
+        self.summary_instruction_like_hit |=
+            instruction_like && (had_instruction_like_hit || has_instruction_like_hit);
     }
 }
 
@@ -222,6 +248,41 @@ fn collect_summary_fingerprints(input: Option<&Value>) -> SummaryFingerprintHits
     let mut fingerprints = SummaryFingerprintHits::default();
     collect_summary_fingerprints_into_input(input, &mut fingerprints);
     fingerprints
+}
+
+fn collect_conflict_fallback_summary_fingerprints(input: &Value) -> SummaryFingerprintHits {
+    let mut fingerprints = SummaryFingerprintHits::default();
+
+    match input {
+        Value::Array(items) => {
+            for item in items {
+                collect_conflict_fallback_summary_from_input_item(item, &mut fingerprints);
+            }
+        }
+        _ => collect_conflict_fallback_summary_from_input_item(input, &mut fingerprints),
+    }
+
+    fingerprints
+}
+
+fn collect_conflict_fallback_summary_from_input_item(
+    value: &Value,
+    fingerprints: &mut SummaryFingerprintHits,
+) {
+    let Some(item) = value.as_object() else {
+        return;
+    };
+
+    if item.get("type").and_then(Value::as_str) != Some("input_text") {
+        return;
+    }
+
+    let Some(text) = item.get("text").and_then(Value::as_str) else {
+        return;
+    };
+
+    // Conflict fallback intentionally accepts only direct top-level input_text items.
+    fingerprints.record_text_with_instruction_like(text, true);
 }
 
 fn collect_summary_fingerprints_into_input(

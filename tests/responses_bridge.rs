@@ -390,6 +390,13 @@ fn simple_history_context_input_item() -> Value {
     })
 }
 
+fn retained_conflict_fallback_summary_input_item() -> Value {
+    json!({
+        "type": "input_text",
+        "text": manual_summary_text()
+    })
+}
+
 fn summary_request_with_input(previous_response_id: Option<&str>, input: Vec<Value>) -> Value {
     let mut payload = json!({
         "model": "gpt-5.4",
@@ -436,6 +443,13 @@ fn summary_request_with_input(previous_response_id: Option<&str>, input: Vec<Val
 
 fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
     summary_request_with_shape(previous_response_id, SummaryRequestShape::Auto)
+}
+
+fn retained_conflict_fallback_summary_request(previous_response_id: Option<&str>) -> Value {
+    summary_request_with_input(
+        previous_response_id,
+        vec![retained_conflict_fallback_summary_input_item()],
+    )
 }
 
 fn summary_request_with_shape(
@@ -1620,6 +1634,283 @@ async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_l
     )
     .await;
     assert_eq!(retried.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn retained_session_conflict_fallback_summary_request_reroutes_transiently() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let summary = post_responses(
+        app,
+        retained_conflict_fallback_summary_request(Some("response-1")),
+    )
+    .await;
+    assert_eq!(summary.status(), StatusCode::OK);
+
+    let payload: Value = serde_json::from_str(&message_text(
+        summary_server
+            .recv_client_message()
+            .await
+            .expect("fallback summary request"),
+    ))
+    .expect("fallback summary request json");
+    assert_eq!(payload["type"], "response.create");
+    assert!(payload.get("previous_response_id").is_none());
+    let tools = payload["tools"].as_array().expect("tools array");
+    assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
+    assert!(!tools.iter().any(|tool| tool["name"] == "threadline_echo"));
+
+    summary_server
+        .send_text(
+            &assistant_text_completed_event("response-fallback-summary", "summary completion")
+                .to_string(),
+        )
+        .await;
+    let _ = to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .expect("summary body");
+}
+
+#[tokio::test]
+async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
+    let trace_guard = TraceCaptureGuard::begin().await;
+    let raw_request_secret = "secret-456";
+    let raw_request_account = "acct_987654321";
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let rerouted = post_responses(
+                app,
+                summary_request_with_input(
+                    Some("response-1"),
+                    vec![
+                        json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": format!("Account {raw_request_account} credential {raw_request_secret}")
+                                }
+                            ]
+                        }),
+                        retained_conflict_fallback_summary_input_item(),
+                    ],
+                ),
+            )
+            .await;
+    assert_eq!(rerouted.status(), StatusCode::OK);
+    let _ = summary_server
+        .recv_client_message()
+        .await
+        .expect("fallback summary request");
+    summary_server
+        .send_text(
+            &assistant_text_completed_event("response-fallback-diagnostics", "summary completion")
+                .to_string(),
+        )
+        .await;
+    let _ = to_bytes(rerouted.into_body(), usize::MAX)
+        .await
+        .expect("rerouted body");
+
+    let logs = trace_guard.logs();
+    let rerouted_line = logs
+        .lines()
+        .find(|line| line.contains("retained_session_conflict_rerouted"))
+        .expect("rerouted diagnostics trace line");
+    assert!(rerouted_line.contains("manual_summary_prompt_hit=true"));
+    assert!(rerouted_line.contains("fallback_summary_input_hit=true"));
+    assert!(rerouted_line.contains("tools_count=2"));
+    assert!(!rerouted_line.contains(raw_request_secret));
+    assert!(!rerouted_line.contains(raw_request_account));
+    assert!(!rerouted_line.contains(manual_summary_text()));
+}
+
+#[tokio::test]
+async fn retained_session_conflict_fallback_empty_completed_output_preserves_auxiliary_behavior() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let response = post_responses(
+        app.clone(),
+        retained_conflict_fallback_summary_request(Some("response-1")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let forwarded: Value = serde_json::from_str(&message_text(
+        summary_server
+            .recv_client_message()
+            .await
+            .expect("fallback summary request"),
+    ))
+    .expect("fallback summary request json");
+    assert!(forwarded.get("previous_response_id").is_none());
+    let tools = forwarded["tools"].as_array().expect("tools array");
+    assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
+    assert!(!tools.iter().any(|tool| tool["name"] == "threadline_echo"));
+
+    let completed_event = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-fallback-empty"
+        }
+    });
+    summary_server.send_text(&completed_event.to_string()).await;
+
+    let body = timeout(
+        Duration::from_secs(2),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("fallback summary body timeout")
+    .expect("fallback summary body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("summary completed frame"));
+    let payload: Value = serde_json::from_str(data).expect("summary completed json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.completed");
+    assert_eq!(payload, completed_event);
+    assert_done_frame(frames[1]);
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-fallback-empty"
+        }),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("rejected body");
+    let rejected_payload: Value = serde_json::from_slice(&rejected_body).expect("rejected json");
+    assert_eq!(
+        rejected_payload["error"]["code"],
+        "previous_response_not_found"
+    );
 }
 
 #[tokio::test]

@@ -18,7 +18,10 @@ mod downstream;
 mod translation;
 mod upstream;
 
-use self::downstream::{DownstreamRequestClassification, parse_downstream_request};
+use self::downstream::{
+    DownstreamRequestClassification, looks_like_auxiliary_summary_conflict_fallback,
+    parse_downstream_request,
+};
 use self::translation::{ResponseStreamLease, ResponseStreamState, response_stream};
 use self::upstream::send_response_create;
 
@@ -34,15 +37,24 @@ pub struct ResponsesRouteState {
     pub services: ThreadlineServices,
 }
 
+struct PreparedResponseRoute {
+    upstream: Arc<LiveUpstreamWebSocket>,
+    lease: ResponseStreamLease,
+    previous_response_id: Option<String>,
+    reconnect_attempted: bool,
+    upstream_request: serde_json::Map<String, Value>,
+    execute_internal_tools: bool,
+    apply_no_observable_output_failure: bool,
+}
+
 pub async fn responses_handler(
     State(state): State<ResponsesRouteState>,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<impl IntoResponse, ThreadlineError> {
     let request = parse_downstream_request(payload)?;
     validate_request_model(&request.payload)?;
-    let auth = state.services.auth_provider().load()?;
     let classification = request.classification;
-    let routing_diagnostics = request.routing_diagnostics();
+    let routing_diagnostics = request.routing_diagnostics().clone();
     let previous_response_id_present = request.previous_response_id.is_some();
     let context_management_present = request.payload.contains_key("context_management");
     debug!(
@@ -76,74 +88,116 @@ pub async fn responses_handler(
             .unwrap_or("none"),
         "responses_request_routed"
     );
-    let mut upstream_request = request.payload;
-    match classification {
-        DownstreamRequestClassification::Normal => inject_internal_tools(&mut upstream_request),
-        DownstreamRequestClassification::AuxiliarySummary => {
-            strip_threadline_tools(&mut upstream_request)
-        }
-    }
-    let (upstream, lease, previous_response_id, reconnect_attempted) = match classification {
+    let previous_response_id = request.previous_response_id;
+    let base_request = request.payload;
+    let prepared = match classification {
         DownstreamRequestClassification::Normal => {
-            let mut lease =
-                acquire_lease(&state.registry, request.previous_response_id.as_deref()).await?;
-            let mut upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
+            match acquire_lease(&state.registry, previous_response_id.as_deref()).await {
+                Ok(mut lease) => {
+                    let auth = state.services.auth_provider().load()?;
+                    let mut upstream_request = base_request.clone();
+                    inject_internal_tools(&mut upstream_request);
+                    let mut upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
 
-            if let Some(previous_response_id) = &request.previous_response_id {
-                upstream_request.insert(
-                    "previous_response_id".to_string(),
-                    Value::String(previous_response_id.clone()),
-                );
-            }
+                    if let Some(previous_response_id) = &previous_response_id {
+                        upstream_request.insert(
+                            "previous_response_id".to_string(),
+                            Value::String(previous_response_id.clone()),
+                        );
+                    }
 
-            let mut reconnect_attempted = false;
-            if let Err(error) = send_response_create(&upstream, &upstream_request).await {
-                if let Some(reconnected) = attempt_pre_first_event_reconnect(
-                    &state.services,
-                    &mut lease,
-                    &upstream_request,
-                    request.previous_response_id.as_deref(),
-                    false,
-                    &mut reconnect_attempted,
-                )
-                .await?
-                {
-                    upstream = reconnected;
-                } else {
-                    return Err(error);
+                    let mut reconnect_attempted = false;
+                    if let Err(error) = send_response_create(&upstream, &upstream_request).await {
+                        if let Some(reconnected) = attempt_pre_first_event_reconnect(
+                            &state.services,
+                            &mut lease,
+                            &upstream_request,
+                            previous_response_id.as_deref(),
+                            false,
+                            &mut reconnect_attempted,
+                        )
+                        .await?
+                        {
+                            upstream = reconnected;
+                        } else {
+                            return Err(error);
+                        }
+                    }
+
+                    PreparedResponseRoute {
+                        upstream,
+                        lease: ResponseStreamLease::Retained(lease),
+                        previous_response_id,
+                        reconnect_attempted,
+                        upstream_request,
+                        execute_internal_tools: true,
+                        apply_no_observable_output_failure: true,
+                    }
                 }
-            }
+                Err(ThreadlineError::RetainedSessionConflict) => {
+                    let fallback_rerouted =
+                        looks_like_auxiliary_summary_conflict_fallback(&base_request);
+                    if !fallback_rerouted {
+                        return Err(ThreadlineError::RetainedSessionConflict);
+                    }
 
-            (
-                upstream,
-                ResponseStreamLease::Retained(lease),
-                request.previous_response_id,
-                reconnect_attempted,
-            )
+                    debug!(
+                        previous_response_id_present,
+                        context_management_present,
+                        manual_summary_prompt_hit =
+                            routing_diagnostics.summary_hits.manual_summary_prompt_hit,
+                        manual_structure_instruction_hit = routing_diagnostics
+                            .summary_hits
+                            .manual_structure_instruction_hit,
+                        manual_tool_results_instruction_hit = routing_diagnostics
+                            .summary_hits
+                            .manual_tool_results_instruction_hit,
+                        auto_context_too_large_hit =
+                            routing_diagnostics.summary_hits.auto_context_too_large_hit,
+                        auto_summary_tags_hit =
+                            routing_diagnostics.summary_hits.auto_summary_tags_hit,
+                        auto_only_task_hit = routing_diagnostics.summary_hits.auto_only_task_hit,
+                        simple_history_context_hit =
+                            routing_diagnostics.summary_hits.simple_history_context_hit,
+                        summary_instruction_like_hit = routing_diagnostics
+                            .summary_hits
+                            .summary_instruction_like_hit,
+                        fallback_summary_input_hit = fallback_rerouted,
+                        tool_choice = routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
+                        tools_count = routing_diagnostics.tools_count,
+                        input_item_count = routing_diagnostics.input_item_count,
+                        last_input_role = routing_diagnostics
+                            .last_input_role
+                            .as_deref()
+                            .unwrap_or("none"),
+                        last_input_type = routing_diagnostics
+                            .last_input_type
+                            .as_deref()
+                            .unwrap_or("none"),
+                        "retained_session_conflict_rerouted"
+                    );
+
+                    start_transient_auxiliary_route(&state.services, base_request).await?
+                }
+                Err(error) => return Err(error),
+            }
         }
         DownstreamRequestClassification::AuxiliarySummary => {
-            let connected = state.services.connector().connect(auth, None).await?;
-            send_response_create(&connected.websocket, &upstream_request).await?;
-            (
-                connected.websocket,
-                ResponseStreamLease::TransientAuxiliary,
-                None,
-                false,
-            )
+            start_transient_auxiliary_route(&state.services, base_request).await?
         }
     };
 
     let stream = response_stream(ResponseStreamState {
         services: state.services.clone(),
-        upstream,
-        lease,
-        base_request: upstream_request,
+        upstream: prepared.upstream,
+        lease: prepared.lease,
+        base_request: prepared.upstream_request,
         pending_internal_outputs: Vec::new(),
-        previous_response_id,
-        execute_internal_tools: classification == DownstreamRequestClassification::Normal,
+        previous_response_id: prepared.previous_response_id,
+        execute_internal_tools: prepared.execute_internal_tools,
         suppressed_internal_output_indexes: std::collections::HashSet::new(),
         upstream_event_seen: false,
-        reconnect_attempted,
+        reconnect_attempted: prepared.reconnect_attempted,
         observable_output: Default::default(),
         downstream_visible_text_sources: std::collections::HashSet::new(),
         downstream_visible_text_delta_count: 0,
@@ -153,8 +207,7 @@ pub async fn responses_handler(
         queued_forwarded_event: None,
         queued_final_completed: None,
         final_done_pending: false,
-        apply_no_observable_output_failure: classification
-            == DownstreamRequestClassification::Normal,
+        apply_no_observable_output_failure: prepared.apply_no_observable_output_failure,
         done: false,
     });
 
@@ -254,6 +307,27 @@ async fn acquire_lease(
             .map_err(map_registry_error),
         None => registry.acquire_new().await.map_err(map_registry_error),
     }
+}
+
+async fn start_transient_auxiliary_route(
+    services: &ThreadlineServices,
+    mut upstream_request: serde_json::Map<String, Value>,
+) -> Result<PreparedResponseRoute, ThreadlineError> {
+    strip_threadline_tools(&mut upstream_request);
+
+    let auth = services.auth_provider().load()?;
+    let connected = services.connector().connect(auth, None).await?;
+    send_response_create(&connected.websocket, &upstream_request).await?;
+
+    Ok(PreparedResponseRoute {
+        upstream: connected.websocket,
+        lease: ResponseStreamLease::TransientAuxiliary,
+        previous_response_id: None,
+        reconnect_attempted: false,
+        upstream_request,
+        execute_internal_tools: false,
+        apply_no_observable_output_failure: false,
+    })
 }
 
 async fn ensure_upstream(
