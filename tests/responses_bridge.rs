@@ -293,11 +293,36 @@ fn simple_history_context_text() -> &'static str {
     "The following is a compressed version of the preceeding history in the current conversation"
 }
 
+fn new_auto_system_summary_text() -> &'static str {
+    "Your task is to create a comprehensive, detailed summary of the entire conversation that captures all essential information needed to seamlessly continue the work without any loss of context"
+}
+
+fn new_auto_compressed_history_text() -> &'static str {
+    concat!(
+        "The following is a compressed version of the preceeding history in the current conversation. ",
+        "The first message is kept, some history may be truncated after that:"
+    )
+}
+
+fn new_auto_final_summary_prompt_text() -> &'static str {
+    concat!(
+        "Summarize the conversation history so far, paying special attention to the most recent agent commands and tool results that triggered this summarization. ",
+        "Structure your summary using the enhanced format provided in the system message.\n",
+        "Focus particularly on:\n",
+        "- The specific agent commands/tools that were just executed\n",
+        "- The results returned from these recent tool calls (truncate if very long but preserve key information)\n",
+        "- What the agent was actively working on when the token budget was exceeded\n",
+        "- How these recent operations connect to the overall user goals\n",
+        "Include all important tool calls and their results as part of the appropriate sections, with special emphasis on the most recent operations."
+    )
+}
+
 #[derive(Clone, Copy)]
 enum SummaryRequestShape {
     Auto,
     ManualFull,
     ManualSimple,
+    NewAuto,
 }
 
 impl SummaryRequestShape {
@@ -306,6 +331,7 @@ impl SummaryRequestShape {
             Self::Auto => "response-summary-auto",
             Self::ManualFull => "response-summary-manual-full",
             Self::ManualSimple => "response-summary-manual-simple",
+            Self::NewAuto => "response-summary-new-auto",
         }
     }
 
@@ -314,13 +340,14 @@ impl SummaryRequestShape {
             Self::Auto => "auto",
             Self::ManualFull => "manual_full",
             Self::ManualSimple => "manual_simple",
+            Self::NewAuto => "new_auto",
         }
     }
 
-    fn summary_input_item(self) -> Value {
+    fn summary_input_items(self) -> Vec<Value> {
         match self {
-            Self::Auto => auxiliary_summary_input_item(),
-            Self::ManualFull => json!({
+            Self::Auto => vec![auxiliary_summary_input_item()],
+            Self::ManualFull => vec![json!({
                 "type": "message",
                 "role": "system",
                 "content": [
@@ -329,8 +356,8 @@ impl SummaryRequestShape {
                         "text": manual_summary_text()
                     }
                 ]
-            }),
-            Self::ManualSimple => json!({
+            })],
+            Self::ManualSimple => vec![json!({
                 "type": "message",
                 "role": "system",
                 "content": [
@@ -339,7 +366,39 @@ impl SummaryRequestShape {
                         "text": manual_simple_summary_text()
                     }
                 ]
-            }),
+            })],
+            Self::NewAuto => vec![
+                json!({
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": new_auto_system_summary_text()
+                        }
+                    ]
+                }),
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": new_auto_compressed_history_text()
+                        }
+                    ]
+                }),
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": new_auto_final_summary_prompt_text()
+                        }
+                    ]
+                }),
+            ],
         }
     }
 }
@@ -456,22 +515,18 @@ fn summary_request_with_shape(
     previous_response_id: Option<&str>,
     shape: SummaryRequestShape,
 ) -> Value {
-    summary_request_with_input(
-        previous_response_id,
-        vec![
-            json!({
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "Continue from the earlier answer."
-                    }
-                ]
-            }),
-            shape.summary_input_item(),
-        ],
-    )
+    let mut input = vec![json!({
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": "Continue from the earlier answer."
+            }
+        ]
+    })];
+    input.extend(shape.summary_input_items());
+    summary_request_with_input(previous_response_id, input)
 }
 
 async fn next_body_chunk(
@@ -750,12 +805,12 @@ async fn summary_request_with_unknown_previous_response_id_uses_auxiliary_sessio
 }
 
 #[tokio::test]
-async fn summary_request_manual_and_auto_shapes_with_active_previous_response_id_use_auxiliary_session()
- {
+async fn summary_request_all_shapes_with_active_previous_response_id_use_auxiliary_session() {
     for shape in [
         SummaryRequestShape::Auto,
         SummaryRequestShape::ManualFull,
         SummaryRequestShape::ManualSimple,
+        SummaryRequestShape::NewAuto,
     ] {
         let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
         let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -860,12 +915,13 @@ async fn summary_request_does_not_forward_previous_response_id_upstream() {
 }
 
 #[tokio::test]
-async fn summary_request_manual_and_auto_shapes_omit_previous_response_id_and_preserve_only_non_threadline_tools_upstream()
+async fn summary_request_all_shapes_omit_previous_response_id_and_preserve_only_non_threadline_tools_upstream()
  {
     for shape in [
         SummaryRequestShape::Auto,
         SummaryRequestShape::ManualFull,
         SummaryRequestShape::ManualSimple,
+        SummaryRequestShape::NewAuto,
     ] {
         let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
         let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -1117,11 +1173,12 @@ async fn summary_response_id_is_not_registered_as_continuation_marker() {
 }
 
 #[tokio::test]
-async fn summary_request_manual_and_auto_response_ids_are_not_registered_as_continuation_markers() {
+async fn summary_request_all_shape_response_ids_are_not_registered_as_continuation_markers() {
     for shape in [
         SummaryRequestShape::Auto,
         SummaryRequestShape::ManualFull,
         SummaryRequestShape::ManualSimple,
+        SummaryRequestShape::NewAuto,
     ] {
         let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
         let connector = RecordingConnector::new(vec![PlannedConnection {
