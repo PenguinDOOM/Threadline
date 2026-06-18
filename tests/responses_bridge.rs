@@ -1769,6 +1769,159 @@ async fn retained_session_conflict_fallback_summary_request_reroutes_transiently
 }
 
 #[tokio::test]
+async fn retained_session_conflict_context_management_without_summary_input_remains_conflict() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&retained_server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let conflict = post_responses(
+        app,
+        summary_request_with_input(
+            Some("response-1"),
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "This is ordinary context management content without a summary request."
+                    }
+                ]
+            })],
+        ),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let body = to_bytes(conflict.into_body(), usize::MAX)
+        .await
+        .expect("conflict body");
+    let payload: Value = serde_json::from_slice(&body).expect("conflict json body");
+    assert_eq!(payload["error"]["code"], "retained_session_conflict");
+}
+
+#[tokio::test]
+async fn retained_session_conflict_tool_choice_none_without_summary_fingerprint_remains_conflict() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&retained_server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let conflict = post_responses(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "previous_response_id": "response-1",
+            "context_management": {
+                "type": "compaction",
+                "compact_threshold": 12345
+            },
+            "tool_choice": "none",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "user_tool",
+                    "description": "User-defined tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "threadline_echo",
+                    "description": "Threadline internal tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": "string"
+                            }
+                        },
+                        "required": ["value"],
+                        "additionalProperties": false
+                    }
+                }
+            ],
+            "input": [
+                {
+                    "type": "input_text",
+                    "text": "Do not summarize this request; continue normal work."
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let body = to_bytes(conflict.into_body(), usize::MAX)
+        .await
+        .expect("conflict body");
+    let payload: Value = serde_json::from_slice(&body).expect("conflict json body");
+    assert_eq!(payload["error"]["code"], "retained_session_conflict");
+}
+
+#[tokio::test]
 async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
     let trace_guard = TraceCaptureGuard::begin().await;
     let raw_request_secret = "secret-456";
