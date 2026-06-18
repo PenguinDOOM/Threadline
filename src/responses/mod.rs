@@ -75,9 +75,7 @@ pub async fn responses_handler(
         new_auto_detailed_summary_hit = routing_diagnostics
             .summary_hits
             .new_auto_detailed_summary_hit,
-        new_auto_user_history_hit = routing_diagnostics
-            .summary_hits
-            .new_auto_user_history_hit,
+        new_auto_user_history_hit = routing_diagnostics.summary_hits.new_auto_user_history_hit,
         new_auto_user_final_summary_prompt_hit = routing_diagnostics
             .summary_hits
             .new_auto_user_final_summary_prompt_hit,
@@ -172,9 +170,8 @@ pub async fn responses_handler(
                         new_auto_detailed_summary_hit = routing_diagnostics
                             .summary_hits
                             .new_auto_detailed_summary_hit,
-                        new_auto_user_history_hit = routing_diagnostics
-                            .summary_hits
-                            .new_auto_user_history_hit,
+                        new_auto_user_history_hit =
+                            routing_diagnostics.summary_hits.new_auto_user_history_hit,
                         new_auto_user_final_summary_prompt_hit = routing_diagnostics
                             .summary_hits
                             .new_auto_user_final_summary_prompt_hit,
