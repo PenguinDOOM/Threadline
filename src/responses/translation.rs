@@ -1020,6 +1020,7 @@ pub(super) struct ResponseStreamState {
     pub(super) execute_internal_tools: bool,
     pub(super) suppressed_internal_output_indexes: HashSet<u64>,
     pub(super) upstream_event_seen: bool,
+    pub(super) replay_stale_marker_on_pre_first_event_close: bool,
     pub(super) reconnect_attempted: bool,
     pub(super) observable_output: DownstreamObservableOutputState,
     pub(super) downstream_visible_text_sources: HashSet<VisibleTextDedupeIdentity>,
@@ -1637,6 +1638,11 @@ pub(super) fn response_stream(
 async fn try_reconnect_or_terminal_error(
     state: &mut ResponseStreamState,
 ) -> Result<Option<Arc<LiveUpstreamWebSocket>>, ThreadlineError> {
+    if state.replay_stale_marker_on_pre_first_event_close && !state.upstream_event_seen {
+        state.lease.release();
+        return Err(ThreadlineError::PreviousResponseNotFound);
+    }
+
     let Some(lease) = state.lease.retained_mut() else {
         return Ok(None);
     };

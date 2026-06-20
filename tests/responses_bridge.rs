@@ -610,13 +610,11 @@ async fn stale_previous_response_id_returns_not_found_without_reconnect_or_confl
             .expect("stale body");
         let payload: Value = serde_json::from_slice(&body).expect("stale json body");
         assert_eq!(
-            payload["error"]["code"],
-            "previous_response_not_found",
+            payload["error"]["code"], "previous_response_not_found",
             "{attempt} stale continuation should require client replay"
         );
         assert_ne!(
-            payload["error"]["code"],
-            "retained_session_conflict",
+            payload["error"]["code"], "retained_session_conflict",
             "{attempt} stale continuation should release the retained lease"
         );
     }
@@ -628,8 +626,11 @@ async fn stale_previous_response_id_returns_not_found_without_reconnect_or_confl
     .await;
     assert!(no_second_connect.is_err());
 
-    let no_third_connect = timeout(Duration::from_millis(250), third_server.recv_client_message())
-        .await;
+    let no_third_connect = timeout(
+        Duration::from_millis(250),
+        third_server.recv_client_message(),
+    )
+    .await;
     assert!(no_third_connect.is_err());
 
     let sessions = connector.recorded_sessions().await;
@@ -702,7 +703,7 @@ async fn live_retained_upstream_continuation_forwards_previous_response_id_witho
 }
 
 #[tokio::test]
-async fn context_management_compaction_is_forwarded_without_changing_marker_semantics() {
+async fn context_management_compaction_does_not_override_stale_marker_semantics() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let second_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
@@ -759,41 +760,22 @@ async fn context_management_compaction_is_forwarded_without_changing_marker_sema
         }),
     )
     .await;
-    assert_eq!(second_response.status(), StatusCode::OK);
-
-    let second_payload: Value = serde_json::from_str(&message_text(
-        second_server
-            .recv_client_message()
-            .await
-            .expect("second request message"),
-    ))
-    .expect("second request json");
-    assert_eq!(second_payload["type"], "response.create");
-    assert_eq!(second_payload["previous_response_id"], "response-1");
-    assert_eq!(
-        second_payload["context_management"],
-        json!({
-            "type":"compaction",
-            "compact_threshold": 12345
-        })
-    );
-    assert_eq!(
-        second_payload["reasoning"],
-        json!({"effort":"high","summary":"auto"})
-    );
-    assert_eq!(
-        second_payload["include"],
-        json!(["reasoning.encrypted_content"])
-    );
-    assert!(second_payload.get("response").is_none());
-    assert_codex_unsupported_response_fields_are_absent(&second_payload);
-
-    second_server
-        .send_text(&assistant_text_completed_event("response-2", "second completion").to_string())
-        .await;
-    let _ = to_bytes(second_response.into_body(), usize::MAX)
+    assert_eq!(second_response.status(), StatusCode::BAD_REQUEST);
+    let second_body = to_bytes(second_response.into_body(), usize::MAX)
         .await
         .expect("second body");
+    let second_payload: Value = serde_json::from_slice(&second_body).expect("second body json");
+    assert_eq!(
+        second_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+
+    let no_second_connect = timeout(
+        Duration::from_millis(250),
+        second_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_second_connect.is_err());
 }
 
 #[tokio::test]
@@ -1425,7 +1407,7 @@ async fn summary_request_negative_shapes_with_active_previous_response_id_remain
 }
 
 #[tokio::test]
-async fn transient_summary_request_does_not_evict_existing_retained_marker() {
+async fn transient_summary_request_preserves_auxiliary_behavior_but_does_not_revive_stale_marker() {
     let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
     let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
     let resumed_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -1490,15 +1472,22 @@ async fn transient_summary_request_does_not_evict_existing_retained_marker() {
         }),
     )
     .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
-    let resumed_payload: Value = serde_json::from_str(&message_text(
-        resumed_server
-            .recv_client_message()
-            .await
-            .expect("resumed request"),
-    ))
-    .expect("resumed request json");
-    assert_eq!(resumed_payload["previous_response_id"], "response-1");
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+    let resumed_payload: Value = serde_json::from_slice(&resumed_body).expect("resumed body json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+
+    let no_resume_connect = timeout(
+        Duration::from_millis(250),
+        resumed_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_resume_connect.is_err());
 }
 
 #[tokio::test]
@@ -2665,15 +2654,22 @@ async fn recoverable_upstream_close_releases_prior_marker_after_completed_chunk_
         }),
     )
     .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
-    let resumed_payload: Value = serde_json::from_str(&message_text(
-        reconnect_server
-            .recv_client_message()
-            .await
-            .expect("resumed request"),
-    ))
-    .expect("resumed request json");
-    assert_eq!(resumed_payload["previous_response_id"], "response-1");
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+    let resumed_payload: Value = serde_json::from_slice(&resumed_body).expect("resumed body json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+
+    let no_resume_connect = timeout(
+        Duration::from_millis(250),
+        reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_resume_connect.is_err());
 
     let done_chunk = next_body_chunk(&mut initial_body).await;
     assert_eq!(done_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
@@ -2681,13 +2677,6 @@ async fn recoverable_upstream_close_releases_prior_marker_after_completed_chunk_
         initial_body.next().await.is_none(),
         "expected EOF after DONE"
     );
-
-    reconnect_server
-        .send_text(&assistant_text_completed_event("response-2", "resume completion").to_string())
-        .await;
-    let _ = to_bytes(resumed.into_body(), usize::MAX)
-        .await
-        .expect("resumed body");
 }
 
 #[tokio::test]
@@ -3048,7 +3037,7 @@ async fn upstream_incomplete_emits_terminal_response_incomplete_without_marker()
 }
 
 #[tokio::test]
-async fn response_failed_preserves_prior_completed_marker_for_resume() {
+async fn response_failed_releases_prior_completed_marker_after_recoverable_close() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
@@ -3114,26 +3103,26 @@ async fn response_failed_preserves_prior_completed_marker_for_resume() {
         }),
     )
     .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
-    let resumed_payload: Value = serde_json::from_str(&message_text(
-        reconnect_server
-            .recv_client_message()
-            .await
-            .expect("resumed request message"),
-    ))
-    .expect("resumed request json");
-    assert!(resumed_payload.get("response").is_none());
-    assert_eq!(resumed_payload["previous_response_id"], "response-1");
-    reconnect_server
-        .send_text(&assistant_text_completed_event("response-2", "resume completion").to_string())
-        .await;
-    let _ = to_bytes(resumed.into_body(), usize::MAX)
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
         .await
         .expect("resumed body");
+    let resumed_payload: Value = serde_json::from_slice(&resumed_body).expect("resumed body json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+
+    let no_resume_connect = timeout(
+        Duration::from_millis(250),
+        reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_resume_connect.is_err());
 }
 
 #[tokio::test]
-async fn failed_turn_releases_prior_marker_before_body_drop() {
+async fn failed_turn_releases_prior_marker_before_body_drop_and_blocks_resume() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
@@ -3200,15 +3189,22 @@ async fn failed_turn_releases_prior_marker_before_body_drop() {
         }),
     )
     .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
-    let resumed_payload: Value = serde_json::from_str(&message_text(
-        reconnect_server
-            .recv_client_message()
-            .await
-            .expect("resumed request message"),
-    ))
-    .expect("resumed request json");
-    assert_eq!(resumed_payload["previous_response_id"], "response-1");
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+    let resumed_payload: Value = serde_json::from_slice(&resumed_body).expect("resumed body json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+
+    let no_resume_connect = timeout(
+        Duration::from_millis(250),
+        reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_resume_connect.is_err());
 
     let done_chunk = next_body_chunk(&mut failed_body).await;
     assert_eq!(done_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
@@ -3216,13 +3212,6 @@ async fn failed_turn_releases_prior_marker_before_body_drop() {
         failed_body.next().await.is_none(),
         "expected EOF after DONE"
     );
-
-    reconnect_server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-2"}}"#)
-        .await;
-    let _ = to_bytes(resumed.into_body(), usize::MAX)
-        .await
-        .expect("resumed body");
 }
 
 #[tokio::test]

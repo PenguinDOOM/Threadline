@@ -184,6 +184,12 @@ impl RetainedSessionLease {
         self.upstream.is_some()
     }
 
+    pub fn has_open_upstream(&self) -> bool {
+        self.upstream
+            .as_ref()
+            .is_some_and(|upstream| !upstream.is_closed())
+    }
+
     pub fn upstream(&self) -> Option<Arc<LiveUpstreamWebSocket>> {
         self.upstream.clone()
     }

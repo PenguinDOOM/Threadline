@@ -318,7 +318,8 @@ async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
 }
 
 #[tokio::test]
-async fn live_retained_continuation_close_before_first_send_returns_previous_response_not_found_without_reconnect_or_resend() {
+async fn live_retained_continuation_close_before_first_send_returns_previous_response_not_found_without_reconnect_or_resend()
+ {
     let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
     let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
@@ -403,24 +404,14 @@ async fn non_transport_first_send_errors_are_preserved_and_not_rewritten() {
 #[tokio::test]
 async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
     let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
-    let continuation_server = Arc::new(ScriptedWebSocketServer::start().await);
-    let connector = RecordingConnector::new(vec![
-        PlannedConnection {
-            server: Arc::clone(&seed_server),
-            turn_state: Some("turn-state-1".to_string()),
-            wait_until_closed_before_return: false,
-        },
-        PlannedConnection {
-            server: Arc::clone(&continuation_server),
-            turn_state: None,
-            wait_until_closed_before_return: false,
-        },
-    ]);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&seed_server),
+        turn_state: Some("turn-state-1".to_string()),
+        wait_until_closed_before_return: false,
+    }]);
     let app = build_test_router(Arc::new(connector.clone()));
 
     seed_marker(app.clone(), &seed_server, "response-1").await;
-    seed_server.send_close(1000, "seed complete").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let response = post_responses(
         app,
@@ -433,19 +424,14 @@ async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let _ = timeout(
-        Duration::from_secs(1),
-        continuation_server.recv_client_message(),
-    )
-    .await
-    .expect("continuation request timeout")
-    .expect("continuation request");
-    continuation_server
+    let _ = timeout(Duration::from_secs(1), seed_server.recv_client_message())
+        .await
+        .expect("continuation request timeout")
+        .expect("continuation request");
+    seed_server
         .send_text(r#"{"type":"response.created","response":{"id":"response-created"}}"#)
         .await;
-    continuation_server
-        .send_close(1000, "closed-after-event")
-        .await;
+    seed_server.send_close(1000, "closed-after-event").await;
 
     let body = timeout(
         Duration::from_secs(1),
@@ -476,11 +462,91 @@ async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
     assert_done_frame(frames[2]);
 
     let sessions = connector.recorded_sessions().await;
-    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions.len(), 1);
 }
 
 #[tokio::test]
-async fn reconnect_fallback_attempts_only_once() {
+async fn retained_continuation_close_after_send_before_first_upstream_event_replays_stale_marker_without_reconnect()
+ {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: Some("turn-state-1".to_string()),
+            wait_until_closed_before_return: false,
+        },
+        PlannedConnection {
+            server: Arc::clone(&unexpected_reconnect_server),
+            turn_state: None,
+            wait_until_closed_before_return: false,
+        },
+    ]);
+    let app = build_test_router(Arc::new(connector.clone()));
+
+    seed_marker(app.clone(), &retained_server, "response-1").await;
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        timeout(
+            Duration::from_secs(1),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("body timeout")
+        .expect("body bytes")
+    });
+
+    let retained_message = timeout(
+        Duration::from_secs(1),
+        retained_server.recv_client_message(),
+    )
+    .await
+    .expect("continuation request timeout")
+    .expect("continuation request");
+    let retained_message = retained_message.into_text().expect("text request");
+    let retained_payload: Value = serde_json::from_str(&retained_message).expect("request json");
+    assert_eq!(retained_payload["previous_response_id"], "response-1");
+
+    retained_server
+        .send_close(1000, "closed-before-first-event")
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (failed_event, failed_data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let failed_payload: Value = serde_json::from_str(failed_data).expect("failed json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(failed_event, "response.failed");
+    assert_response_failed_payload(&failed_payload, "previous_response_not_found");
+    assert_done_frame(frames[1]);
+
+    let no_reconnect = timeout(
+        Duration::from_millis(250),
+        unexpected_reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_reconnect.is_err());
+
+    let sessions = connector.recorded_sessions().await;
+    assert_eq!(sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn stale_continuation_with_spare_reconnect_plans_returns_previous_response_not_found_without_reconnect()
+ {
     let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
     let first_attempt_server = Arc::new(ScriptedWebSocketServer::start().await);
     let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -516,65 +582,35 @@ async fn reconnect_fallback_attempts_only_once() {
         }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let _ = timeout(
-        Duration::from_secs(1),
+    let no_first_attempt = timeout(
+        Duration::from_millis(250),
         first_attempt_server.recv_client_message(),
     )
-    .await
-    .expect("first continuation timeout")
-    .expect("first continuation request");
-    first_attempt_server
-        .send_close(1000, "closed-before-event")
-        .await;
+    .await;
+    assert!(no_first_attempt.is_err());
 
-    let body_task = tokio::spawn(async move {
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body")
-    });
-
-    match timeout(
-        Duration::from_secs(1),
+    let no_reconnect = timeout(
+        Duration::from_millis(250),
         reconnect_server.recv_client_message(),
     )
-    .await
-    {
-        Ok(message) => {
-            let _ = message.expect("reconnect request");
-        }
-        Err(error) => {
-            body_task.abort();
-            panic!("reconnect timeout: {error}");
-        }
-    }
-    reconnect_server.send_close(1000, "closed-again").await;
+    .await;
+    assert!(no_reconnect.is_err());
 
-    let body = timeout(Duration::from_secs(1), body_task)
+    let body = to_bytes(response.into_body(), usize::MAX)
         .await
-        .expect("body timeout")
-        .expect("body task");
-    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
-    let payload: Value = serde_json::from_str(data).expect("failed json");
-
-    assert_eq!(frames.len(), 2);
-    assert_eq!(event, "response.failed");
-    assert_response_failed_payload(&payload, "upstream_websocket_closed");
-    assert!(
-        !body_text.contains("event: error\n"),
-        "expected terminal websocket close to use the downstream response.failed contract: {body_text}"
-    );
-    assert_done_frame(frames[1]);
+        .expect("body");
+    let payload: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
 
     let sessions = connector.recorded_sessions().await;
-    assert_eq!(sessions.len(), 3);
+    assert_eq!(sessions.len(), 1);
 }
 
 #[tokio::test]
-async fn stale_continuation_returns_previous_response_not_found_before_sse_without_reconnect_or_resend() {
+async fn stale_continuation_returns_previous_response_not_found_before_sse_without_reconnect_or_resend()
+ {
     let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
     let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![

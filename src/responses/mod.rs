@@ -41,6 +41,7 @@ struct PreparedResponseRoute {
     upstream: Arc<LiveUpstreamWebSocket>,
     lease: ResponseStreamLease,
     previous_response_id: Option<String>,
+    replay_stale_marker_on_pre_first_event_close: bool,
     reconnect_attempted: bool,
     upstream_request: serde_json::Map<String, Value>,
     execute_internal_tools: bool,
@@ -96,45 +97,100 @@ pub async fn responses_handler(
         "responses_request_routed"
     );
     let previous_response_id = request.previous_response_id;
+    let is_continuation_request = previous_response_id.is_some();
     let base_request = request.payload;
     let prepared = match classification {
         DownstreamRequestClassification::Normal => {
             match acquire_lease(&state.registry, previous_response_id.as_deref()).await {
                 Ok(mut lease) => {
-                    let auth = state.services.auth_provider().load()?;
                     let mut upstream_request = base_request.clone();
                     inject_internal_tools(&mut upstream_request);
-                    let mut upstream = ensure_upstream(&state.services, &mut lease, auth).await?;
+                    let mut reconnect_attempted = false;
+                    let upstream = if let Some(previous_response_id) = &previous_response_id {
+                        if !lease.has_open_upstream() {
+                            debug!(
+                                previous_response_id,
+                                session_id = %lease.session().session_id,
+                                thread_id = %lease.session().thread_id,
+                                window_id = %lease.session().window_id,
+                                stale_reason = "missing_or_closed_upstream",
+                                "stale_previous_response_requires_client_replay"
+                            );
+                            lease.release();
+                            return Err(ThreadlineError::PreviousResponseNotFound);
+                        }
 
-                    if let Some(previous_response_id) = &previous_response_id {
                         upstream_request.insert(
                             "previous_response_id".to_string(),
                             Value::String(previous_response_id.clone()),
                         );
-                    }
 
-                    let mut reconnect_attempted = false;
-                    if let Err(error) = send_response_create(&upstream, &upstream_request).await {
-                        if let Some(reconnected) = attempt_pre_first_event_reconnect(
-                            &state.services,
-                            &mut lease,
-                            &upstream_request,
-                            previous_response_id.as_deref(),
-                            false,
-                            &mut reconnect_attempted,
-                        )
-                        .await?
+                        let upstream = lease
+                            .upstream()
+                            .expect("open retained upstream must exist for continuation preflight");
+                        if let Err(error) = send_response_create(&upstream, &upstream_request).await
                         {
-                            upstream = reconnected;
-                        } else {
+                            if matches!(error, ThreadlineError::UpstreamWebSocketClosed) {
+                                debug!(
+                                    previous_response_id,
+                                    session_id = %lease.session().session_id,
+                                    thread_id = %lease.session().thread_id,
+                                    window_id = %lease.session().window_id,
+                                    stale_reason = "first_send_closed",
+                                    "stale_previous_response_requires_client_replay"
+                                );
+                                lease.release();
+                                return Err(ThreadlineError::PreviousResponseNotFound);
+                            }
+
                             return Err(error);
                         }
-                    }
+
+                        tokio::task::yield_now().await;
+                        if upstream.is_closed() {
+                            debug!(
+                                previous_response_id,
+                                session_id = %lease.session().session_id,
+                                thread_id = %lease.session().thread_id,
+                                window_id = %lease.session().window_id,
+                                stale_reason = "first_send_closed_after_enqueue",
+                                "stale_previous_response_requires_client_replay"
+                            );
+                            lease.release();
+                            return Err(ThreadlineError::PreviousResponseNotFound);
+                        }
+
+                        upstream
+                    } else {
+                        let auth = state.services.auth_provider().load()?;
+                        let mut upstream =
+                            ensure_upstream(&state.services, &mut lease, auth).await?;
+                        if let Err(error) = send_response_create(&upstream, &upstream_request).await
+                        {
+                            if let Some(reconnected) = attempt_pre_first_event_reconnect(
+                                &state.services,
+                                &mut lease,
+                                &upstream_request,
+                                previous_response_id.as_deref(),
+                                false,
+                                &mut reconnect_attempted,
+                            )
+                            .await?
+                            {
+                                upstream = reconnected;
+                            } else {
+                                return Err(error);
+                            }
+                        }
+
+                        upstream
+                    };
 
                     PreparedResponseRoute {
                         upstream,
                         lease: ResponseStreamLease::Retained(lease),
                         previous_response_id,
+                        replay_stale_marker_on_pre_first_event_close: is_continuation_request,
                         reconnect_attempted,
                         upstream_request,
                         execute_internal_tools: true,
@@ -213,6 +269,8 @@ pub async fn responses_handler(
         execute_internal_tools: prepared.execute_internal_tools,
         suppressed_internal_output_indexes: std::collections::HashSet::new(),
         upstream_event_seen: false,
+        replay_stale_marker_on_pre_first_event_close: prepared
+            .replay_stale_marker_on_pre_first_event_close,
         reconnect_attempted: prepared.reconnect_attempted,
         observable_output: Default::default(),
         downstream_visible_text_sources: std::collections::HashSet::new(),
@@ -339,6 +397,7 @@ async fn start_transient_auxiliary_route(
         upstream: connected.websocket,
         lease: ResponseStreamLease::TransientAuxiliary,
         previous_response_id: None,
+        replay_stale_marker_on_pre_first_event_close: false,
         reconnect_attempted: false,
         upstream_request,
         execute_internal_tools: false,
