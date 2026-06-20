@@ -176,9 +176,15 @@ When continuing from `previous_response_id`, first resolve the marker in the reg
 
 If the session is open and usable, continue through the retained pump.
 
+An open retained upstream is a best-effort continuation condition, not a guarantee that upstream still recognizes the marker.
+
+For ordinary downstream requests that include `previous_response_id`, forward that marker upstream only when the same marker still has an open retained upstream being continued. If no open retained upstream exists for that marker, do not send a known-stale marker upstream just because the downstream request supplied it.
+
 If a later upstream turn ends with a recoverable `response.failed`, preserve any earlier completed marker that still identifies the retained session.
 
-If the socket is closed but recoverable metadata exists, attempt recovery or reconnect according to the current protocol implementation.
+If the socket is closed but recoverable metadata exists, attempt recovery or reconnect according to the current protocol implementation for recoverable metadata cases other than ordinary downstream `previous_response_id` continuation where that marker no longer has an open retained upstream.
+
+If the first upstream send for that continued turn fails before any upstream event is observed, or if the retained upstream closes before the first upstream event arrives, surface the stable downstream `previous_response_not_found` replay signal instead of reconnecting and resending the same marker.
 
 If recovery fails, return a stable error and keep enough diagnostic information for logs.
 
@@ -343,6 +349,8 @@ A non-empty final `response.completed.response.output` is not by itself the succ
 Emitting a failed `response.id` downstream does not make that id continuation-safe. Only previously completed markers remain valid for later `previous_response_id` requests.
 
 If a prior completed marker exists and the upstream `response.failed` is recoverable, preserve that earlier marker for later resume or retry.
+
+If SSE has already started and upstream later reports `previous_response_not_found`, classify that terminal downstream outcome as `previous_response_not_found` while preserving the prior completed marker or releasing it recoverably. Do not terminal-remove the marker solely because that late not-found was observed.
 
 If an upstream error must be forwarded downstream, normalize it into a stable public error shape.
 

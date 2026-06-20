@@ -1204,7 +1204,12 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
     let normal_line = logs
         .lines()
         .find(|line| {
-            line.contains("responses_request_routed") && line.contains("request_class=\"normal\"")
+            line.contains("responses_request_routed")
+                && line.contains("request_class=\"normal\"")
+                && line.contains("previous_response_id_present=false")
+                && line.contains("context_management_present=false")
+                && line.contains("tools_count=0")
+                && line.contains("input_item_count=1")
         })
         .expect("normal routing diagnostics trace line");
     assert!(normal_line.contains("previous_response_id_present=false"));
