@@ -3270,6 +3270,231 @@ async fn response_failed_id_is_not_a_continuation_marker() {
 }
 
 #[tokio::test]
+async fn upstream_error_event_with_previous_response_not_found_code_emits_previous_response_not_found()
+ {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"error-code"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("error request");
+    server
+        .send_text(
+            r#"{"type":"error","error":{"code":"previous_response_not_found","message":"unrelated upstream text"},"status":404}"#,
+        )
+        .await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_eq!(payload["type"], "response.failed");
+    assert_eq!(payload["response"]["status"], "failed");
+    assert_eq!(
+        payload["response"]["error"]["code"],
+        "previous_response_not_found"
+    );
+    assert_eq!(
+        payload["response"]["error"]["message"],
+        "Threadline could not find the retained session for that previous_response_id."
+    );
+    assert!(
+        !body_text.contains("event: error\n"),
+        "raw upstream error must not be forwarded as a raw error event: {body_text}"
+    );
+    assert_done_frame(frames[1]);
+}
+
+#[tokio::test]
+async fn upstream_error_event_with_previous_response_not_found_message_emits_previous_response_not_found()
+ {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"error-message"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("error request");
+    server
+        .send_text(
+            r#"{"type":"error","error":{"code":"upstream_boom","message":"Previous response with id 'resp_123' not found."},"status":404}"#,
+        )
+        .await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_eq!(
+        payload["response"]["error"]["code"],
+        "previous_response_not_found"
+    );
+    assert_done_frame(frames[1]);
+}
+
+#[tokio::test]
+async fn upstream_error_event_partial_previous_response_messages_remain_upstream_error_event() {
+    for (case_name, error_message) in [
+        (
+            "previous-response-only",
+            "Previous response with id 'resp_123' expired.",
+        ),
+        ("not-found-only", "Session marker not found."),
+    ] {
+        let server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = RecordingConnector::new(vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }]);
+        let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+        let response = post_responses(
+            app,
+            json!({"model":"gpt-5.4","input":format!("partial-{case_name}")}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "status for {case_name}");
+        let _ = server.recv_client_message().await.expect("error request");
+        server
+            .send_text(
+                &json!({
+                    "type": "error",
+                    "error": {
+                        "code": "upstream_boom",
+                        "message": error_message,
+                    },
+                    "status": 404,
+                })
+                .to_string(),
+            )
+            .await;
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        let frames = split_sse_frames(&body_text);
+        let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+        let payload: Value = serde_json::from_str(data).expect("failed json");
+
+        assert_eq!(frames.len(), 2, "frame count for {case_name}");
+        assert_eq!(event, "response.failed", "event for {case_name}");
+        assert_eq!(
+            payload["response"]["error"]["code"], "upstream_error_event",
+            "error code for {case_name}"
+        );
+        assert_done_frame(frames[1]);
+    }
+}
+
+#[tokio::test]
+async fn classified_upstream_previous_response_not_found_releases_prior_marker_without_reconnect() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: Some("turn-state-1".to_string()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&reconnect_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = first_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    first_server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let failed = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"failure",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::OK);
+    let failed_payload: Value = serde_json::from_str(&message_text(
+        first_server
+            .recv_client_message()
+            .await
+            .expect("failed request message"),
+    ))
+    .expect("failed request json");
+    assert_eq!(failed_payload["previous_response_id"], "response-1");
+    first_server
+        .send_text(
+            r#"{"type":"error","error":{"code":"previous_response_not_found","message":"Previous response with id 'response-1' not found."},"status":404}"#,
+        )
+        .await;
+    let _ = to_bytes(failed.into_body(), usize::MAX)
+        .await
+        .expect("failed body");
+
+    first_server
+        .send_close(1000, "classified failure complete")
+        .await;
+    sleep(Duration::from_millis(50)).await;
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+    let resumed_payload: Value = serde_json::from_slice(&resumed_body).expect("resumed body json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+
+    let no_resume_connect = timeout(
+        Duration::from_millis(250),
+        reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_resume_connect.is_err());
+}
+
+#[tokio::test]
 async fn upstream_error_event_emits_response_failed_and_done_without_successful_completion() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {

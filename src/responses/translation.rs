@@ -38,6 +38,19 @@ fn output_index_from_event(event: &Value) -> Option<u64> {
     event.get("output_index").and_then(Value::as_u64)
 }
 
+fn is_upstream_previous_response_not_found_error(
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> bool {
+    if error_code == Some("previous_response_not_found") {
+        return true;
+    }
+
+    error_message.is_some_and(|message| {
+        message.contains("Previous response with id") && message.contains("not found")
+    })
+}
+
 pub(super) enum ResponseStreamLease {
     Retained(RetainedSessionLease),
     TransientAuxiliary,
@@ -1544,24 +1557,46 @@ pub(super) fn response_stream(
                         .get("status")
                         .or_else(|| parsed.get("status_code"))
                         .and_then(safe_scalar_field);
+                    let is_previous_response_not_found =
+                        is_upstream_previous_response_not_found_error(
+                            error_code.as_deref(),
+                            error_message.as_deref(),
+                        );
 
                     debug!(
                         event_type,
-                        error_code, error_message, status, "upstream_error_event"
+                        error_code,
+                        error_message,
+                        status,
+                        is_previous_response_not_found,
+                        "upstream_error_event"
                     );
                     trace_downstream_sse_event(&downstream_sse_trace_metadata(
                         &parsed,
                         DownstreamTraceAction::ErrorTranslated,
                         None,
                     ));
-                    let public_error = ThreadlineError::UpstreamErrorEvent.public_error();
+                    let public_error = if is_previous_response_not_found {
+                        ThreadlineError::PreviousResponseNotFound.public_error()
+                    } else {
+                        ThreadlineError::UpstreamErrorEvent.public_error()
+                    };
+                    let public_message = public_error.message.clone().into_owned();
                     let failed_payload = terminal_failed_payload(
                         parsed.get("response"),
                         response_id_from_event(&parsed),
                         public_error.code.into_owned(),
-                        error_message.unwrap_or_else(|| public_error.message.into_owned()),
+                        if is_previous_response_not_found {
+                            public_message
+                        } else {
+                            error_message.unwrap_or(public_message)
+                        },
                     );
-                    state.lease.mark_upstream_terminal().await;
+                    if is_previous_response_not_found {
+                        state.lease.mark_upstream_recoverable().await;
+                    } else {
+                        state.lease.mark_upstream_terminal().await;
+                    }
                     state.lease.release();
                     state.final_done_pending = true;
                     return Some((
