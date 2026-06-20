@@ -394,14 +394,6 @@ async fn live_retained_continuation_close_before_first_send_returns_previous_res
 }
 
 #[tokio::test]
-#[ignore = "current scripted websocket seams only inject transport-close style failures before first send; preserving non-transport first-send errors without rewriting needs a new seam beyond Phase 1 scope"]
-async fn non_transport_first_send_errors_are_preserved_and_not_rewritten() {
-    todo!(
-        "current scripted websocket seams only inject transport-close style failures before first send; preserving non-transport first-send errors without rewriting needs a new seam beyond Phase 1 scope"
-    );
-}
-
-#[tokio::test]
 async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
     let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {

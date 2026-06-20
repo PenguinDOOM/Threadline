@@ -130,7 +130,8 @@ pub async fn responses_handler(
                             .expect("open retained upstream must exist for continuation preflight");
                         if let Err(error) = send_response_create(&upstream, &upstream_request).await
                         {
-                            if matches!(error, ThreadlineError::UpstreamWebSocketClosed) {
+                            let error = rewrite_stale_continuation_first_send_error(error);
+                            if matches!(error, ThreadlineError::PreviousResponseNotFound) {
                                 debug!(
                                     previous_response_id,
                                     session_id = %lease.session().session_id,
@@ -317,6 +318,13 @@ fn request_class_label(classification: DownstreamRequestClassification) -> &'sta
     }
 }
 
+fn rewrite_stale_continuation_first_send_error(error: ThreadlineError) -> ThreadlineError {
+    match error {
+        ThreadlineError::UpstreamWebSocketClosed => ThreadlineError::PreviousResponseNotFound,
+        other => other,
+    }
+}
+
 async fn attempt_pre_first_event_reconnect(
     services: &ThreadlineServices,
     lease: &mut RetainedSessionLease,
@@ -440,5 +448,33 @@ fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError {
         RegistryAcquireError::RetainedSessionCapacityExceeded => {
             ThreadlineError::RetainedSessionCapacityExceeded
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_stale_continuation_first_send_error;
+    use crate::errors::ThreadlineError;
+
+    #[test]
+    fn stale_continuation_first_send_rewrites_closed_upstream_to_previous_response_not_found() {
+        let rewritten =
+            rewrite_stale_continuation_first_send_error(ThreadlineError::UpstreamWebSocketClosed);
+
+        assert!(matches!(
+            rewritten,
+            ThreadlineError::PreviousResponseNotFound
+        ));
+    }
+
+    #[test]
+    fn stale_continuation_first_send_preserves_non_transport_errors() {
+        let preserved =
+            rewrite_stale_continuation_first_send_error(ThreadlineError::InvalidResponsesRequest);
+
+        assert!(matches!(
+            preserved,
+            ThreadlineError::InvalidResponsesRequest
+        ));
     }
 }
