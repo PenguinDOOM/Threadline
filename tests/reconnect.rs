@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -123,13 +122,6 @@ async fn post_responses(app: axum::Router, payload: Value) -> Response<Body> {
     )
     .await
     .expect("response")
-}
-
-fn message_text(message: Message) -> String {
-    match message {
-        Message::Text(text) => text.to_string(),
-        other => panic!("expected text message, got {other:?}"),
-    }
 }
 
 fn new_session_descriptor() -> UpstreamSessionDescriptor {
@@ -326,131 +318,86 @@ async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
 }
 
 #[tokio::test]
-async fn reconnect_fallback_reuses_the_same_session_once_before_the_first_upstream_event() {
-    let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
-    let first_attempt_server = Arc::new(ScriptedWebSocketServer::start().await);
-    let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+async fn live_retained_continuation_close_before_first_send_returns_previous_response_not_found_without_reconnect_or_resend() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
         PlannedConnection {
-            server: Arc::clone(&seed_server),
+            server: Arc::clone(&retained_server),
             turn_state: Some("turn-state-1".to_string()),
             wait_until_closed_before_return: false,
         },
         PlannedConnection {
-            server: Arc::clone(&first_attempt_server),
-            turn_state: None,
-            wait_until_closed_before_return: false,
-        },
-        PlannedConnection {
-            server: Arc::clone(&reconnect_server),
+            server: Arc::clone(&unexpected_reconnect_server),
             turn_state: None,
             wait_until_closed_before_return: false,
         },
     ]);
     let app = build_test_router(Arc::new(connector.clone()));
 
-    seed_marker(app.clone(), &seed_server, "response-1").await;
-    seed_server.send_close(1000, "seed complete").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    seed_marker(app.clone(), &retained_server, "response-1").await;
 
-    let response = post_responses(
-        app,
-        json!({
-            "model":"gpt-5.4",
-            "input":"followup",
-            "previous_response_id":"response-1"
-        }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let first_attempt_payload: Value = serde_json::from_str(&message_text(
-        timeout(
-            Duration::from_secs(1),
-            first_attempt_server.recv_client_message(),
-        )
-        .await
-        .expect("first continuation timeout")
-        .expect("first continuation request"),
-    ))
-    .expect("first continuation json");
-    assert!(first_attempt_payload.get("response").is_none());
-    assert_eq!(first_attempt_payload["previous_response_id"], "response-1");
-    first_attempt_server
-        .send_close(1000, "closed-before-event")
-        .await;
-
-    let body_task = tokio::spawn(async move {
-        to_bytes(response.into_body(), usize::MAX)
+    let response_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            post_responses(
+                app,
+                json!({
+                    "model":"gpt-5.4",
+                    "input":"followup",
+                    "previous_response_id":"response-1"
+                }),
+            )
             .await
-            .expect("body")
+        }
     });
 
-    let reconnect_message = match timeout(
-        Duration::from_secs(1),
-        reconnect_server.recv_client_message(),
-    )
-    .await
-    {
-        Ok(message) => message.expect("reconnect request"),
-        Err(error) => {
-            body_task.abort();
-            panic!("reconnect timeout: {error}");
-        }
-    };
-    let reconnect_payload: Value =
-        serde_json::from_str(&message_text(reconnect_message)).expect("reconnect json");
-    assert!(reconnect_payload.get("response").is_none());
-    assert_eq!(reconnect_payload["previous_response_id"], "response-1");
-    reconnect_server
-        .send_text(&assistant_text_completed_event("response-2", "resume completion").to_string())
-        .await;
+    retained_server.abort_connection().await;
 
-    let body = timeout(Duration::from_secs(1), body_task)
+    let response = timeout(Duration::from_secs(1), response_task)
         .await
-        .expect("body timeout")
-        .expect("body task");
-    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let frames = split_sse_frames(&body_text);
-    let (delta_event, delta_data, completed_frame, done_frame) = match frames.as_slice() {
-        [delta_frame, completed_frame, done_frame] => {
-            let (delta_event, delta_data) = sse_event_and_data(delta_frame);
-            (
-                Some(delta_event),
-                Some(delta_data),
-                *completed_frame,
-                *done_frame,
-            )
-        }
-        [completed_frame, done_frame] => (None, None, *completed_frame, *done_frame),
-        other => panic!(
-            "unexpected successful reconnect frame sequence: expected [completed, done] or [delta, completed, done], got {other:?}"
-        ),
-    };
-    let (completed_event, completed_data) = sse_event_and_data(completed_frame);
-    let completed_payload: Value = serde_json::from_str(completed_data).expect("completed json");
-
-    if let (Some(delta_event), Some(delta_data)) = (delta_event, delta_data) {
-        let delta_payload: Value = serde_json::from_str(delta_data).expect("delta json");
-        assert_eq!(delta_event, "response.output_text.delta");
-        assert_eq!(delta_payload["delta"], "resume completion");
-    }
-
-    assert_eq!(completed_event, "response.completed");
+        .expect("continuation response timeout")
+        .expect("continuation response task");
     assert_eq!(
-        completed_payload,
-        assistant_text_completed_event("response-2", "resume completion")
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "retained close before first send should fail before SSE starts"
     );
 
-    assert_done_frame(done_frame);
+    let retained_message = timeout(
+        Duration::from_millis(250),
+        retained_server.recv_client_message(),
+    )
+    .await
+    .expect("retained close should resolve the pending client receive");
+    assert!(
+        retained_message.is_none(),
+        "expected the retained upstream to close before resending the same previous_response_id"
+    );
+
+    let no_reconnect = timeout(
+        Duration::from_millis(250),
+        unexpected_reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_reconnect.is_err());
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let payload: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
 
     let sessions = connector.recorded_sessions().await;
-    assert_eq!(sessions.len(), 3);
-    assert_eq!(sessions[1].session_id, sessions[2].session_id);
-    assert_eq!(sessions[1].thread_id, sessions[2].thread_id);
-    assert_eq!(sessions[1].turn_state.as_deref(), Some("turn-state-1"));
-    assert_eq!(sessions[2].turn_state.as_deref(), Some("turn-state-1"));
-    assert_ne!(sessions[1].window_id, sessions[2].window_id);
+    assert_eq!(sessions.len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "current scripted websocket seams only inject transport-close style failures before first send; preserving non-transport first-send errors without rewriting needs a new seam beyond Phase 1 scope"]
+async fn non_transport_first_send_errors_are_preserved_and_not_rewritten() {
+    todo!(
+        "current scripted websocket seams only inject transport-close style failures before first send; preserving non-transport first-send errors without rewriting needs a new seam beyond Phase 1 scope"
+    );
 }
 
 #[tokio::test]
@@ -627,12 +574,9 @@ async fn reconnect_fallback_attempts_only_once() {
 }
 
 #[tokio::test]
-async fn reconnect_fallback_attempts_only_once_after_pre_stream_send_failure() {
+async fn stale_continuation_returns_previous_response_not_found_before_sse_without_reconnect_or_resend() {
     let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
-    let first_attempt_server =
-        Arc::new(ScriptedWebSocketServer::start_disconnect_after_handshake().await);
-    let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
-    let unexpected_third_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
         PlannedConnection {
             server: Arc::clone(&seed_server),
@@ -640,17 +584,7 @@ async fn reconnect_fallback_attempts_only_once_after_pre_stream_send_failure() {
             wait_until_closed_before_return: false,
         },
         PlannedConnection {
-            server: Arc::clone(&first_attempt_server),
-            turn_state: None,
-            wait_until_closed_before_return: true,
-        },
-        PlannedConnection {
-            server: Arc::clone(&reconnect_server),
-            turn_state: None,
-            wait_until_closed_before_return: false,
-        },
-        PlannedConnection {
-            server: Arc::clone(&unexpected_third_server),
+            server: Arc::clone(&unexpected_reconnect_server),
             turn_state: None,
             wait_until_closed_before_return: false,
         },
@@ -670,56 +604,27 @@ async fn reconnect_fallback_attempts_only_once_after_pre_stream_send_failure() {
         }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "stale retained continuation should fail before SSE starts"
+    );
 
-    let body_task = tokio::spawn(async move {
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body")
-    });
-
-    let reconnect_message = timeout(
-        Duration::from_secs(1),
-        reconnect_server.recv_client_message(),
-    )
-    .await
-    .expect("reconnect timeout")
-    .expect("reconnect request");
-    let reconnect_payload: Value =
-        serde_json::from_str(&message_text(reconnect_message)).expect("reconnect json");
-    assert!(reconnect_payload.get("response").is_none());
-    assert_eq!(reconnect_payload["previous_response_id"], "response-1");
-    reconnect_server
-        .send_close(1000, "closed-before-event-again")
-        .await;
-
-    let no_second_reconnect = timeout(
+    let no_reconnect = timeout(
         Duration::from_millis(250),
-        unexpected_third_server.recv_client_message(),
+        unexpected_reconnect_server.recv_client_message(),
     )
     .await;
-    assert!(no_second_reconnect.is_err());
+    assert!(no_reconnect.is_err());
 
-    let body = timeout(Duration::from_secs(1), body_task)
+    let body = to_bytes(response.into_body(), usize::MAX)
         .await
-        .expect("body timeout")
-        .expect("body task");
-    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
-    let payload: Value = serde_json::from_str(data).expect("failed json");
-
-    assert_eq!(frames.len(), 2);
-    assert_eq!(event, "response.failed");
-    assert_response_failed_payload(&payload, "upstream_websocket_closed");
-    assert!(
-        !body_text.contains("event: error\n"),
-        "expected terminal websocket close to use the downstream response.failed contract: {body_text}"
-    );
-    assert_done_frame(frames[1]);
+        .expect("body");
+    let payload: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
 
     let sessions = connector.recorded_sessions().await;
-    assert_eq!(sessions.len(), 3);
+    assert_eq!(sessions.len(), 1);
 }
 
 #[tokio::test]

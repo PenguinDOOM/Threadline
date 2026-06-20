@@ -540,9 +540,10 @@ async fn next_body_chunk(
 }
 
 #[tokio::test]
-async fn response_marker_continuity_reconnects_with_saved_turn_state() {
+async fn stale_previous_response_id_returns_not_found_without_reconnect_or_conflict() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let second_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let third_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
         PlannedConnection {
             server: Arc::clone(&first_server),
@@ -550,6 +551,10 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
         },
         PlannedConnection {
             server: Arc::clone(&second_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&third_server),
             turn_state: None,
         },
     ]);
@@ -584,6 +589,85 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     first_server.send_close(1000, "done").await;
     sleep(Duration::from_millis(50)).await;
 
+    for attempt in ["first", "second"] {
+        let response = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"second",
+                "previous_response_id":"response-1"
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{attempt} stale continuation should fail before SSE starts"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("stale body");
+        let payload: Value = serde_json::from_slice(&body).expect("stale json body");
+        assert_eq!(
+            payload["error"]["code"],
+            "previous_response_not_found",
+            "{attempt} stale continuation should require client replay"
+        );
+        assert_ne!(
+            payload["error"]["code"],
+            "retained_session_conflict",
+            "{attempt} stale continuation should release the retained lease"
+        );
+    }
+
+    let no_second_connect = timeout(
+        Duration::from_millis(250),
+        second_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_second_connect.is_err());
+
+    let no_third_connect = timeout(Duration::from_millis(250), third_server.recv_client_message())
+        .await;
+    assert!(no_third_connect.is_err());
+
+    let sessions = connector.recorded_sessions().await;
+    assert_eq!(sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn live_retained_upstream_continuation_forwards_previous_response_id_without_reconnect() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&retained_server),
+        turn_state: Some("turn-state-1".to_string()),
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let first_response =
+        post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let first_payload: Value = serde_json::from_str(&message_text(
+        retained_server
+            .recv_client_message()
+            .await
+            .expect("first request message"),
+    ))
+    .expect("first request json");
+    assert_eq!(first_payload["type"], "response.create");
+
+    retained_server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-1"}}"#)
+        .await;
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "first completion").to_string())
+        .await;
+    let _ = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+
     let second_response = post_responses(
         app,
         json!({
@@ -596,7 +680,7 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     assert_eq!(second_response.status(), StatusCode::OK);
 
     let second_payload: Value = serde_json::from_str(&message_text(
-        second_server
+        retained_server
             .recv_client_message()
             .await
             .expect("second request message"),
@@ -606,18 +690,15 @@ async fn response_marker_continuity_reconnects_with_saved_turn_state() {
     assert!(second_payload.get("response").is_none());
     assert_eq!(second_payload["previous_response_id"], "response-1");
 
-    let sessions = connector.recorded_sessions().await;
-    assert_eq!(sessions.len(), 2);
-    assert_eq!(sessions[0].session_id, sessions[1].session_id);
-    assert_eq!(sessions[0].thread_id, sessions[1].thread_id);
-    assert_eq!(sessions[1].turn_state.as_deref(), Some("turn-state-1"));
-
-    second_server
+    retained_server
         .send_text(&assistant_text_completed_event("response-2", "second completion").to_string())
         .await;
     let _ = to_bytes(second_response.into_body(), usize::MAX)
         .await
         .expect("second body");
+
+    let sessions = connector.recorded_sessions().await;
+    assert_eq!(sessions.len(), 1);
 }
 
 #[tokio::test]
