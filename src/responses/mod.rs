@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
 use crate::errors::ThreadlineError;
-use crate::models::{RouteProfile, validate_request_model};
+use crate::models::{RouteProfile, resolve_request_model_for_profile};
 use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
 use crate::tools::{inject_internal_tools, is_internal_tool_name};
 use crate::ws_pump::LiveUpstreamWebSocket;
@@ -53,8 +53,12 @@ pub async fn responses_handler(
     State(state): State<ResponsesRouteState>,
     axum::Json(payload): axum::Json<Value>,
 ) -> Result<impl IntoResponse, ThreadlineError> {
-    let request = parse_downstream_request(payload)?;
-    validate_request_model(&request.payload)?;
+    let mut request = parse_downstream_request(payload)?;
+    let model_alias = resolve_request_model_for_profile(&request.payload, state.profile)?;
+    request.payload.insert(
+        "model".to_string(),
+        Value::String(model_alias.upstream_model_id.to_string()),
+    );
     let classification = request.classification;
     let routing_diagnostics = request.routing_diagnostics().clone();
     let previous_response_id_present = request.previous_response_id.is_some();

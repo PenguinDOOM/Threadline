@@ -61,6 +61,13 @@ const UNSUPPORTED_MODEL_IDS: [&str; 4] = [
     "threadline-test-unsupported",
 ];
 
+const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 4] = [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+];
+
 async fn read_json_body(response: axum::response::Response) -> Value {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&body).unwrap()
@@ -86,6 +93,13 @@ async fn post_responses_json(app: axum::Router, payload: Value) -> axum::respons
 fn assert_invalid_model_error(payload: &Value) {
     assert_eq!(payload["error"]["type"], "invalid_request_error");
     assert_eq!(payload["error"]["code"], "invalid_model");
+}
+
+fn utility_config() -> ThreadlineConfig {
+    ThreadlineConfig {
+        profile: RouteProfile::Utility,
+        ..ThreadlineConfig::default()
+    }
 }
 
 #[tokio::test]
@@ -203,6 +217,61 @@ async fn responses_endpoint_rejects_non_string_model() {
 
     let payload = read_json_body(response).await;
     assert_invalid_model_error(&payload);
+}
+
+#[tokio::test]
+async fn responses_model_rejects_missing_non_string_unknown_and_profile_mismatch_cases() {
+    let cases = [
+        (ThreadlineConfig::default(), json!({})),
+        (
+            ThreadlineConfig::default(),
+            invalid_model_payload(json!({ "id": "gpt-5.4" })),
+        ),
+        (
+            ThreadlineConfig::default(),
+            invalid_model_payload(json!("codex-mini-latest")),
+        ),
+        (
+            ThreadlineConfig::default(),
+            invalid_model_payload(json!("threadline-utility-gpt-5.4-mini")),
+        ),
+        (
+            utility_config(),
+            invalid_model_payload(json!("threadline-main-gpt-5.4")),
+        ),
+    ];
+
+    for (config, payload) in cases {
+        let app = build_router_with_services(
+            config,
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(app, payload).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = read_json_body(response).await;
+        assert_invalid_model_error(&body);
+    }
+}
+
+#[tokio::test]
+async fn responses_model_accepts_main_compatibility_ids_on_main() {
+    for model_id in HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS {
+        let app = build_router_with_services(
+            ThreadlineConfig::default(),
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(app, json!({ "model": model_id })).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let payload = read_json_body(response).await;
+        assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
+        assert_eq!(payload["error"]["type"], "configuration_error");
+    }
 }
 
 #[tokio::test]

@@ -26,6 +26,7 @@ use threadline::codex_ws::UpstreamSessionDescriptor;
 use threadline::config::ThreadlineConfig;
 use threadline::errors::ThreadlineError;
 use threadline::http::build_router_with_services;
+use threadline::models::RouteProfile;
 use threadline::responses::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
 };
@@ -3842,6 +3843,90 @@ async fn supported_request_fields_are_preserved_while_codex_unsupported_fields_a
 
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-1"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_model_alias_rewrites_upstream_model() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-utility-gpt-5.4-mini",
+            "input":"utility-alias"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(request_payload["type"], "response.create");
+    assert_eq!(request_payload["model"], "gpt-5.4-mini");
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-alias"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_reasoning_effort_is_preserved() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-utility-gpt-5.4-mini",
+            "input":"utility-reasoning",
+            "reasoning":{"effort":"high","summary":"auto"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(request_payload["model"], "gpt-5.4-mini");
+    assert_eq!(
+        request_payload["reasoning"],
+        json!({"effort":"high","summary":"auto"})
+    );
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-reasoning"}}"#)
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
