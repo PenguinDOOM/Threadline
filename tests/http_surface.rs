@@ -37,13 +37,21 @@ impl UpstreamConnector for UnusedConnector {
     }
 }
 
-const SUPPORTED_MODEL_IDS: [&str; 4] =
-    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"];
+const ADVERTISED_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-5.5", "threadline-main-gpt-5.4"];
+
+const ACCEPTED_MAIN_MODEL_IDS: [&str; 6] = [
+    "threadline-main-gpt-5.5",
+    "threadline-main-gpt-5.4",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+];
 
 const UNSUPPORTED_MODEL_IDS: [&str; 4] = [
+    "threadline-utility-gpt-5.4-mini",
+    "threadline-utility-gpt-5.3-codex-spark",
     "codex-mini-latest",
-    "gpt-5.5-preview",
-    "codex-threadline-preview",
     "threadline-test-unsupported",
 ];
 
@@ -117,9 +125,9 @@ async fn models_endpoint_returns_supported_models() {
 
     assert_eq!(payload["object"], "list");
     let models = payload["data"].as_array().expect("models list");
-    assert_eq!(models.len(), SUPPORTED_MODEL_IDS.len());
+    assert_eq!(models.len(), ADVERTISED_MAIN_MODEL_IDS.len());
 
-    for (model, expected_id) in models.iter().zip(SUPPORTED_MODEL_IDS) {
+    for (model, expected_id) in models.iter().zip(ADVERTISED_MAIN_MODEL_IDS) {
         assert_eq!(model["id"], expected_id);
         assert_eq!(model["object"], "model");
         assert_eq!(model["created"], 0);
@@ -231,7 +239,7 @@ async fn responses_endpoint_rejects_unsupported_model_before_auth_loading_and_up
 
 #[tokio::test]
 async fn responses_endpoint_accepts_each_supported_model_before_missing_auth_error() {
-    for model_id in SUPPORTED_MODEL_IDS {
+    for model_id in ACCEPTED_MAIN_MODEL_IDS {
         let app = build_router_with_services(
             ThreadlineConfig::default(),
             ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),

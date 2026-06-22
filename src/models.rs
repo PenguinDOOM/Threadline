@@ -1,46 +1,174 @@
+use std::sync::OnceLock;
+
 use serde_json::{Map, Value};
 
 use crate::errors::ThreadlineError;
 
-pub const SUPPORTED_MODEL_IDS: [&str; 4] =
-    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteProfile {
+    Main,
+    Utility,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelAlias {
+    pub alias_id: &'static str,
+    pub upstream_model_id: &'static str,
+    pub profile: RouteProfile,
+    pub advertised: bool,
+}
+
+const MODEL_ALIAS_CATALOG: [ModelAlias; 8] = [
+    ModelAlias {
+        alias_id: "threadline-main-gpt-5.5",
+        upstream_model_id: "gpt-5.5",
+        profile: RouteProfile::Main,
+        advertised: true,
+    },
+    ModelAlias {
+        alias_id: "threadline-main-gpt-5.4",
+        upstream_model_id: "gpt-5.4",
+        profile: RouteProfile::Main,
+        advertised: true,
+    },
+    ModelAlias {
+        alias_id: "threadline-utility-gpt-5.4-mini",
+        upstream_model_id: "gpt-5.4-mini",
+        profile: RouteProfile::Utility,
+        advertised: true,
+    },
+    ModelAlias {
+        alias_id: "threadline-utility-gpt-5.3-codex-spark",
+        upstream_model_id: "gpt-5.3-codex-spark",
+        profile: RouteProfile::Utility,
+        advertised: true,
+    },
+    ModelAlias {
+        alias_id: "gpt-5.5",
+        upstream_model_id: "gpt-5.5",
+        profile: RouteProfile::Main,
+        advertised: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-5.4",
+        upstream_model_id: "gpt-5.4",
+        profile: RouteProfile::Main,
+        advertised: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-5.4-mini",
+        upstream_model_id: "gpt-5.4-mini",
+        profile: RouteProfile::Main,
+        advertised: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-5.3-codex-spark",
+        upstream_model_id: "gpt-5.3-codex-spark",
+        profile: RouteProfile::Main,
+        advertised: false,
+    },
+];
+
+static MAIN_ADVERTISED_MODEL_IDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+static UTILITY_ADVERTISED_MODEL_IDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+fn advertised_model_ids_cache(profile: RouteProfile) -> &'static OnceLock<Vec<&'static str>> {
+    match profile {
+        RouteProfile::Main => &MAIN_ADVERTISED_MODEL_IDS,
+        RouteProfile::Utility => &UTILITY_ADVERTISED_MODEL_IDS,
+    }
+}
+
+fn model_alias_by_id(model_id: &str) -> Option<&'static ModelAlias> {
+    MODEL_ALIAS_CATALOG
+        .iter()
+        .find(|alias| alias.alias_id == model_id)
+}
+
+fn resolve_model_alias_for_profile(
+    model_id: &str,
+    profile: RouteProfile,
+) -> Result<&'static ModelAlias, ThreadlineError> {
+    match model_alias_by_id(model_id) {
+        Some(alias) if alias.profile == profile => Ok(alias),
+        _ => Err(ThreadlineError::InvalidModel),
+    }
+}
 
 pub fn supported_model_ids() -> &'static [&'static str] {
-    &SUPPORTED_MODEL_IDS
+    advertised_model_ids_for_profile(RouteProfile::Main)
+}
+
+pub fn advertised_model_ids_for_profile(profile: RouteProfile) -> &'static [&'static str] {
+    advertised_model_ids_cache(profile)
+        .get_or_init(|| {
+            MODEL_ALIAS_CATALOG
+                .iter()
+                .filter(|alias| alias.profile == profile && alias.advertised)
+                .map(|alias| alias.alias_id)
+                .collect()
+        })
+        .as_slice()
 }
 
 pub fn is_supported_model(model_id: &str) -> bool {
-    SUPPORTED_MODEL_IDS.contains(&model_id)
+    model_alias_by_id(model_id).is_some()
 }
 
 pub fn validate_request_model(payload: &Map<String, Value>) -> Result<&str, ThreadlineError> {
+    let alias = resolve_request_model_for_profile(payload, RouteProfile::Main)?;
+    Ok(alias.alias_id)
+}
+
+pub fn resolve_request_model_for_profile(
+    payload: &Map<String, Value>,
+    profile: RouteProfile,
+) -> Result<&'static ModelAlias, ThreadlineError> {
     let model_id = payload
         .get("model")
         .and_then(Value::as_str)
         .ok_or(ThreadlineError::InvalidModel)?;
 
-    if is_supported_model(model_id) {
-        Ok(model_id)
-    } else {
-        Err(ThreadlineError::InvalidModel)
-    }
+    resolve_model_alias_for_profile(model_id, profile)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_supported_model, supported_model_ids, validate_request_model};
+    use super::{
+        RouteProfile, advertised_model_ids_for_profile, is_supported_model,
+        resolve_request_model_for_profile, supported_model_ids, validate_request_model,
+    };
     use serde_json::json;
 
     #[test]
-    fn supported_model_ids_match_public_contract() {
+    fn supported_model_ids_match_main_public_contract() {
         assert_eq!(
             supported_model_ids(),
-            &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",]
+            &["threadline-main-gpt-5.5", "threadline-main-gpt-5.4",]
         );
     }
 
     #[test]
-    fn supported_model_check_accepts_only_contract_models() {
+    fn advertised_model_ids_are_filtered_by_profile() {
+        assert_eq!(
+            advertised_model_ids_for_profile(RouteProfile::Main),
+            &["threadline-main-gpt-5.5", "threadline-main-gpt-5.4",]
+        );
+        assert_eq!(
+            advertised_model_ids_for_profile(RouteProfile::Utility),
+            &[
+                "threadline-utility-gpt-5.4-mini",
+                "threadline-utility-gpt-5.3-codex-spark",
+            ]
+        );
+    }
+
+    #[test]
+    fn supported_model_check_accepts_aliases_and_hidden_main_compatibility_ids() {
+        assert!(is_supported_model("threadline-main-gpt-5.5"));
+        assert!(is_supported_model("threadline-main-gpt-5.4"));
+        assert!(is_supported_model("threadline-utility-gpt-5.4-mini"));
+        assert!(is_supported_model("threadline-utility-gpt-5.3-codex-spark"));
         assert!(is_supported_model("gpt-5.5"));
         assert!(is_supported_model("gpt-5.4"));
         assert!(is_supported_model("gpt-5.4-mini"));
@@ -49,7 +177,96 @@ mod tests {
     }
 
     #[test]
-    fn validate_request_model_requires_supported_string_model() {
+    fn resolve_request_model_for_profile_rewrites_visible_alias_to_upstream_model() {
+        let main = resolve_request_model_for_profile(
+            json!({ "model": "threadline-main-gpt-5.5" })
+                .as_object()
+                .unwrap(),
+            RouteProfile::Main,
+        )
+        .unwrap();
+        assert_eq!(main.alias_id, "threadline-main-gpt-5.5");
+        assert_eq!(main.upstream_model_id, "gpt-5.5");
+        assert_eq!(main.profile, RouteProfile::Main);
+        assert!(main.advertised);
+
+        let utility = resolve_request_model_for_profile(
+            json!({ "model": "threadline-utility-gpt-5.4-mini" })
+                .as_object()
+                .unwrap(),
+            RouteProfile::Utility,
+        )
+        .unwrap();
+        assert_eq!(utility.alias_id, "threadline-utility-gpt-5.4-mini");
+        assert_eq!(utility.upstream_model_id, "gpt-5.4-mini");
+        assert_eq!(utility.profile, RouteProfile::Utility);
+        assert!(utility.advertised);
+    }
+
+    #[test]
+    fn resolve_request_model_for_profile_rejects_profile_mismatch() {
+        assert_eq!(
+            resolve_request_model_for_profile(
+                json!({ "model": "threadline-utility-gpt-5.4-mini" })
+                    .as_object()
+                    .unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap_err()
+            .to_string(),
+            "The /v1/responses request must include a supported string model."
+        );
+        assert_eq!(
+            resolve_request_model_for_profile(
+                json!({ "model": "threadline-main-gpt-5.4" })
+                    .as_object()
+                    .unwrap(),
+                RouteProfile::Utility,
+            )
+            .unwrap_err()
+            .to_string(),
+            "The /v1/responses request must include a supported string model."
+        );
+    }
+
+    #[test]
+    fn resolve_request_model_for_profile_rejects_unknown_model() {
+        assert_eq!(
+            resolve_request_model_for_profile(
+                json!({ "model": "codex-mini-latest" }).as_object().unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap_err()
+            .to_string(),
+            "The /v1/responses request must include a supported string model."
+        );
+    }
+
+    #[test]
+    fn resolve_request_model_for_profile_accepts_hidden_main_compatibility_ids() {
+        let compatibility = resolve_request_model_for_profile(
+            json!({ "model": "gpt-5.4-mini" }).as_object().unwrap(),
+            RouteProfile::Main,
+        )
+        .unwrap();
+        assert_eq!(compatibility.alias_id, "gpt-5.4-mini");
+        assert_eq!(compatibility.upstream_model_id, "gpt-5.4-mini");
+        assert_eq!(compatibility.profile, RouteProfile::Main);
+        assert!(!compatibility.advertised);
+
+        assert_eq!(
+            resolve_request_model_for_profile(
+                json!({ "model": "gpt-5.4-mini" }).as_object().unwrap(),
+                RouteProfile::Utility,
+            )
+            .unwrap_err()
+            .to_string(),
+            "The /v1/responses request must include a supported string model."
+        );
+    }
+
+    #[test]
+    fn validate_request_model_requires_main_supported_string_model() {
         assert_eq!(
             validate_request_model(json!({}).as_object().unwrap())
                 .unwrap_err()
@@ -69,8 +286,23 @@ mod tests {
             "The /v1/responses request must include a supported string model."
         );
         assert_eq!(
-            validate_request_model(json!({ "model": "gpt-5.4" }).as_object().unwrap()).unwrap(),
-            "gpt-5.4"
+            validate_request_model(
+                json!({ "model": "threadline-main-gpt-5.4" })
+                    .as_object()
+                    .unwrap()
+            )
+            .unwrap(),
+            "threadline-main-gpt-5.4"
+        );
+        assert_eq!(
+            validate_request_model(
+                json!({ "model": "threadline-utility-gpt-5.4-mini" })
+                    .as_object()
+                    .unwrap()
+            )
+            .unwrap_err()
+            .to_string(),
+            "The /v1/responses request must include a supported string model."
         );
     }
 }
