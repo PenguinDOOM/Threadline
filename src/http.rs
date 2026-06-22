@@ -14,7 +14,7 @@ use crate::auth::{AuthDiscoveryOptions, load_upstream_auth};
 use crate::codex_ws::build_handshake_request;
 use crate::config::ThreadlineConfig;
 use crate::errors::ThreadlineError;
-use crate::models::supported_model_ids;
+use crate::models::{RouteProfile, advertised_model_ids_for_profile};
 use crate::registry::RetainedSessionRegistry;
 use crate::responses::{
     ConnectedUpstream, ResponsesRouteState, ThreadlineServices, responses_handler,
@@ -26,6 +26,7 @@ const DEFAULT_UPSTREAM_URL: &str = "wss://chatgpt.com/backend-api/codex/response
 
 #[derive(Clone)]
 struct AppState {
+    profile: RouteProfile,
     responses: ResponsesRouteState,
 }
 
@@ -65,12 +66,16 @@ pub fn build_router_with_services(
     services: ThreadlineServices,
 ) -> Router {
     let responses = ResponsesRouteState {
+        profile: config.profile,
         registry: Arc::new(RetainedSessionRegistry::new(
             config.retained_session_capacity,
         )),
         services,
     };
-    let state = AppState { responses };
+    let state = AppState {
+        profile: config.profile,
+        responses,
+    };
 
     Router::new()
         .route("/health", get(health))
@@ -86,10 +91,10 @@ async fn health() -> Json<HealthPayload> {
     })
 }
 
-async fn models() -> Json<ModelListPayload> {
+async fn models(State(state): State<AppState>) -> Json<ModelListPayload> {
     Json(ModelListPayload {
         object: "list",
-        data: supported_model_ids()
+        data: advertised_model_ids_for_profile(state.profile)
             .iter()
             .map(|model_id| ModelEntry {
                 id: (*model_id).to_string(),

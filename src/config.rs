@@ -5,9 +5,11 @@ use std::time::Duration;
 use clap::{Args, Parser};
 
 use crate::jobs::ThreadlineJobManagerConfig;
+use crate::models::RouteProfile;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8100;
+const DEFAULT_PROFILE: RouteProfile = RouteProfile::Main;
 const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.136.0";
 const DEFAULT_RETAINED_SESSION_CAPACITY: usize = 64;
 const DEFAULT_JOBS_ENABLED: bool = false;
@@ -39,6 +41,16 @@ pub struct ThreadlineConfig {
         long_help = "Listen port for the downstream HTTP server. This controls which local TCP port accepts /v1/responses requests."
     )]
     pub port: u16,
+
+    #[arg(
+        long,
+        env = "THREADLINE_PROFILE",
+        default_value_t = DEFAULT_PROFILE,
+        value_name = "PROFILE",
+        help = "Route profile that controls advertised model aliases.",
+        long_help = "Route profile that controls advertised model aliases. Use main for retained-session routes and utility for utility-only model advertisement on this listener."
+    )]
+    pub profile: RouteProfile,
 
     #[arg(
         long,
@@ -115,6 +127,7 @@ impl Default for ThreadlineConfig {
         let config = Self {
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
+            profile: DEFAULT_PROFILE,
             codex_client_version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
             retained_session_capacity: DEFAULT_RETAINED_SESSION_CAPACITY,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
@@ -215,11 +228,38 @@ fn set_active_job_manager_config(config: ThreadlineJobManagerConfig) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
     use clap::{Arg, Command, CommandFactory, Parser};
 
     use crate::cli::ThreadlineCli;
+    use crate::models::RouteProfile;
 
     use super::DEFAULT_CODEX_CLIENT_VERSION;
+
+    static THREADLINE_PROFILE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ProfileEnvGuard {
+        original: Option<OsString>,
+    }
+
+    impl ProfileEnvGuard {
+        fn acquire() -> Self {
+            Self {
+                original: std::env::var_os("THREADLINE_PROFILE"),
+            }
+        }
+    }
+
+    impl Drop for ProfileEnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe { std::env::set_var("THREADLINE_PROFILE", value) },
+                None => unsafe { std::env::remove_var("THREADLINE_PROFILE") },
+            }
+        }
+    }
 
     fn arg_by_long_flag<'a>(command: &'a Command, long_flag: &str) -> &'a Arg {
         command
@@ -301,6 +341,7 @@ mod tests {
         for (long_flag, expected_terms) in [
             ("host", &["listen", "address"][..]),
             ("port", &["listen", "port"][..]),
+            ("profile", &["profile", "main", "utility"][..]),
             ("codex-client-version", &["codex", "client version"][..]),
             (
                 "retained-session-capacity",
@@ -324,5 +365,50 @@ mod tests {
             let argument = arg_by_long_flag(&command, long_flag);
             assert_help_mentions(argument, long_flag, expected_terms);
         }
+    }
+
+    #[test]
+    fn profile_defaults_to_main() {
+        let _lock = THREADLINE_PROFILE_ENV_LOCK.lock().expect("profile env lock");
+        let _guard = ProfileEnvGuard::acquire();
+        unsafe { std::env::remove_var("THREADLINE_PROFILE") };
+
+        let config = ThreadlineCli::parse_from(["threadline"]).server;
+        let command = ThreadlineCli::command();
+        let argument = arg_by_long_flag(&command, "profile");
+        let default_values: Vec<_> = argument
+            .get_default_values()
+            .iter()
+            .map(|value| value.to_str().expect("utf-8 default value"))
+            .collect();
+
+        assert_eq!(config.profile, RouteProfile::Main);
+        assert_eq!(default_values, vec!["main"]);
+    }
+
+    #[test]
+    fn profile_accepts_explicit_utility_value() {
+        let config = ThreadlineCli::try_parse_from(["threadline", "--profile", "utility"])
+            .expect("threadline config should accept utility profile")
+            .server;
+
+        assert_eq!(config.profile, RouteProfile::Utility);
+    }
+
+    #[test]
+    fn profile_rejects_invalid_value() {
+        ThreadlineCli::try_parse_from(["threadline", "--profile", "invalid"])
+            .expect_err("threadline config should reject invalid profiles");
+    }
+
+    #[test]
+    fn profile_reads_threadline_profile_env_var() {
+        let _lock = THREADLINE_PROFILE_ENV_LOCK.lock().expect("profile env lock");
+        let _guard = ProfileEnvGuard::acquire();
+        unsafe { std::env::set_var("THREADLINE_PROFILE", "utility") };
+
+        let config = ThreadlineCli::parse_from(["threadline"]).server;
+
+        assert_eq!(config.profile, RouteProfile::Utility);
     }
 }

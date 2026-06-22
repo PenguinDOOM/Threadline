@@ -1,13 +1,25 @@
 use std::sync::OnceLock;
 
+use clap::ValueEnum;
 use serde_json::{Map, Value};
 
 use crate::errors::ThreadlineError;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RouteProfile {
     Main,
     Utility,
+}
+
+impl std::fmt::Display for RouteProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Main => "main",
+            Self::Utility => "utility",
+        };
+
+        formatter.write_str(value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

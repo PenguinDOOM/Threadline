@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
 use crate::errors::ThreadlineError;
-use crate::models::validate_request_model;
+use crate::models::{RouteProfile, validate_request_model};
 use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
 use crate::tools::{inject_internal_tools, is_internal_tool_name};
 use crate::ws_pump::LiveUpstreamWebSocket;
@@ -33,6 +33,7 @@ pub const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 #[derive(Clone)]
 pub struct ResponsesRouteState {
+    pub profile: RouteProfile,
     pub registry: Arc<RetainedSessionRegistry>,
     pub services: ThreadlineServices,
 }

@@ -112,6 +112,8 @@ mod login_cli_tests {
             "0.0.0.0",
             "--port",
             "9100",
+            "--profile",
+            "utility",
             "--retained-session-capacity",
             "9",
             "--jobs-enabled",
@@ -120,6 +122,7 @@ mod login_cli_tests {
 
         assert_eq!(cli.server.host, "0.0.0.0");
         assert_eq!(cli.server.port, 9100);
+        assert_eq!(cli.server.profile.to_string(), "utility");
         assert_eq!(cli.server.retained_session_capacity, 9);
         assert!(cli.server.jobs_enabled);
     }

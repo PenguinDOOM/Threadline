@@ -11,6 +11,7 @@ use threadline::config::ThreadlineConfig;
 use threadline::errors::ThreadlineError;
 use threadline::http::build_router;
 use threadline::http::build_router_with_services;
+use threadline::models::RouteProfile;
 use threadline::responses::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
 };
@@ -38,6 +39,11 @@ impl UpstreamConnector for UnusedConnector {
 }
 
 const ADVERTISED_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-5.5", "threadline-main-gpt-5.4"];
+
+const ADVERTISED_UTILITY_MODEL_IDS: [&str; 2] = [
+    "threadline-utility-gpt-5.4-mini",
+    "threadline-utility-gpt-5.3-codex-spark",
+];
 
 const ACCEPTED_MAIN_MODEL_IDS: [&str; 6] = [
     "threadline-main-gpt-5.5",
@@ -128,6 +134,39 @@ async fn models_endpoint_returns_supported_models() {
     assert_eq!(models.len(), ADVERTISED_MAIN_MODEL_IDS.len());
 
     for (model, expected_id) in models.iter().zip(ADVERTISED_MAIN_MODEL_IDS) {
+        assert_eq!(model["id"], expected_id);
+        assert_eq!(model["object"], "model");
+        assert_eq!(model["created"], 0);
+        assert_eq!(model["owned_by"], "threadline");
+    }
+}
+
+#[tokio::test]
+async fn models_endpoint_returns_only_utility_profile_models() {
+    let app = build_router(ThreadlineConfig {
+        profile: RouteProfile::Utility,
+        ..ThreadlineConfig::default()
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let payload = read_json_body(response).await;
+
+    assert_eq!(payload["object"], "list");
+    let models = payload["data"].as_array().expect("models list");
+    assert_eq!(models.len(), ADVERTISED_UTILITY_MODEL_IDS.len());
+
+    for (model, expected_id) in models.iter().zip(ADVERTISED_UTILITY_MODEL_IDS) {
         assert_eq!(model["id"], expected_id);
         assert_eq!(model["object"], "model");
         assert_eq!(model["created"], 0);
