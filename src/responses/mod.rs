@@ -20,7 +20,7 @@ mod upstream;
 
 use self::downstream::{
     DownstreamRequestClassification, looks_like_auxiliary_summary_conflict_fallback,
-    parse_downstream_request,
+    parse_downstream_request, wants_reasoning_all_turns,
 };
 use self::translation::{ResponseStreamLease, ResponseStreamState, response_stream};
 use self::upstream::send_response_create;
@@ -61,6 +61,9 @@ pub async fn responses_handler(
 ) -> Result<impl IntoResponse, ThreadlineError> {
     let mut request = parse_downstream_request(payload)?;
     let model_alias = resolve_request_model_for_profile(&request.payload, state.profile)?;
+    if wants_reasoning_all_turns(&request.payload) && !model_alias.supports_reasoning_all_turns {
+        return Err(ThreadlineError::UnsupportedReasoningContext);
+    }
     request.payload.insert(
         "model".to_string(),
         Value::String(model_alias.upstream_model_id.to_string()),

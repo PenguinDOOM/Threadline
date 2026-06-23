@@ -84,6 +84,15 @@ pub(super) fn looks_like_auxiliary_summary_conflict_fallback(
     collect_conflict_fallback_summary_fingerprints(input).matches_auxiliary_summary()
 }
 
+pub(super) fn wants_reasoning_all_turns(payload: &serde_json::Map<String, Value>) -> bool {
+    payload
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("context"))
+        .and_then(Value::as_str)
+        == Some("all_turns")
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct DownstreamRequestRoutingDiagnostics {
     pub(super) summary_hits: SummaryFingerprintHits,
@@ -581,6 +590,7 @@ mod tests {
         DownstreamRequestClassification, parse_downstream_request, safe_scalar_field,
         sse_done_chunk, sse_error_chunk, sse_json_chunk, sse_payload_chunk,
         sse_terminal_response_failed_chunk, sse_terminal_response_incomplete_chunk,
+        wants_reasoning_all_turns,
     };
     use crate::errors::ThreadlineError;
     use serde_json::{Value, json};
@@ -705,6 +715,57 @@ mod tests {
                 }
             ]
         })
+    }
+
+    #[test]
+    fn wants_reasoning_all_turns_matches_only_exact_string_value() {
+        assert!(wants_reasoning_all_turns(
+            json!({
+                "reasoning": {
+                    "context": "all_turns"
+                }
+            })
+            .as_object()
+            .expect("object payload")
+        ));
+
+        assert!(!wants_reasoning_all_turns(
+            json!({
+                "reasoning": {
+                    "context": "last_turn"
+                }
+            })
+            .as_object()
+            .expect("object payload")
+        ));
+    }
+
+    #[test]
+    fn wants_reasoning_all_turns_returns_false_for_missing_or_non_object_reasoning() {
+        assert!(!wants_reasoning_all_turns(
+            json!({ "input": "no reasoning" })
+                .as_object()
+                .expect("object payload")
+        ));
+
+        assert!(!wants_reasoning_all_turns(
+            json!({ "reasoning": "all_turns" })
+                .as_object()
+                .expect("object payload")
+        ));
+    }
+
+    #[test]
+    fn wants_reasoning_all_turns_returns_false_for_non_string_context() {
+        assert!(!wants_reasoning_all_turns(
+            json!({
+                "reasoning": {
+                    "context": true
+                }
+            })
+            .as_object()
+            .expect("object payload")
+        ));
     }
 
     fn new_auto_system_summary_input_item() -> Value {
