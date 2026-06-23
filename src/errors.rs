@@ -87,6 +87,9 @@ pub enum ThreadlineError {
     #[error("Threadline is missing THREADLINE_UPSTREAM_URL for upstream websocket connections.")]
     UpstreamUrlMissing,
 
+    #[error("{0}")]
+    InvalidServerConfiguration(String),
+
     #[error("Invalid bind host: {0}")]
     InvalidBindHost(String),
 }
@@ -121,6 +124,7 @@ impl ThreadlineError {
             Self::JobCancelled => StatusCode::CONFLICT,
             Self::UpstreamCredentialsUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
             Self::UpstreamUrlMissing => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidServerConfiguration(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidBindHost(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -229,6 +233,11 @@ impl ThreadlineError {
                 "Threadline is missing THREADLINE_UPSTREAM_URL for upstream websocket connections.",
                 "configuration_error",
             ),
+            Self::InvalidServerConfiguration(message) => PublicErrorPayload {
+                code: Cow::Borrowed("configuration_error"),
+                message: Cow::Owned(message.clone()),
+                error_type: Cow::Borrowed("configuration_error"),
+            },
             Self::InvalidBindHost(_) => borrowed_public_error(
                 "configuration_error",
                 "Threadline failed to resolve its configured bind address.",
@@ -315,5 +324,23 @@ mod tests {
             error.public_error_document().error.message.as_ref(),
             "The upstream Codex websocket handshake was rejected with HTTP 503 Service Unavailable."
         );
+    }
+
+    #[test]
+    fn invalid_server_configuration_maps_to_configuration_error_with_original_message() {
+        let error = ThreadlineError::InvalidServerConfiguration(
+            "--utility-port must differ from --port".to_string(),
+        );
+
+        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let document = error.public_error_document();
+
+        assert_eq!(document.error.code.as_ref(), "configuration_error");
+        assert_eq!(
+            document.error.message.as_ref(),
+            "--utility-port must differ from --port"
+        );
+        assert_eq!(document.error.error_type.as_ref(), "configuration_error");
     }
 }
