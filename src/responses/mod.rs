@@ -49,6 +49,12 @@ struct PreparedResponseRoute {
     apply_no_observable_output_failure: bool,
 }
 
+#[derive(Clone, Copy)]
+enum TransientRouteKind {
+    AuxiliarySummary,
+    Utility,
+}
+
 pub async fn responses_handler(
     State(state): State<ResponsesRouteState>,
     axum::Json(payload): axum::Json<Value>,
@@ -101,12 +107,15 @@ pub async fn responses_handler(
             .unwrap_or("none"),
         "responses_request_routed"
     );
+    let base_request = request.payload;
     let previous_response_id = request.previous_response_id;
     let is_continuation_request = previous_response_id.is_some();
-    let base_request = request.payload;
-    let prepared = match classification {
-        DownstreamRequestClassification::Normal => {
-            match acquire_lease(&state.registry, previous_response_id.as_deref()).await {
+    let prepared = if state.profile == RouteProfile::Utility {
+        start_transient_route(&state.services, base_request, TransientRouteKind::Utility).await?
+    } else {
+        match classification {
+            DownstreamRequestClassification::Normal => {
+                match acquire_lease(&state.registry, previous_response_id.as_deref()).await {
                 Ok(mut lease) => {
                     let mut upstream_request = base_request.clone();
                     inject_internal_tools(&mut upstream_request);
@@ -255,13 +264,24 @@ pub async fn responses_handler(
                         "retained_session_conflict_rerouted"
                     );
 
-                    start_transient_auxiliary_route(&state.services, base_request).await?
+                    start_transient_route(
+                        &state.services,
+                        base_request,
+                        TransientRouteKind::AuxiliarySummary,
+                    )
+                    .await?
                 }
                 Err(error) => return Err(error),
             }
-        }
-        DownstreamRequestClassification::AuxiliarySummary => {
-            start_transient_auxiliary_route(&state.services, base_request).await?
+            }
+            DownstreamRequestClassification::AuxiliarySummary => {
+                start_transient_route(
+                    &state.services,
+                    base_request,
+                    TransientRouteKind::AuxiliarySummary,
+                )
+                .await?
+            }
         }
     };
 
@@ -396,11 +416,17 @@ async fn acquire_lease(
     }
 }
 
-async fn start_transient_auxiliary_route(
+async fn start_transient_route(
     services: &ThreadlineServices,
     mut upstream_request: serde_json::Map<String, Value>,
+    kind: TransientRouteKind,
 ) -> Result<PreparedResponseRoute, ThreadlineError> {
     strip_threadline_tools(&mut upstream_request);
+
+    if matches!(kind, TransientRouteKind::Utility) {
+        upstream_request.remove("previous_response_id");
+        upstream_request.remove("context_management");
+    }
 
     let auth = services.auth_provider().load()?;
     let connected = services.connector().connect(auth, None).await?;

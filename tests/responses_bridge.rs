@@ -3934,6 +3934,288 @@ async fn utility_reasoning_effort_is_preserved() {
 }
 
 #[tokio::test]
+async fn utility_request_omits_previous_response_id_context_management_and_threadline_tools_upstream()
+ {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            retained_session_capacity: 1,
+            jobs_enabled: true,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-utility-gpt-5.4-mini",
+            "input":"utility-upstream-normalization",
+            "previous_response_id":"response-stale",
+            "context_management":{
+                "type":"compaction",
+                "compact_threshold":12345
+            },
+            "reasoning":{"effort":"high","summary":"auto"},
+            "tools":[
+                {
+                    "type":"function",
+                    "name":"user_tool",
+                    "description":"User tool",
+                    "parameters":{"type":"object"}
+                },
+                {
+                    "type":"function",
+                    "name":"threadline_echo",
+                    "description":"Threadline internal tool",
+                    "parameters":{"type":"object"}
+                },
+                {
+                    "type":"function",
+                    "name":"threadline_start_job",
+                    "description":"Threadline job tool",
+                    "parameters":{"type":"object"}
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(request_payload["type"], "response.create");
+    assert_eq!(request_payload["model"], "gpt-5.4-mini");
+    assert!(request_payload.get("previous_response_id").is_none());
+    assert!(request_payload.get("context_management").is_none());
+    assert_eq!(
+        request_payload["reasoning"],
+        json!({"effort":"high","summary":"auto"})
+    );
+    let tools = request_payload["tools"].as_array().expect("tools array");
+    assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
+    assert!(!tools.iter().any(|tool| {
+        tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("threadline_"))
+    }));
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-normalized"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_requests_ignore_retained_capacity_and_open_fresh_sessions() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let second_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&second_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let first = post_responses(
+        app.clone(),
+        json!({
+            "model":"threadline-utility-gpt-5.4-mini",
+            "input":"first utility request"
+        }),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let first_payload: Value = serde_json::from_str(&message_text(
+        first_server
+            .recv_client_message()
+            .await
+            .expect("first request message"),
+    ))
+    .expect("first request json");
+    assert!(first_payload.get("previous_response_id").is_none());
+
+    let second = post_responses(
+        app.clone(),
+        json!({
+            "model":"threadline-utility-gpt-5.4-mini",
+            "input":"second utility request",
+            "previous_response_id":"response-utility-stale"
+        }),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let second_payload: Value = serde_json::from_str(&message_text(
+        second_server
+            .recv_client_message()
+            .await
+            .expect("second request message"),
+    ))
+    .expect("second request json");
+    assert!(second_payload.get("previous_response_id").is_none());
+
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-1"}}"#)
+        .await;
+    second_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-2"}}"#)
+        .await;
+
+    let _ = to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+    let _ = to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("second body");
+
+    let sessions = connector.recorded_sessions().await;
+    assert_eq!(sessions.len(), 2);
+}
+
+#[tokio::test]
+async fn utility_does_not_execute_upstream_threadline_job_calls_locally() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            jobs_enabled: true,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-utility-gpt-5.4-mini",
+            "input":"utility-job-tool-call"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("initial request"),
+    ))
+    .expect("initial request json");
+    let tools = request_payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !tools.iter().any(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("threadline_"))
+        }),
+        "expected Utility request to exclude internal tools before streaming"
+    );
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-job","name":"threadline_start_job","arguments":"{\"command\":[\"echo\",\"hello\"]}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-job"}}"#)
+        .await;
+
+    let maybe_followup =
+        tokio::time::timeout(Duration::from_millis(100), server.recv_client_message()).await;
+    assert!(
+        !matches!(maybe_followup, Ok(Some(_))),
+        "expected Utility request to avoid internal job-tool follow-up traffic"
+    );
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("terminal frame"));
+    let payload: Value = serde_json::from_str(data).expect("terminal json");
+
+    assert_eq!(event, "response.completed");
+    assert_eq!(payload["response"]["id"], "response-utility-job");
+    assert!(!body_text.contains("threadline_start_job"));
+    assert_done_frame(frames[1]);
+}
+
+#[tokio::test]
+async fn utility_terminal_completion_drops_transient_upstream_handle() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-utility-gpt-5.4-mini",
+            "input":"utility-cleanup"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("utility cleanup request");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-cleanup"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("cleanup body");
+
+    sleep(Duration::from_millis(50)).await;
+    let sockets = connector.recorded_websockets().await;
+    assert!(sockets[0].upgrade().is_none());
+}
+
+#[tokio::test]
 async fn missing_or_null_instructions_are_normalized_for_upstream_response_create() {
     let missing_server = Arc::new(ScriptedWebSocketServer::start().await);
     let null_server = Arc::new(ScriptedWebSocketServer::start().await);
