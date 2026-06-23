@@ -112,6 +112,8 @@ mod login_cli_tests {
             "0.0.0.0",
             "--port",
             "9100",
+            "--utility-port",
+            "9101",
             "--profile",
             "utility",
             "--retained-session-capacity",
@@ -122,6 +124,7 @@ mod login_cli_tests {
 
         assert_eq!(cli.server.host, "0.0.0.0");
         assert_eq!(cli.server.port, 9100);
+        assert_eq!(cli.server.utility_port, Some(9101));
         assert_eq!(cli.server.profile.to_string(), "utility");
         assert_eq!(cli.server.retained_session_capacity, 9);
         assert!(cli.server.jobs_enabled);
@@ -177,6 +180,7 @@ mod login_cli_tests {
         for (flag, env_var, stable_default) in [
             ("--host", "THREADLINE_HOST", Some("127.0.0.1")),
             ("--port", "THREADLINE_PORT", Some("8100")),
+            ("--utility-port", "THREADLINE_UTILITY_PORT", Some("None")),
             (
                 "--codex-client-version",
                 "THREADLINE_CODEX_CLIENT_VERSION",

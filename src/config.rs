@@ -44,6 +44,15 @@ pub struct ThreadlineConfig {
 
     #[arg(
         long,
+        env = "THREADLINE_UTILITY_PORT",
+        value_name = "PORT",
+        help = "Optional port for a second utility listener.",
+        long_help = "Optional port for a second utility listener. When set, Threadline can start a separate utility-profile listener on this port in addition to the main listener."
+    )]
+    pub utility_port: Option<u16>,
+
+    #[arg(
+        long,
         env = "THREADLINE_PROFILE",
         default_value_t = DEFAULT_PROFILE,
         value_name = "PROFILE",
@@ -127,6 +136,7 @@ impl Default for ThreadlineConfig {
         let config = Self {
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
+            utility_port: None,
             profile: DEFAULT_PROFILE,
             codex_client_version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
             retained_session_capacity: DEFAULT_RETAINED_SESSION_CAPACITY,
@@ -236,9 +246,10 @@ mod tests {
     use crate::cli::ThreadlineCli;
     use crate::models::RouteProfile;
 
-    use super::DEFAULT_CODEX_CLIENT_VERSION;
+    use super::{DEFAULT_CODEX_CLIENT_VERSION, ThreadlineConfig};
 
     static THREADLINE_PROFILE_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static THREADLINE_UTILITY_PORT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct ProfileEnvGuard {
         original: Option<OsString>,
@@ -257,6 +268,27 @@ mod tests {
             match self.original.take() {
                 Some(value) => unsafe { std::env::set_var("THREADLINE_PROFILE", value) },
                 None => unsafe { std::env::remove_var("THREADLINE_PROFILE") },
+            }
+        }
+    }
+
+    struct UtilityPortEnvGuard {
+        original: Option<OsString>,
+    }
+
+    impl UtilityPortEnvGuard {
+        fn acquire() -> Self {
+            Self {
+                original: std::env::var_os("THREADLINE_UTILITY_PORT"),
+            }
+        }
+    }
+
+    impl Drop for UtilityPortEnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe { std::env::set_var("THREADLINE_UTILITY_PORT", value) },
+                None => unsafe { std::env::remove_var("THREADLINE_UTILITY_PORT") },
             }
         }
     }
@@ -341,6 +373,7 @@ mod tests {
         for (long_flag, expected_terms) in [
             ("host", &["listen", "address"][..]),
             ("port", &["listen", "port"][..]),
+            ("utility-port", &["utility", "listener", "port"][..]),
             ("profile", &["profile", "main", "utility"][..]),
             ("codex-client-version", &["codex", "client version"][..]),
             (
@@ -414,5 +447,34 @@ mod tests {
         let config = ThreadlineCli::parse_from(["threadline"]).server;
 
         assert_eq!(config.profile, RouteProfile::Utility);
+    }
+
+    #[test]
+    fn utility_port_defaults_to_none() {
+        let config = ThreadlineConfig::default();
+
+        assert_eq!(config.utility_port, None);
+    }
+
+    #[test]
+    fn utility_port_accepts_cli_value() {
+        let config = ThreadlineCli::try_parse_from(["threadline", "--utility-port", "8101"])
+            .expect("threadline config should accept a utility port cli override")
+            .server;
+
+        assert_eq!(config.utility_port, Some(8101));
+    }
+
+    #[test]
+    fn utility_port_reads_threadline_utility_port_env_var() {
+        let _lock = THREADLINE_UTILITY_PORT_ENV_LOCK
+            .lock()
+            .expect("utility port env lock");
+        let _guard = UtilityPortEnvGuard::acquire();
+        unsafe { std::env::set_var("THREADLINE_UTILITY_PORT", "8101") };
+
+        let config = ThreadlineCli::parse_from(["threadline"]).server;
+
+        assert_eq!(config.utility_port, Some(8101));
     }
 }

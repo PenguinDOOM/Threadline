@@ -50,6 +50,7 @@ Threadline reads configuration from CLI flags or environment variables.
 | --- | --- | --- | --- |
 | `--host` | `THREADLINE_HOST` | `127.0.0.1` | Listen address for the downstream HTTP server that accepts local `/v1/responses` requests. |
 | `--port` | `THREADLINE_PORT` | `8100` | Listen port for the downstream HTTP server. |
+| `--utility-port` | `THREADLINE_UTILITY_PORT` | None | Optional port for a second utility listener in the same process. |
 | `--profile` | `THREADLINE_PROFILE` | `main` | Route profile for this listener. Use `main` for retained-session routes and `utility` for stateless utility-only model aliases. |
 | `--codex-client-version` | `THREADLINE_CODEX_CLIENT_VERSION` | `0.136.0` | Codex client version Threadline sends to the upstream backend for compatibility. |
 | `--retained-session-capacity` | `THREADLINE_RETAINED_SESSION_CAPACITY` | `64` | Maximum number of retained sessions kept available for response continuation. |
