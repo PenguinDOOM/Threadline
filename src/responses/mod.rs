@@ -116,163 +116,167 @@ pub async fn responses_handler(
         match classification {
             DownstreamRequestClassification::Normal => {
                 match acquire_lease(&state.registry, previous_response_id.as_deref()).await {
-                Ok(mut lease) => {
-                    let mut upstream_request = base_request.clone();
-                    inject_internal_tools(&mut upstream_request);
-                    let mut reconnect_attempted = false;
-                    let upstream = if let Some(previous_response_id) = &previous_response_id {
-                        if !lease.has_open_upstream() {
-                            debug!(
-                                previous_response_id,
-                                session_id = %lease.session().session_id,
-                                thread_id = %lease.session().thread_id,
-                                window_id = %lease.session().window_id,
-                                stale_reason = "missing_or_closed_upstream",
-                                "stale_previous_response_requires_client_replay"
-                            );
-                            lease.release();
-                            return Err(ThreadlineError::PreviousResponseNotFound);
-                        }
-
-                        upstream_request.insert(
-                            "previous_response_id".to_string(),
-                            Value::String(previous_response_id.clone()),
-                        );
-
-                        let upstream = lease
-                            .upstream()
-                            .expect("open retained upstream must exist for continuation preflight");
-                        if let Err(error) = send_response_create(&upstream, &upstream_request).await
-                        {
-                            let error = rewrite_stale_continuation_first_send_error(error);
-                            if matches!(error, ThreadlineError::PreviousResponseNotFound) {
+                    Ok(mut lease) => {
+                        let mut upstream_request = base_request.clone();
+                        inject_internal_tools(&mut upstream_request);
+                        let mut reconnect_attempted = false;
+                        let upstream = if let Some(previous_response_id) = &previous_response_id {
+                            if !lease.has_open_upstream() {
                                 debug!(
                                     previous_response_id,
                                     session_id = %lease.session().session_id,
                                     thread_id = %lease.session().thread_id,
                                     window_id = %lease.session().window_id,
-                                    stale_reason = "first_send_closed",
+                                    stale_reason = "missing_or_closed_upstream",
                                     "stale_previous_response_requires_client_replay"
                                 );
                                 lease.release();
                                 return Err(ThreadlineError::PreviousResponseNotFound);
                             }
 
-                            return Err(error);
-                        }
-
-                        tokio::task::yield_now().await;
-                        if upstream.is_closed() {
-                            debug!(
-                                previous_response_id,
-                                session_id = %lease.session().session_id,
-                                thread_id = %lease.session().thread_id,
-                                window_id = %lease.session().window_id,
-                                stale_reason = "first_send_closed_after_enqueue",
-                                "stale_previous_response_requires_client_replay"
+                            upstream_request.insert(
+                                "previous_response_id".to_string(),
+                                Value::String(previous_response_id.clone()),
                             );
-                            lease.release();
-                            return Err(ThreadlineError::PreviousResponseNotFound);
-                        }
 
-                        upstream
-                    } else {
-                        let auth = state.services.auth_provider().load()?;
-                        let mut upstream =
-                            ensure_upstream(&state.services, &mut lease, auth).await?;
-                        if let Err(error) = send_response_create(&upstream, &upstream_request).await
-                        {
-                            if let Some(reconnected) = attempt_pre_first_event_reconnect(
-                                &state.services,
-                                &mut lease,
-                                &upstream_request,
-                                previous_response_id.as_deref(),
-                                false,
-                                &mut reconnect_attempted,
-                            )
-                            .await?
+                            let upstream = lease.upstream().expect(
+                                "open retained upstream must exist for continuation preflight",
+                            );
+                            if let Err(error) =
+                                send_response_create(&upstream, &upstream_request).await
                             {
-                                upstream = reconnected;
-                            } else {
+                                let error = rewrite_stale_continuation_first_send_error(error);
+                                if matches!(error, ThreadlineError::PreviousResponseNotFound) {
+                                    debug!(
+                                        previous_response_id,
+                                        session_id = %lease.session().session_id,
+                                        thread_id = %lease.session().thread_id,
+                                        window_id = %lease.session().window_id,
+                                        stale_reason = "first_send_closed",
+                                        "stale_previous_response_requires_client_replay"
+                                    );
+                                    lease.release();
+                                    return Err(ThreadlineError::PreviousResponseNotFound);
+                                }
+
                                 return Err(error);
                             }
+
+                            tokio::task::yield_now().await;
+                            if upstream.is_closed() {
+                                debug!(
+                                    previous_response_id,
+                                    session_id = %lease.session().session_id,
+                                    thread_id = %lease.session().thread_id,
+                                    window_id = %lease.session().window_id,
+                                    stale_reason = "first_send_closed_after_enqueue",
+                                    "stale_previous_response_requires_client_replay"
+                                );
+                                lease.release();
+                                return Err(ThreadlineError::PreviousResponseNotFound);
+                            }
+
+                            upstream
+                        } else {
+                            let auth = state.services.auth_provider().load()?;
+                            let mut upstream =
+                                ensure_upstream(&state.services, &mut lease, auth).await?;
+                            if let Err(error) =
+                                send_response_create(&upstream, &upstream_request).await
+                            {
+                                if let Some(reconnected) = attempt_pre_first_event_reconnect(
+                                    &state.services,
+                                    &mut lease,
+                                    &upstream_request,
+                                    previous_response_id.as_deref(),
+                                    false,
+                                    &mut reconnect_attempted,
+                                )
+                                .await?
+                                {
+                                    upstream = reconnected;
+                                } else {
+                                    return Err(error);
+                                }
+                            }
+
+                            upstream
+                        };
+
+                        PreparedResponseRoute {
+                            upstream,
+                            lease: ResponseStreamLease::Retained(lease),
+                            previous_response_id,
+                            replay_stale_marker_on_pre_first_event_close: is_continuation_request,
+                            reconnect_attempted,
+                            upstream_request,
+                            execute_internal_tools: true,
+                            apply_no_observable_output_failure: true,
+                        }
+                    }
+                    Err(ThreadlineError::RetainedSessionConflict) => {
+                        let fallback_rerouted =
+                            looks_like_auxiliary_summary_conflict_fallback(&base_request);
+                        if !fallback_rerouted {
+                            return Err(ThreadlineError::RetainedSessionConflict);
                         }
 
-                        upstream
-                    };
+                        debug!(
+                            request_class = request_class_label(classification),
+                            previous_response_id_present,
+                            context_management_present,
+                            manual_summary_prompt_hit =
+                                routing_diagnostics.summary_hits.manual_summary_prompt_hit,
+                            manual_structure_instruction_hit = routing_diagnostics
+                                .summary_hits
+                                .manual_structure_instruction_hit,
+                            manual_tool_results_instruction_hit = routing_diagnostics
+                                .summary_hits
+                                .manual_tool_results_instruction_hit,
+                            auto_context_too_large_hit =
+                                routing_diagnostics.summary_hits.auto_context_too_large_hit,
+                            auto_summary_tags_hit =
+                                routing_diagnostics.summary_hits.auto_summary_tags_hit,
+                            auto_only_task_hit =
+                                routing_diagnostics.summary_hits.auto_only_task_hit,
+                            simple_history_context_hit =
+                                routing_diagnostics.summary_hits.simple_history_context_hit,
+                            new_auto_detailed_summary_hit = routing_diagnostics
+                                .summary_hits
+                                .new_auto_detailed_summary_hit,
+                            new_auto_user_history_hit =
+                                routing_diagnostics.summary_hits.new_auto_user_history_hit,
+                            new_auto_user_final_summary_prompt_hit = routing_diagnostics
+                                .summary_hits
+                                .new_auto_user_final_summary_prompt_hit,
+                            summary_instruction_like_hit = routing_diagnostics
+                                .summary_hits
+                                .summary_instruction_like_hit,
+                            fallback_summary_input_hit = fallback_rerouted,
+                            tool_choice =
+                                routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
+                            tools_count = routing_diagnostics.tools_count,
+                            input_item_count = routing_diagnostics.input_item_count,
+                            last_input_role = routing_diagnostics
+                                .last_input_role
+                                .as_deref()
+                                .unwrap_or("none"),
+                            last_input_type = routing_diagnostics
+                                .last_input_type
+                                .as_deref()
+                                .unwrap_or("none"),
+                            "retained_session_conflict_rerouted"
+                        );
 
-                    PreparedResponseRoute {
-                        upstream,
-                        lease: ResponseStreamLease::Retained(lease),
-                        previous_response_id,
-                        replay_stale_marker_on_pre_first_event_close: is_continuation_request,
-                        reconnect_attempted,
-                        upstream_request,
-                        execute_internal_tools: true,
-                        apply_no_observable_output_failure: true,
+                        start_transient_route(
+                            &state.services,
+                            base_request,
+                            TransientRouteKind::AuxiliarySummary,
+                        )
+                        .await?
                     }
+                    Err(error) => return Err(error),
                 }
-                Err(ThreadlineError::RetainedSessionConflict) => {
-                    let fallback_rerouted =
-                        looks_like_auxiliary_summary_conflict_fallback(&base_request);
-                    if !fallback_rerouted {
-                        return Err(ThreadlineError::RetainedSessionConflict);
-                    }
-
-                    debug!(
-                        request_class = request_class_label(classification),
-                        previous_response_id_present,
-                        context_management_present,
-                        manual_summary_prompt_hit =
-                            routing_diagnostics.summary_hits.manual_summary_prompt_hit,
-                        manual_structure_instruction_hit = routing_diagnostics
-                            .summary_hits
-                            .manual_structure_instruction_hit,
-                        manual_tool_results_instruction_hit = routing_diagnostics
-                            .summary_hits
-                            .manual_tool_results_instruction_hit,
-                        auto_context_too_large_hit =
-                            routing_diagnostics.summary_hits.auto_context_too_large_hit,
-                        auto_summary_tags_hit =
-                            routing_diagnostics.summary_hits.auto_summary_tags_hit,
-                        auto_only_task_hit = routing_diagnostics.summary_hits.auto_only_task_hit,
-                        simple_history_context_hit =
-                            routing_diagnostics.summary_hits.simple_history_context_hit,
-                        new_auto_detailed_summary_hit = routing_diagnostics
-                            .summary_hits
-                            .new_auto_detailed_summary_hit,
-                        new_auto_user_history_hit =
-                            routing_diagnostics.summary_hits.new_auto_user_history_hit,
-                        new_auto_user_final_summary_prompt_hit = routing_diagnostics
-                            .summary_hits
-                            .new_auto_user_final_summary_prompt_hit,
-                        summary_instruction_like_hit = routing_diagnostics
-                            .summary_hits
-                            .summary_instruction_like_hit,
-                        fallback_summary_input_hit = fallback_rerouted,
-                        tool_choice = routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
-                        tools_count = routing_diagnostics.tools_count,
-                        input_item_count = routing_diagnostics.input_item_count,
-                        last_input_role = routing_diagnostics
-                            .last_input_role
-                            .as_deref()
-                            .unwrap_or("none"),
-                        last_input_type = routing_diagnostics
-                            .last_input_type
-                            .as_deref()
-                            .unwrap_or("none"),
-                        "retained_session_conflict_rerouted"
-                    );
-
-                    start_transient_route(
-                        &state.services,
-                        base_request,
-                        TransientRouteKind::AuxiliarySummary,
-                    )
-                    .await?
-                }
-                Err(error) => return Err(error),
-            }
             }
             DownstreamRequestClassification::AuxiliarySummary => {
                 start_transient_route(

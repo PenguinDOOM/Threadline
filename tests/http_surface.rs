@@ -61,12 +61,8 @@ const UNSUPPORTED_MODEL_IDS: [&str; 4] = [
     "threadline-test-unsupported",
 ];
 
-const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 4] = [
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex-spark",
-];
+const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 4] =
+    ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"];
 
 async fn read_json_body(response: axum::response::Response) -> Value {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

@@ -3926,7 +3926,9 @@ async fn utility_reasoning_effort_is_preserved() {
     );
 
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-reasoning"}}"#)
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-utility-reasoning"}}"#,
+        )
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -4008,7 +4010,9 @@ async fn utility_request_omits_previous_response_id_context_management_and_threa
     }));
 
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-normalized"}}"#)
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-utility-normalized"}}"#,
+        )
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await

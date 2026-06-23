@@ -369,7 +369,9 @@ mod tests {
 
     #[test]
     fn profile_defaults_to_main() {
-        let _lock = THREADLINE_PROFILE_ENV_LOCK.lock().expect("profile env lock");
+        let _lock = THREADLINE_PROFILE_ENV_LOCK
+            .lock()
+            .expect("profile env lock");
         let _guard = ProfileEnvGuard::acquire();
         unsafe { std::env::remove_var("THREADLINE_PROFILE") };
 
@@ -403,7 +405,9 @@ mod tests {
 
     #[test]
     fn profile_reads_threadline_profile_env_var() {
-        let _lock = THREADLINE_PROFILE_ENV_LOCK.lock().expect("profile env lock");
+        let _lock = THREADLINE_PROFILE_ENV_LOCK
+            .lock()
+            .expect("profile env lock");
         let _guard = ProfileEnvGuard::acquire();
         unsafe { std::env::set_var("THREADLINE_PROFILE", "utility") };
 
