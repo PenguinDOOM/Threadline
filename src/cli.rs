@@ -257,6 +257,24 @@ mod login_cli_tests {
     }
 
     #[test]
+    fn readme_recommends_one_process_dual_listener_startup() {
+        let readme = readme_text();
+
+        assert!(
+            readme.contains("threadline --port 8100 --jobs-enabled --utility-port 8101"),
+            "README should recommend one-process dual-listener startup"
+        );
+        assert!(
+            readme.contains("second stateless Utility listener in the same process"),
+            "README should explain that --utility-port starts a second stateless Utility listener in the same process"
+        );
+        assert!(
+            readme.contains("fallback/debug"),
+            "README should keep two-process startup documented as fallback/debug guidance"
+        );
+    }
+
+    #[test]
     fn login_command_accepts_bare_login_only() {
         let cli =
             ThreadlineCli::try_parse_from(["threadline", "login"]).expect("login should parse");

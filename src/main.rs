@@ -54,8 +54,7 @@ async fn run_main_and_utility_servers(
     main_config: ThreadlineConfig,
     utility_port: u16,
 ) -> Result<(), ThreadlineError> {
-    let (main_config, utility_config) =
-        split_main_and_utility_configs(main_config, utility_port)?;
+    let (main_config, utility_config) = split_main_and_utility_configs(main_config, utility_port)?;
 
     tokio::try_join!(serve_config(main_config), serve_config(utility_config))?;
 

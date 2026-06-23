@@ -64,18 +64,28 @@ Threadline does not accept an arbitrary model override through CLI flags or envi
 
 ## Main And Utility Startup
 
-The initial supported contract is two separate Threadline processes with profile-specific ports:
+The recommended startup path is one Threadline process with two listener ports:
+
+```bash
+threadline --port 8100 --jobs-enabled --utility-port 8101
+```
+
+This starts the default Main listener on port `8100` and a second stateless Utility listener in the same process on port `8101`.
+
+The Utility listener remains stateless because the Utility route profile always uses a fresh one-shot upstream connection and never registers or retains upstream session state.
+
+fallback/debug mode still supports two separate Threadline processes with profile-specific ports:
 
 ```bash
 threadline --port 8100 --jobs-enabled
 threadline --port 8101 --profile utility
 ```
 
-Main uses the default `main` profile on port `8100`. Utility uses `--profile utility` on a separate listener, such as port `8101`.
+Use the two-process form when startup isolation or process-by-process debugging is more useful than the one-process convenience path.
 
 `--retained-session-capacity 0` is optional hardening for a Main listener that should avoid retained continuation state. It is not the mechanism that makes Utility stateless. Utility is stateless because the Utility route profile always uses a fresh one-shot upstream connection and never registers or retains upstream session state.
 
-`--utility-port` is not part of the initial startup contract. It remains a possible future convenience flag for launching a second listener more directly.
+`--utility-port` starts a second stateless Utility listener in the same process. Keep Main and Utility on separate endpoint base URLs, even in one-process mode, so clients still target `http://127.0.0.1:8100/v1` for Main and `http://127.0.0.1:8101/v1` for Utility.
 
 ## Supported Model Aliases
 
