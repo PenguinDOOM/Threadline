@@ -91,6 +91,15 @@ fn assert_invalid_model_error(payload: &Value) {
     assert_eq!(payload["error"]["code"], "invalid_model");
 }
 
+fn assert_unsupported_reasoning_context_error(payload: &Value) {
+    assert_eq!(payload["error"]["type"], "invalid_request_error");
+    assert_eq!(payload["error"]["code"], "unsupported_reasoning_context");
+    assert_eq!(
+        payload["error"]["message"],
+        "reasoning.context=all_turns is not supported for this model. The model metadata has use_responses_lite=false."
+    );
+}
+
 fn utility_config() -> ThreadlineConfig {
     ThreadlineConfig {
         profile: RouteProfile::Utility,
@@ -339,6 +348,87 @@ async fn responses_endpoint_rejects_unsupported_model_before_auth_loading_and_up
         let payload = read_json_body(response).await;
         assert_invalid_model_error(&payload);
     }
+}
+
+#[tokio::test]
+async fn responses_endpoint_rejects_reasoning_all_turns_for_unsupported_model_before_auth_or_upstream()
+{
+    let app = build_router_with_services(
+        utility_config(),
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+
+    let response = post_responses_json(
+        app,
+        json!({
+            "model": "threadline-utility-gpt-5.3-codex-spark",
+            "input": "utility-all-turns",
+            "reasoning": {
+                "context": "all_turns"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let payload = read_json_body(response).await;
+    assert_unsupported_reasoning_context_error(&payload);
+}
+
+#[tokio::test]
+async fn responses_endpoint_allows_non_persistent_request_for_reasoning_all_turns_unsupported_model_to_reach_existing_auth_path()
+{
+    let app = build_router_with_services(
+        utility_config(),
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+
+    let response = post_responses_json(
+        app,
+        json!({
+            "model": "threadline-utility-gpt-5.3-codex-spark",
+            "input": "utility-non-persistent",
+            "reasoning": {
+                "effort": "high"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let payload = read_json_body(response).await;
+    assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
+    assert_eq!(payload["error"]["type"], "configuration_error");
+    assert_ne!(payload["error"]["code"], "unsupported_reasoning_context");
+}
+
+#[tokio::test]
+async fn responses_endpoint_rejects_unsupported_reasoning_all_turns_before_retained_session_lease()
+{
+    let app = build_router(ThreadlineConfig {
+        retained_session_capacity: 0,
+        ..ThreadlineConfig::default()
+    });
+
+    let response = post_responses_json(
+        app,
+        json!({
+            "model": "gpt-5.4",
+            "input": "main-all-turns",
+            "previous_response_id": "response-lease",
+            "reasoning": {
+                "context": "all_turns"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let payload = read_json_body(response).await;
+    assert_unsupported_reasoning_context_error(&payload);
 }
 
 #[tokio::test]
