@@ -363,7 +363,10 @@ mod tests {
 
         let document = error.public_error_document();
 
-        assert_eq!(document.error.code.as_ref(), "unsupported_reasoning_context");
+        assert_eq!(
+            document.error.code.as_ref(),
+            "unsupported_reasoning_context"
+        );
         assert_eq!(
             document.error.message.as_ref(),
             "reasoning.context=all_turns is not supported for this model. The model metadata has use_responses_lite=false."

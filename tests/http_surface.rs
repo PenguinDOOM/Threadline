@@ -352,7 +352,7 @@ async fn responses_endpoint_rejects_unsupported_model_before_auth_loading_and_up
 
 #[tokio::test]
 async fn responses_endpoint_rejects_reasoning_all_turns_for_unsupported_model_before_auth_or_upstream()
-{
+ {
     let app = build_router_with_services(
         utility_config(),
         ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
@@ -378,7 +378,7 @@ async fn responses_endpoint_rejects_reasoning_all_turns_for_unsupported_model_be
 
 #[tokio::test]
 async fn responses_endpoint_allows_non_persistent_request_for_reasoning_all_turns_unsupported_model_to_reach_existing_auth_path()
-{
+ {
     let app = build_router_with_services(
         utility_config(),
         ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),

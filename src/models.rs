@@ -156,8 +156,8 @@ pub fn resolve_request_model_for_profile(
 #[cfg(test)]
 mod tests {
     use super::{
-        advertised_model_ids_for_profile, is_supported_model, resolve_request_model_for_profile,
-        supported_model_ids, validate_request_model, RouteProfile,
+        RouteProfile, advertised_model_ids_for_profile, is_supported_model,
+        resolve_request_model_for_profile, supported_model_ids, validate_request_model,
     };
     use serde_json::json;
 
@@ -359,8 +359,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_request_model_for_profile_keeps_invalid_model_for_wrong_profile_before_capability_use(
-    ) {
+    fn resolve_request_model_for_profile_keeps_invalid_model_for_wrong_profile_before_capability_use()
+     {
         assert_eq!(
             resolve_request_model_for_profile(
                 json!({ "model": "threadline-utility-gpt-5.4-mini" })
@@ -375,8 +375,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_request_model_for_profile_keeps_invalid_model_for_unknown_alias_before_capability_use(
-    ) {
+    fn resolve_request_model_for_profile_keeps_invalid_model_for_unknown_alias_before_capability_use()
+     {
         assert_eq!(
             resolve_request_model_for_profile(
                 json!({ "model": "gpt-5.4-nano" }).as_object().unwrap(),
