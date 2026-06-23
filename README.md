@@ -1,14 +1,19 @@
 # Threadline
 
-Threadline is a Rust service that will bridge VSCode Copilot BYOK Responses API traffic to the Codex backend WebSocket protocol.
+Threadline is a Rust service that bridges VSCode Copilot BYOK Responses API traffic to the Codex backend WebSocket protocol.
 
 Threadline is a BYOK `/v1/responses` bridge. It is not native VS Code Copilot and it does not have native editor, terminal, or extension-host tool integration.
 
-The current implementation provides the initial HTTP surface only:
+The current implementation exposes these HTTP endpoints:
 
 - `GET /health`
 - `GET /v1/models`
-- `POST /v1/responses` placeholder that returns a stable public error until the bridge is implemented
+- `POST /v1/responses`
+
+Threadline currently supports two route profiles:
+
+- Main: retained-session `/v1/responses` routing for primary assistant turns.
+- Utility: stateless one-shot `/v1/responses` routing for utility turns. Utility does not retain upstream sessions, does not use `previous_response_id`, does not keep `context_management`, and does not execute Threadline internal tools or jobs.
 
 ## Expected bridge UX
 
@@ -45,6 +50,7 @@ Threadline reads configuration from CLI flags or environment variables.
 | --- | --- | --- | --- |
 | `--host` | `THREADLINE_HOST` | `127.0.0.1` | Listen address for the downstream HTTP server that accepts local `/v1/responses` requests. |
 | `--port` | `THREADLINE_PORT` | `8100` | Listen port for the downstream HTTP server. |
+| `--profile` | `THREADLINE_PROFILE` | `main` | Route profile for this listener. Use `main` for retained-session routes and `utility` for stateless utility-only model aliases. |
 | `--codex-client-version` | `THREADLINE_CODEX_CLIENT_VERSION` | `0.136.0` | Codex client version Threadline sends to the upstream backend for compatibility. |
 | `--retained-session-capacity` | `THREADLINE_RETAINED_SESSION_CAPACITY` | `64` | Maximum number of retained sessions kept available for response continuation. |
 | `--jobs-enabled` | `THREADLINE_JOBS_ENABLED` | `false` | Enables local job execution support for long-running work. |
@@ -55,14 +61,84 @@ Threadline reads configuration from CLI flags or environment variables.
 
 Threadline does not accept an arbitrary model override through CLI flags or environment variables.
 
-## Supported models
+## Main And Utility Startup
 
-Threadline advertises and accepts exactly these model ids:
+The initial supported contract is two separate Threadline processes with profile-specific ports:
 
-- `gpt-5.5`
-- `gpt-5.4`
-- `gpt-5.4-mini`
-- `gpt-5.3-codex-spark`
+```bash
+threadline --port 8100 --jobs-enabled
+threadline --port 8101 --profile utility
+```
+
+Main uses the default `main` profile on port `8100`. Utility uses `--profile utility` on a separate listener, such as port `8101`.
+
+`--retained-session-capacity 0` is optional hardening for a Main listener that should avoid retained continuation state. It is not the mechanism that makes Utility stateless. Utility is stateless because the Utility route profile always uses a fresh one-shot upstream connection and never registers or retains upstream session state.
+
+`--utility-port` is not part of the initial startup contract. It remains a possible future convenience flag for launching a second listener more directly.
+
+## Supported Model Aliases
+
+These are the visible model ids that Threadline advertises from `/v1/models`.
+
+Main profile aliases:
+
+- `threadline-main-gpt-5.5`
+- `threadline-main-gpt-5.4`
+
+Utility profile aliases:
+
+- `threadline-utility-gpt-5.4-mini`
+- `threadline-utility-gpt-5.3-codex-spark`
+
+These visible ids are aliases for VS Code selection and routing. The upstream model ids sent to Codex remain `gpt-*` ids such as `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`.
+
+For Main compatibility, Threadline still accepts direct `gpt-*` ids on the Main profile even though `/v1/models` advertises only the `threadline-main-*` aliases.
+
+## VS Code Custom Endpoint Setup
+
+Use distinct visible ids and distinct profile-specific URLs so VS Code can keep Main and Utility models separate under `customendpoint/{id}`.
+
+```json
+{
+	"chat.customEndpoints": [
+		{
+			"uri": "http://127.0.0.1:8100/v1",
+			"models": [
+				{
+					"id": "threadline-main-gpt-5.5",
+					"name": "Threadline Main GPT-5.5"
+				},
+				{
+					"id": "threadline-main-gpt-5.4",
+					"name": "Threadline Main GPT-5.4"
+				}
+			]
+		},
+		{
+			"uri": "http://127.0.0.1:8101/v1",
+			"models": [
+				{
+					"id": "threadline-utility-gpt-5.4-mini",
+					"name": "Threadline Utility GPT-5.4 Mini",
+					"supportsReasoningEffort": true
+				},
+				{
+					"id": "threadline-utility-gpt-5.3-codex-spark",
+					"name": "Threadline Utility GPT-5.3 Codex Spark"
+				}
+			]
+		}
+	],
+	"chat.utilityModel": "customendpoint/threadline-utility-gpt-5.4-mini",
+	"chat.utilitySmallModel": "customendpoint/threadline-utility-gpt-5.4-mini"
+}
+```
+
+The visible ids in this JSON are aliases only. VS Code uses `customendpoint/threadline-main-gpt-5.5` and `customendpoint/threadline-utility-gpt-5.4-mini` as local model selectors, while Threadline rewrites the upstream `model` field to the matching `gpt-*` id.
+
+Utility preserves `reasoning.effort` by default when the client sends it. The `supportsReasoningEffort` model setting only controls whether VS Code shows the effort picker for that visible model id.
+
+Utility remains stateless even when the Main listener enables retained sessions or jobs. Utility does not retain upstream sessions, does not register continuation markers, and does not execute Threadline internal tools or Threadline jobs.
 
 Running `threadline` without a subcommand starts the server. `threadline login` is informational only and prints guidance to sign in with Codex Desktop or Codex CLI.
 
