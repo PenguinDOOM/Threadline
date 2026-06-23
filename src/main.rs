@@ -42,22 +42,37 @@ fn login_instructions_message() -> &'static str {
 }
 
 async fn run_server(config: ThreadlineConfig) -> Result<(), ThreadlineError> {
-    let config = match config.utility_port {
-        Some(utility_port) => split_main_and_utility_configs(config, utility_port)?.0,
-        None => config,
-    };
-
     init_tracing(&config);
 
+    match config.utility_port {
+        Some(utility_port) => run_main_and_utility_servers(config, utility_port).await,
+        None => serve_config(config).await,
+    }
+}
+
+async fn run_main_and_utility_servers(
+    main_config: ThreadlineConfig,
+    utility_port: u16,
+) -> Result<(), ThreadlineError> {
+    let (main_config, utility_config) =
+        split_main_and_utility_configs(main_config, utility_port)?;
+
+    tokio::try_join!(serve_config(main_config), serve_config(utility_config))?;
+
+    Ok(())
+}
+
+async fn serve_config(config: ThreadlineConfig) -> Result<(), ThreadlineError> {
     let bind_address = config
         .bind_address()
         .map_err(|_| ThreadlineError::InvalidBindHost(config.host.clone()))?;
+    let profile = config.profile;
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await
         .map_err(|_| ThreadlineError::InvalidBindHost(bind_address.ip().to_string()))?;
     let app = build_router(config);
 
-    info!(address = %bind_address, "threadline_http_server_started");
+    info!(address = %bind_address, profile = %profile, "threadline_http_server_started");
 
     axum::serve(listener, app)
         .await
