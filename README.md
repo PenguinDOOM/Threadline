@@ -105,6 +105,8 @@ These visible ids are aliases for VS Code selection and routing. The upstream mo
 
 For Main compatibility, Threadline still accepts direct `gpt-*` ids on the Main profile even though `/v1/models` advertises only the `threadline-main-*` aliases.
 
+Persistent CoT with `reasoning.context=all_turns` does not currently support the raw compatibility ids `gpt-5.5` and `gpt-5.4`; revisit that later rather than enabling it now. For now, keep `github.copilot.chat.responsesApi.persistentCoT.enabled=false` in VS Code; the current default is already `false`. When supported all-turn reasoning is needed, use the advertised Threadline aliases rather than the raw compatibility ids.
+
 ## VS Code Custom Endpoint Setup
 
 Use distinct visible ids and distinct profile-specific URLs so VS Code can keep Main and Utility models separate under `customendpoint/{id}`.
