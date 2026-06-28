@@ -20,10 +20,14 @@ mod upstream;
 
 use self::downstream::{
     DownstreamRequestClassification, looks_like_auxiliary_summary_conflict_fallback,
-    parse_downstream_request, wants_reasoning_all_turns,
+    parse_downstream_request_with_metadata, wants_reasoning_all_turns,
 };
 use self::translation::{ResponseStreamLease, ResponseStreamState, response_stream};
 use self::upstream::send_response_create;
+
+#[cfg(test)]
+pub(crate) use self::downstream::DownstreamInteractionType;
+pub(crate) use self::downstream::DownstreamRequestMetadata;
 
 pub use self::upstream::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
@@ -55,11 +59,12 @@ enum TransientRouteKind {
     Utility,
 }
 
-pub async fn responses_handler(
+pub(crate) async fn responses_handler(
     State(state): State<ResponsesRouteState>,
     axum::Json(payload): axum::Json<Value>,
+    request_metadata: DownstreamRequestMetadata,
 ) -> Result<impl IntoResponse, ThreadlineError> {
-    let mut request = parse_downstream_request(payload)?;
+    let mut request = parse_downstream_request_with_metadata(payload, request_metadata)?;
     let model_alias = resolve_request_model_for_profile(&request.payload, state.profile)?;
     if wants_reasoning_all_turns(&request.payload) && !model_alias.supports_reasoning_all_turns {
         return Err(ThreadlineError::UnsupportedReasoningContext);
@@ -74,6 +79,8 @@ pub async fn responses_handler(
     let context_management_present = request.payload.contains_key("context_management");
     debug!(
         request_class = request_class_label(classification),
+        interaction_type = routing_diagnostics.interaction_type.label(),
+        interaction_type_compaction_hit = routing_diagnostics.interaction_type_compaction_hit,
         previous_response_id_present,
         context_management_present,
         manual_summary_prompt_hit = routing_diagnostics.summary_hits.manual_summary_prompt_hit,
@@ -226,6 +233,9 @@ pub async fn responses_handler(
 
                         debug!(
                             request_class = request_class_label(classification),
+                            interaction_type = routing_diagnostics.interaction_type.label(),
+                            interaction_type_compaction_hit =
+                                routing_diagnostics.interaction_type_compaction_hit,
                             previous_response_id_present,
                             context_management_present,
                             manual_summary_prompt_hit =

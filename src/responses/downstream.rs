@@ -29,26 +29,37 @@ pub(super) enum DownstreamRequestClassification {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum DownstreamInteractionType {
+pub(crate) enum DownstreamInteractionType {
     #[default]
     None,
     ConversationCompaction,
     Other,
 }
 
+impl DownstreamInteractionType {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ConversationCompaction => "conversation_compaction",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct DownstreamRequestMetadata {
-    pub(super) interaction_type: DownstreamInteractionType,
+pub(crate) struct DownstreamRequestMetadata {
+    interaction_type: DownstreamInteractionType,
 }
 
 impl DownstreamRequestMetadata {
-    pub(super) fn from_interaction_type_header_value(value: Option<&str>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_interaction_type_header_value(value: Option<&str>) -> Self {
         Self {
             interaction_type: normalize_interaction_type(value),
         }
     }
 
-    pub(super) fn from_interaction_type_header_bytes(value: Option<&[u8]>) -> Self {
+    pub(crate) fn from_interaction_type_header_bytes(value: Option<&[u8]>) -> Self {
         let interaction_type = match value {
             Some(raw) => match std::str::from_utf8(raw) {
                 Ok(text) => normalize_interaction_type(Some(text)),
@@ -58,6 +69,11 @@ impl DownstreamRequestMetadata {
         };
 
         Self { interaction_type }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interaction_type(self) -> DownstreamInteractionType {
+        self.interaction_type
     }
 }
 
@@ -79,6 +95,7 @@ impl DownstreamResponsesRequest {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn parse_downstream_request(
     payload: Value,
 ) -> Result<DownstreamResponsesRequest, ThreadlineError> {
@@ -120,6 +137,10 @@ fn normalize_interaction_type(value: Option<&str>) -> DownstreamInteractionType 
 fn classify_request(
     routing_diagnostics: &DownstreamRequestRoutingDiagnostics,
 ) -> DownstreamRequestClassification {
+    if routing_diagnostics.interaction_type_compaction_hit {
+        return DownstreamRequestClassification::AuxiliarySummary;
+    }
+
     if is_auxiliary_summary_request(&routing_diagnostics.summary_hits) {
         DownstreamRequestClassification::AuxiliarySummary
     } else {

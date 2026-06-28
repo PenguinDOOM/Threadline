@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::future::BoxFuture;
@@ -17,12 +18,14 @@ use crate::errors::ThreadlineError;
 use crate::models::{RouteProfile, advertised_model_ids_for_profile};
 use crate::registry::RetainedSessionRegistry;
 use crate::responses::{
-    ConnectedUpstream, ResponsesRouteState, ThreadlineServices, responses_handler,
+    ConnectedUpstream, DownstreamRequestMetadata, ResponsesRouteState, ThreadlineServices,
+    responses_handler,
 };
 use crate::ws_pump::LiveUpstreamWebSocket;
 
 const MODEL_CREATED_UNSPECIFIED: u64 = 0;
 const DEFAULT_UPSTREAM_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
+const INTERACTION_TYPE_HEADER: &str = "x-interaction-type";
 
 #[derive(Clone)]
 struct AppState {
@@ -108,9 +111,21 @@ async fn models(State(state): State<AppState>) -> Json<ModelListPayload> {
 
 async fn responses_route(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<impl axum::response::IntoResponse, ThreadlineError> {
-    responses_handler(State(state.responses), Json(payload)).await
+    let request_metadata = extract_downstream_request_metadata(&headers);
+    responses_handler(State(state.responses), Json(payload), request_metadata).await
+}
+
+fn extract_downstream_request_metadata(headers: &HeaderMap) -> DownstreamRequestMetadata {
+    let interaction_type = headers
+        .get_all(INTERACTION_TYPE_HEADER)
+        .iter()
+        .next()
+        .map(|value| value.as_bytes());
+
+    DownstreamRequestMetadata::from_interaction_type_header_bytes(interaction_type)
 }
 
 #[derive(Clone)]
@@ -207,13 +222,13 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::Response;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderValue, Response, StatusCode};
     use std::ffi::OsString;
     use std::sync::Mutex;
     use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 
     use super::*;
+    use crate::responses::DownstreamInteractionType;
 
     static UPSTREAM_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -309,6 +324,43 @@ mod tests {
         assert_eq!(
             DefaultUpstreamConnector::upstream_url(),
             "wss://example.invalid/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn interaction_type_header_uses_first_duplicate_value() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            INTERACTION_TYPE_HEADER,
+            HeaderValue::from_static("conversation-start"),
+        );
+        headers.append(
+            INTERACTION_TYPE_HEADER,
+            HeaderValue::from_static("conversation-compaction"),
+        );
+
+        let metadata = extract_downstream_request_metadata(&headers);
+
+        assert_eq!(
+            metadata.interaction_type(),
+            DownstreamInteractionType::Other
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            INTERACTION_TYPE_HEADER,
+            HeaderValue::from_static(" conversation-compaction "),
+        );
+        headers.append(
+            INTERACTION_TYPE_HEADER,
+            HeaderValue::from_static("conversation-start"),
+        );
+
+        let metadata = extract_downstream_request_metadata(&headers);
+
+        assert_eq!(
+            metadata.interaction_type(),
+            DownstreamInteractionType::ConversationCompaction
         );
     }
 }
