@@ -220,11 +220,16 @@ impl SummaryFingerprintHits {
         let auto_secondary = self.auto_summary_tags_instruction_like
             || self.auto_only_task_instruction_like
             || self.simple_history_context_instruction_like;
-        let new_auto = self.new_auto_detailed_summary_instruction_like
+        let new_auto_with_history = self.new_auto_detailed_summary_instruction_like
             && self.new_auto_user_history_hit
             && self.new_auto_user_final_summary_prompt_hit;
+        let new_foreground = self.new_auto_detailed_summary_instruction_like
+            && self.new_auto_user_final_summary_prompt_hit;
 
-        (manual_primary && manual_secondary) || (auto_primary && auto_secondary) || new_auto
+        (manual_primary && manual_secondary)
+            || (auto_primary && auto_secondary)
+            || new_auto_with_history
+            || new_foreground
     }
 
     fn record_text(&mut self, text: &str, context: SummaryObservationContext<'_>) {
@@ -243,7 +248,7 @@ impl SummaryFingerprintHits {
             self.new_auto_user_history_hit = true;
         }
 
-        if context.is_user_input_text()
+        if context.is_final_user_input_text()
             && text.contains(MANUAL_SUMMARY_PROMPT)
             && text.contains(MANUAL_STRUCTURE_INSTRUCTION)
             && text.contains(MANUAL_TOOL_RESULTS_INSTRUCTION)
@@ -332,7 +337,7 @@ struct SummaryObservationContext<'a> {
     message_role: Option<&'a str>,
     content_item_type: Option<&'a str>,
     under_content_array: bool,
-    _final_input_item: bool,
+    final_input_item: bool,
     source_category: InputSourceCategory,
 }
 
@@ -347,6 +352,10 @@ impl SummaryObservationContext<'_> {
         self.under_content_array
             && self.content_item_type == Some("input_text")
             && self.source_category == InputSourceCategory::OrdinaryUserContent
+    }
+
+    fn is_final_user_input_text(self) -> bool {
+        self.final_input_item && self.is_user_input_text()
     }
 }
 
@@ -427,7 +436,7 @@ fn collect_summary_fingerprints_into_input(
         Value::Array(items) => {
             for (index, item) in items.iter().enumerate() {
                 let context = SummaryObservationContext {
-                    _final_input_item: index + 1 == items.len(),
+                    final_input_item: index + 1 == items.len(),
                     ..SummaryObservationContext::default()
                 };
                 collect_summary_fingerprints_from_input_item(item, context, fingerprints);
