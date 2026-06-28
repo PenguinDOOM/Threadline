@@ -1014,7 +1014,12 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
         );
 
         let requested_sessions = connector.recorded_requested_sessions().await;
-        assert_eq!(requested_sessions.len(), 2, "session count for {}", shape.label());
+        assert_eq!(
+            requested_sessions.len(),
+            2,
+            "session count for {}",
+            shape.label()
+        );
         assert!(
             requested_sessions[1].is_none(),
             "summary transient connect should use session None for {}",
@@ -1025,7 +1030,7 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
 
 #[tokio::test]
 async fn header_classified_summary_with_active_previous_response_id_routes_transiently_without_retained_conflict()
-{
+ {
     let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
     let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
@@ -1049,7 +1054,10 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
 
     let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
-    let _ = retained_server.recv_client_message().await.expect("seed request");
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
     retained_server
         .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
@@ -1145,9 +1153,11 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
         .send_text(r#"{"type":"response.completed","response":{"id":"response-header-summary"}}"#)
         .await;
 
-    let maybe_followup =
-        tokio::time::timeout(Duration::from_millis(100), summary_server.recv_client_message())
-            .await;
+    let maybe_followup = tokio::time::timeout(
+        Duration::from_millis(100),
+        summary_server.recv_client_message(),
+    )
+    .await;
     assert!(
         !matches!(maybe_followup, Ok(Some(_))),
         "expected header-classified AuxiliarySummary request to avoid internal tool follow-up traffic"
@@ -1427,6 +1437,7 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
                 && line.contains("context_management_present=false")
                 && line.contains("tools_count=0")
                 && line.contains("input_item_count=1")
+                && line.contains("last_input_type=\"string\"")
         })
         .expect("normal routing diagnostics trace line");
     assert!(normal_line.contains("previous_response_id_present=false"));
