@@ -19,12 +19,46 @@ const SIMPLE_HISTORY_CONTEXT_OBSERVED: &str =
     "The following is a compressed version of the preceeding history in the current conversation";
 const SIMPLE_HISTORY_CONTEXT_CORRECTED: &str =
     "The following is a compressed version of the preceding history in the current conversation";
+const MAX_ALLOWLISTED_INTERACTION_TYPE_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum DownstreamRequestClassification {
     #[default]
     Normal,
     AuxiliarySummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum DownstreamInteractionType {
+    #[default]
+    None,
+    ConversationCompaction,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DownstreamRequestMetadata {
+    pub(super) interaction_type: DownstreamInteractionType,
+}
+
+impl DownstreamRequestMetadata {
+    pub(super) fn from_interaction_type_header_value(value: Option<&str>) -> Self {
+        Self {
+            interaction_type: normalize_interaction_type(value),
+        }
+    }
+
+    pub(super) fn from_interaction_type_header_bytes(value: Option<&[u8]>) -> Self {
+        let interaction_type = match value {
+            Some(raw) => match std::str::from_utf8(raw) {
+                Ok(text) => normalize_interaction_type(Some(text)),
+                Err(_) => DownstreamInteractionType::Other,
+            },
+            None => DownstreamInteractionType::None,
+        };
+
+        Self { interaction_type }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,12 +82,39 @@ impl DownstreamResponsesRequest {
 pub(super) fn parse_downstream_request(
     payload: Value,
 ) -> Result<DownstreamResponsesRequest, ThreadlineError> {
+    parse_downstream_request_with_metadata(payload, DownstreamRequestMetadata::default())
+}
+
+pub(super) fn parse_downstream_request_with_metadata(
+    payload: Value,
+    metadata: DownstreamRequestMetadata,
+) -> Result<DownstreamResponsesRequest, ThreadlineError> {
     let mut request = serde_json::from_value::<DownstreamResponsesRequest>(payload)
         .map_err(|_| ThreadlineError::InvalidResponsesRequest)?;
-    let routing_diagnostics = collect_request_routing_diagnostics(&request.payload);
+    let routing_diagnostics = collect_request_routing_diagnostics(&request.payload, metadata);
     request.classification = classify_request(&routing_diagnostics);
     request.routing_diagnostics = routing_diagnostics;
     Ok(request)
+}
+
+fn normalize_interaction_type(value: Option<&str>) -> DownstreamInteractionType {
+    let Some(value) = value.map(str::trim) else {
+        return DownstreamInteractionType::None;
+    };
+
+    if value.is_empty() {
+        return DownstreamInteractionType::None;
+    }
+
+    if value.len() > MAX_ALLOWLISTED_INTERACTION_TYPE_LEN {
+        return DownstreamInteractionType::Other;
+    }
+
+    if value.eq_ignore_ascii_case("conversation-compaction") {
+        DownstreamInteractionType::ConversationCompaction
+    } else {
+        DownstreamInteractionType::Other
+    }
 }
 
 fn classify_request(
@@ -96,6 +157,8 @@ pub(super) fn wants_reasoning_all_turns(payload: &serde_json::Map<String, Value>
 #[derive(Debug, Clone, Default)]
 pub(super) struct DownstreamRequestRoutingDiagnostics {
     pub(super) summary_hits: SummaryFingerprintHits,
+    pub(super) interaction_type: DownstreamInteractionType,
+    pub(super) interaction_type_compaction_hit: bool,
     pub(super) tool_choice: Option<String>,
     pub(super) tools_count: usize,
     pub(super) input_item_count: usize,
@@ -268,11 +331,17 @@ impl SummaryObservationContext<'_> {
 
 fn collect_request_routing_diagnostics(
     payload: &serde_json::Map<String, Value>,
+    metadata: DownstreamRequestMetadata,
 ) -> DownstreamRequestRoutingDiagnostics {
     let input = payload.get("input");
 
     DownstreamRequestRoutingDiagnostics {
         summary_hits: collect_summary_fingerprints(input),
+        interaction_type: metadata.interaction_type,
+        interaction_type_compaction_hit: matches!(
+            metadata.interaction_type,
+            DownstreamInteractionType::ConversationCompaction
+        ),
         tool_choice: safe_value_type_label(payload.get("tool_choice")),
         tools_count: payload
             .get("tools")
@@ -587,7 +656,8 @@ pub(super) fn sse_error_chunk(error: &ThreadlineError) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownstreamRequestClassification, parse_downstream_request, safe_scalar_field,
+        DownstreamInteractionType, DownstreamRequestClassification, DownstreamRequestMetadata,
+        parse_downstream_request, parse_downstream_request_with_metadata, safe_scalar_field,
         sse_done_chunk, sse_error_chunk, sse_json_chunk, sse_payload_chunk,
         sse_terminal_response_failed_chunk, sse_terminal_response_incomplete_chunk,
         wants_reasoning_all_turns,
@@ -791,6 +861,20 @@ mod tests {
         }))
         .expect("parse request")
         .classification
+    }
+
+    fn parse_input_with_metadata(
+        input: Vec<Value>,
+        metadata: DownstreamRequestMetadata,
+    ) -> super::DownstreamResponsesRequest {
+        parse_downstream_request_with_metadata(
+            json!({
+                "previous_response_id": "resp_123",
+                "input": input
+            }),
+            metadata,
+        )
+        .expect("parse request")
     }
 
     fn sanitized_observed_auxiliary_summary_request() -> Value {
@@ -1057,6 +1141,119 @@ mod tests {
     }
 
     #[test]
+    fn parse_downstream_request_classifies_interaction_type_conversation_compaction() {
+        let request = parse_input_with_metadata(
+            vec![input_text_message(
+                "user",
+                "Please continue the earlier task.",
+            )],
+            DownstreamRequestMetadata::from_interaction_type_header_value(Some(
+                "conversation-compaction",
+            )),
+        );
+
+        assert_eq!(
+            request.routing_diagnostics().interaction_type,
+            DownstreamInteractionType::ConversationCompaction
+        );
+        assert!(
+            request
+                .routing_diagnostics()
+                .interaction_type_compaction_hit
+        );
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::AuxiliarySummary
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_trims_and_lowercases_interaction_type() {
+        let request = parse_input_with_metadata(
+            vec![input_text_message(
+                "user",
+                "Please continue the earlier task.",
+            )],
+            DownstreamRequestMetadata::from_interaction_type_header_value(Some(
+                " Conversation-Compaction ",
+            )),
+        );
+
+        assert_eq!(
+            request.routing_diagnostics().interaction_type,
+            DownstreamInteractionType::ConversationCompaction
+        );
+        assert!(
+            request
+                .routing_diagnostics()
+                .interaction_type_compaction_hit
+        );
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::AuxiliarySummary
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_ignores_unknown_empty_non_utf8_or_long_interaction_type() {
+        let long_value = "x".repeat(65);
+
+        for (name, metadata, expected_interaction_type) in [
+            (
+                "missing",
+                DownstreamRequestMetadata::default(),
+                DownstreamInteractionType::None,
+            ),
+            (
+                "empty",
+                DownstreamRequestMetadata::from_interaction_type_header_value(Some("   ")),
+                DownstreamInteractionType::None,
+            ),
+            (
+                "unknown",
+                DownstreamRequestMetadata::from_interaction_type_header_value(Some(
+                    "conversation-start",
+                )),
+                DownstreamInteractionType::Other,
+            ),
+            (
+                "non_utf8",
+                DownstreamRequestMetadata::from_interaction_type_header_bytes(Some(b"\xFF")),
+                DownstreamInteractionType::Other,
+            ),
+            (
+                "too_long",
+                DownstreamRequestMetadata::from_interaction_type_header_value(Some(&long_value)),
+                DownstreamInteractionType::Other,
+            ),
+        ] {
+            let request = parse_input_with_metadata(
+                vec![input_text_message(
+                    "user",
+                    "Please continue the earlier task.",
+                )],
+                metadata,
+            );
+
+            assert_eq!(
+                request.classification,
+                DownstreamRequestClassification::Normal,
+                "fixture should remain normal: {name}"
+            );
+            assert_eq!(
+                request.routing_diagnostics().interaction_type,
+                expected_interaction_type,
+                "fixture should use allowlisted interaction type diagnostics: {name}"
+            );
+            assert!(
+                !request
+                    .routing_diagnostics()
+                    .interaction_type_compaction_hit
+            );
+        }
+    }
+
+    #[test]
     fn parse_downstream_request_does_not_classify_new_auto_partial_fingerprints() {
         for (name, input) in [
             (
@@ -1064,13 +1261,6 @@ mod tests {
                 vec![
                     new_auto_system_summary_input_item(),
                     new_auto_compressed_history_input_item(),
-                ],
-            ),
-            (
-                "system_plus_final_prompt_only",
-                vec![
-                    new_auto_system_summary_input_item(),
-                    new_auto_final_summary_prompt_input_item(),
                 ],
             ),
             (
@@ -1096,6 +1286,141 @@ mod tests {
                 "fixture should remain normal: {name}"
             );
         }
+    }
+
+    #[test]
+    fn parse_downstream_request_classifies_new_foreground_summary_prompt_without_compressed_history()
+     {
+        assert_eq!(
+            classify_input(vec![
+                new_auto_system_summary_input_item(),
+                new_auto_final_summary_prompt_input_item(),
+            ]),
+            DownstreamRequestClassification::AuxiliarySummary
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_user_role_foreground_prompt_quote_only() {
+        assert_eq!(
+            classify_input(vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Quoted prompt: {}", new_auto_final_summary_prompt_text())
+                    }
+                ]
+            })]),
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_new_foreground_partial_fingerprints() {
+        for (name, input) in [
+            ("system_only", vec![new_auto_system_summary_input_item()]),
+            (
+                "final_prompt_only",
+                vec![new_auto_final_summary_prompt_input_item()],
+            ),
+        ] {
+            assert_eq!(
+                classify_input(input),
+                DownstreamRequestClassification::Normal,
+                "fixture should remain normal: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_foreground_prompt_when_not_final_user_input() {
+        assert_eq!(
+            classify_input(vec![
+                new_auto_system_summary_input_item(),
+                new_auto_final_summary_prompt_input_item(),
+                input_text_message("user", "Please continue the earlier task."),
+            ]),
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_split_ordinary_conversation_quotes() {
+        assert_eq!(
+            classify_input(vec![
+                input_text_message(
+                    "user",
+                    &format!(
+                        "The user quoted this instruction earlier: {}",
+                        new_auto_system_summary_text()
+                    ),
+                ),
+                input_text_message(
+                    "user",
+                    &format!(
+                        "The user later quoted this prompt too: {}",
+                        new_auto_final_summary_prompt_text()
+                    ),
+                ),
+            ]),
+            DownstreamRequestClassification::Normal
+        );
+    }
+
+    #[test]
+    fn parse_downstream_request_does_not_classify_new_foreground_fingerprints_outside_input_text() {
+        let request = parse_downstream_request(json!({
+            "previous_response_id": "resp_123",
+            "metadata": {
+                "system_prompt": new_auto_system_summary_text(),
+                "final_prompt": new_auto_final_summary_prompt_text()
+            },
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "echo",
+                    "description": new_auto_final_summary_prompt_text(),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "summary": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            ],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": new_auto_system_summary_text()
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Please continue the earlier task."
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("parse request");
+
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::Normal
+        );
     }
 
     #[test]
