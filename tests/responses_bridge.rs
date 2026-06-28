@@ -54,6 +54,7 @@ struct PlannedConnection {
 struct RecordingConnector {
     plans: Arc<Mutex<VecDeque<PlannedConnection>>>,
     sessions: Arc<Mutex<Vec<UpstreamSessionDescriptor>>>,
+    requested_sessions: Arc<Mutex<Vec<Option<UpstreamSessionDescriptor>>>>,
     websockets: Arc<Mutex<Vec<Weak<LiveUpstreamWebSocket>>>>,
 }
 
@@ -62,12 +63,17 @@ impl RecordingConnector {
         Self {
             plans: Arc::new(Mutex::new(plans.into())),
             sessions: Arc::new(Mutex::new(Vec::new())),
+            requested_sessions: Arc::new(Mutex::new(Vec::new())),
             websockets: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     async fn recorded_sessions(&self) -> Vec<UpstreamSessionDescriptor> {
         self.sessions.lock().await.clone()
+    }
+
+    async fn recorded_requested_sessions(&self) -> Vec<Option<UpstreamSessionDescriptor>> {
+        self.requested_sessions.lock().await.clone()
     }
 
     async fn recorded_websockets(&self) -> Vec<Weak<LiveUpstreamWebSocket>> {
@@ -83,8 +89,10 @@ impl UpstreamConnector for RecordingConnector {
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
         let plans = Arc::clone(&self.plans);
         let sessions = Arc::clone(&self.sessions);
+        let requested_sessions = Arc::clone(&self.requested_sessions);
         let websockets = Arc::clone(&self.websockets);
         Box::pin(async move {
+            requested_sessions.lock().await.push(session.clone());
             let session = session.unwrap_or_else(new_session_descriptor);
             let plan = plans
                 .lock()
@@ -138,6 +146,29 @@ async fn post_responses(app: axum::Router, payload: Value) -> Response<Body> {
             .method("POST")
             .uri("/v1/responses")
             .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("request"),
+    )
+    .await
+    .expect("response")
+}
+
+async fn post_responses_with_headers(
+    app: axum::Router,
+    payload: Value,
+    headers: &[(&str, &str)],
+) -> Response<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json");
+
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+
+    app.oneshot(
+        builder
             .body(Body::from(payload.to_string()))
             .expect("request"),
     )
@@ -324,6 +355,7 @@ enum SummaryRequestShape {
     ManualFull,
     ManualSimple,
     NewAuto,
+    NewForeground,
 }
 
 impl SummaryRequestShape {
@@ -333,6 +365,7 @@ impl SummaryRequestShape {
             Self::ManualFull => "response-summary-manual-full",
             Self::ManualSimple => "response-summary-manual-simple",
             Self::NewAuto => "response-summary-new-auto",
+            Self::NewForeground => "response-summary-new-foreground",
         }
     }
 
@@ -342,6 +375,7 @@ impl SummaryRequestShape {
             Self::ManualFull => "manual_full",
             Self::ManualSimple => "manual_simple",
             Self::NewAuto => "new_auto",
+            Self::NewForeground => "new_foreground",
         }
     }
 
@@ -386,6 +420,28 @@ impl SummaryRequestShape {
                         {
                             "type": "input_text",
                             "text": new_auto_compressed_history_text()
+                        }
+                    ]
+                }),
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": new_auto_final_summary_prompt_text()
+                        }
+                    ]
+                }),
+            ],
+            Self::NewForeground => vec![
+                json!({
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": new_auto_system_summary_text()
                         }
                     ]
                 }),
@@ -875,6 +931,7 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
         SummaryRequestShape::ManualFull,
         SummaryRequestShape::ManualSimple,
         SummaryRequestShape::NewAuto,
+        SummaryRequestShape::NewForeground,
     ] {
         let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
         let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -893,7 +950,7 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
                 retained_session_capacity: 1,
                 ..ThreadlineConfig::default()
             },
-            Arc::new(connector),
+            Arc::new(connector.clone()),
         );
 
         let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
@@ -942,7 +999,163 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
             "summary status for {}",
             shape.label()
         );
+
+        let summary_payload: Value = serde_json::from_str(&message_text(
+            summary_server
+                .recv_client_message()
+                .await
+                .expect("summary request"),
+        ))
+        .expect("summary request json");
+        assert!(
+            summary_payload.get("previous_response_id").is_none(),
+            "previous_response_id should be omitted for {}",
+            shape.label()
+        );
+
+        let requested_sessions = connector.recorded_requested_sessions().await;
+        assert_eq!(requested_sessions.len(), 2, "session count for {}", shape.label());
+        assert!(
+            requested_sessions[1].is_none(),
+            "summary transient connect should use session None for {}",
+            shape.label()
+        );
     }
+}
+
+#[tokio::test]
+async fn header_classified_summary_with_active_previous_response_id_routes_transiently_without_retained_conflict()
+{
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&summary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            jobs_enabled: true,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let _ = retained_server.recv_client_message().await.expect("seed request");
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(initial.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active followup request");
+
+    let response = post_responses_with_headers(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"ordinary header classified summary",
+            "previous_response_id":"response-1",
+            "context_management":{
+                "type":"compaction",
+                "compact_threshold":12345
+            },
+            "tools":[
+                {
+                    "type":"function",
+                    "name":"user_tool",
+                    "description":"User tool",
+                    "parameters":{"type":"object"}
+                },
+                {
+                    "type":"function",
+                    "name":"threadline_start_job",
+                    "description":"Threadline job tool",
+                    "parameters":{"type":"object"}
+                }
+            ]
+        }),
+        &[("x-interaction-type", " conversation-compaction ")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        summary_server
+            .recv_client_message()
+            .await
+            .expect("summary request"),
+    ))
+    .expect("summary request json");
+    assert_eq!(request_payload["type"], "response.create");
+    assert!(request_payload.get("previous_response_id").is_none());
+    assert_eq!(
+        request_payload["context_management"],
+        json!({
+            "type":"compaction",
+            "compact_threshold":12345
+        })
+    );
+    let tools = request_payload["tools"].as_array().expect("tools array");
+    assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
+    assert!(!tools.iter().any(|tool| {
+        tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("threadline_"))
+    }));
+
+    let requested_sessions = connector.recorded_requested_sessions().await;
+    assert_eq!(requested_sessions.len(), 2);
+    assert!(requested_sessions[1].is_none());
+
+    summary_server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-job","name":"threadline_start_job","arguments":"{\"command\":[\"echo\",\"hello\"]}"}}"#,
+        )
+        .await;
+    summary_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-header-summary"}}"#)
+        .await;
+
+    let maybe_followup =
+        tokio::time::timeout(Duration::from_millis(100), summary_server.recv_client_message())
+            .await;
+    assert!(
+        !matches!(maybe_followup, Ok(Some(_))),
+        "expected header-classified AuxiliarySummary request to avoid internal tool follow-up traffic"
+    );
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(!body_text.contains("threadline_start_job"));
 }
 
 #[tokio::test]
@@ -986,6 +1199,7 @@ async fn summary_request_all_shapes_omit_previous_response_id_and_preserve_only_
         SummaryRequestShape::ManualFull,
         SummaryRequestShape::ManualSimple,
         SummaryRequestShape::NewAuto,
+        SummaryRequestShape::NewForeground,
     ] {
         let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
         let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -1182,6 +1396,8 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
         .expect("summary routing diagnostics trace line");
     assert!(summary_line.contains("previous_response_id_present=true"));
     assert!(summary_line.contains("context_management_present=true"));
+    assert!(summary_line.contains("interaction_type=\"none\""));
+    assert!(summary_line.contains("interaction_type_compaction_hit=false"));
     assert!(summary_line.contains("tool_choice=\"none\""));
     assert!(summary_line.contains("tools_count=2"));
     assert!(summary_line.contains("input_item_count=2"));
@@ -1215,6 +1431,8 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
         .expect("normal routing diagnostics trace line");
     assert!(normal_line.contains("previous_response_id_present=false"));
     assert!(normal_line.contains("context_management_present=false"));
+    assert!(normal_line.contains("interaction_type=\"none\""));
+    assert!(normal_line.contains("interaction_type_compaction_hit=false"));
     assert!(normal_line.contains("tool_choice=\"none\""));
     assert!(normal_line.contains("tools_count=0"));
     assert!(normal_line.contains("input_item_count=1"));
@@ -1234,6 +1452,64 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
     assert!(!normal_line.contains(raw_request_secret));
     assert!(!normal_line.contains(raw_request_account));
     assert!(!normal_line.contains("{\"model\":\"gpt-5.4\""));
+}
+
+#[tokio::test]
+async fn header_classified_request_routing_diagnostics_are_privacy_safe() {
+    let trace_guard = TraceCaptureGuard::begin().await;
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+    let raw_request_secret = "secret-789";
+    let raw_request_header = "conversation-compaction";
+
+    let response = post_responses_with_headers(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input": format!("ordinary request body {raw_request_secret}"),
+            "previous_response_id":"response-1",
+            "context_management":{
+                "type":"compaction",
+                "compact_threshold":12345
+            }
+        }),
+        &[("x-interaction-type", raw_request_header)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("summary request");
+    server
+        .send_text(
+            &assistant_text_completed_event("response-header-diagnostics", "summary completion")
+                .to_string(),
+        )
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+
+    let logs = trace_guard.logs();
+    let routed_line = logs
+        .lines()
+        .find(|line| {
+            line.contains("responses_request_routed")
+                && line.contains("request_class=\"auxiliary_summary\"")
+                && line.contains("interaction_type=\"conversation_compaction\"")
+        })
+        .expect("header routing diagnostics trace line");
+    assert!(routed_line.contains("interaction_type_compaction_hit=true"));
+    assert!(routed_line.contains("previous_response_id_present=true"));
+    assert!(routed_line.contains("context_management_present=true"));
+    assert!(routed_line.contains("manual_summary_prompt_hit=false"));
+    assert!(routed_line.contains("summary_instruction_like_hit=false"));
+    assert!(!routed_line.contains(raw_request_secret));
+    assert!(!routed_line.contains(raw_request_header));
+    assert!(!routed_line.contains("response-1"));
+    assert!(!routed_line.contains("{\"model\":\"gpt-5.4\""));
 }
 
 #[tokio::test]
@@ -1282,6 +1558,7 @@ async fn summary_request_all_shape_response_ids_are_not_registered_as_continuati
         SummaryRequestShape::ManualFull,
         SummaryRequestShape::ManualSimple,
         SummaryRequestShape::NewAuto,
+        SummaryRequestShape::NewForeground,
     ] {
         let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
         let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -2125,6 +2402,8 @@ async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
         })
         .expect("rerouted diagnostics trace line");
     assert!(rerouted_line.contains("request_class=\"normal\""));
+    assert!(rerouted_line.contains("interaction_type=\"none\""));
+    assert!(rerouted_line.contains("interaction_type_compaction_hit=false"));
     assert!(rerouted_line.contains("previous_response_id_present=true"));
     assert!(rerouted_line.contains("context_management_present=true"));
     assert!(rerouted_line.contains("manual_summary_prompt_hit=true"));
