@@ -66,9 +66,9 @@ For this ordinary-request success rule, downstream-observable output is limited 
 
 The `threadline_no_observable_output` guard exists to prevent empty or effectively invisible ordinary-request successes. It does not reject a response merely because the only observable output is preserved compaction or another preserved downstream-consumable state marker.
 
-Server-side `context_management` compaction remains distinct from client-side auxiliary summary behavior. Do not treat preserved compaction, context, or marker-like output as summary-only behavior merely because `context_management` fields are present.
+Server-side `context_management` compaction remains distinct from client-side auxiliary summary behavior. In the current v1 bridge, Threadline strips downstream `context_management` before every upstream `response.create`. Do not treat preserved compaction, context, or marker-like output as summary-only behavior merely because downstream `context_management` fields were present.
 
-Server-side `context_management` compaction is requested through the upstream `response.create` payload and is satisfied only when upstream emits downstream-consumable compaction output that Threadline forwards or retains. Client-side auxiliary summary remains a separate VS Code behavior used for summary-only prompt shapes and does not replace retained-session continuation markers or prove that server-side compaction worked.
+Client-side auxiliary summary remains a separate VS Code behavior used for summary-only prompt shapes. It does not replace retained-session continuation markers, and the v1 bridge does not claim or prove server-side `context_management` passthrough support.
 
 Internal `threadline_*` tool events, intermediate completions that only finish internal-tool work, and other marker-like payloads that Threadline neither forwards downstream nor retains in the completed downstream output do not themselves satisfy the downstream-observable-output requirement.
 
@@ -392,7 +392,7 @@ Use structured tracing for protocol events.
 
 Useful fields include `response_id`, `previous_response_id`, `session_id`, `thread_id`, `job_id`, `tool_name`, `marker`, `generation`, `recoverable`, and `close_code`.
 
-For compaction-sensitive diagnostics, keep logs limited to safe structured facts such as item counts, item types, item ids, booleans, and presence flags like whether `context_management` was present, whether compaction was forwarded, or whether preserved completed output contained a compaction item.
+For compaction-sensitive diagnostics, keep logs limited to safe structured facts such as item counts, item types, item ids, booleans, and presence flags like whether downstream `context_management` was present, whether Threadline stripped it upstream, or whether preserved completed output contained a compaction item.
 
 Do not log or echo `encrypted_content`, prompts, tool arguments, tokens, cookies, raw request bodies, or other opaque compaction payload fields.
 
@@ -405,13 +405,13 @@ Use stable event names as described in `docs/agent/conventions.md`.
 Use this checklist when verifying VS Code and Codex round-trip behavior without dumping sensitive payloads:
 
 1. Confirm the incoming downstream `/v1/responses` request includes `context_management` and record only safe facts such as the configured compaction `type`, presence of `compact_threshold`, and whether `previous_response_id` is present.
-2. Confirm the upstream `response.create` payload still includes `context_management` after Threadline normalization, and confirm unsupported fields were filtered without logging prompts, tokens, or raw bodies.
+2. Confirm the upstream `response.create` payload omits `context_management` after Threadline normalization, and confirm only safe structured stripping facts were recorded without logging prompts, tokens, or raw bodies.
 3. Confirm the downstream stream or terminal `response.completed` includes a preserved `type: "compaction"` item by checking only safe structure such as item count, item `type`, item `id`, and whether `encrypted_content` is present.
 4. Confirm the ordinary-request terminal result matches visibility rules: a preserved compaction-only completion is a valid `response.completed`, while a terminal path with no forwarded or retained observable output must become `threadline_no_observable_output`.
 5. Confirm VS Code records the returned compaction item without exposing its opaque payload, using only safe indicators such as a compaction-related event name, presence flag, item id, or count.
 6. Confirm the next downstream request round-trips the prior compaction item as input by matching only safe structure such as `type: "compaction"`, item `id`, and presence flags rather than comparing raw encrypted payload bytes in logs.
 
-If the request keeps `context_management` but no preserved or forwarded compaction item ever returns downstream, treat that as evidence about upstream backend behavior rather than as proof that auxiliary summary covered the same contract.
+If the downstream request included `context_management` but no preserved or forwarded compaction item ever returns downstream, do not treat auxiliary summary as covering a server-side compaction contract that the v1 bridge does not send upstream.
 
 ## Protocol change checklist
 
