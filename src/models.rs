@@ -31,7 +31,28 @@ pub struct ModelAlias {
     pub supports_reasoning_all_turns: bool,
 }
 
-const MODEL_ALIAS_CATALOG: [ModelAlias; 8] = [
+const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
+    ModelAlias {
+        alias_id: "threadline-main-gpt-5.6-sol",
+        upstream_model_id: "gpt-5.6-sol",
+        profile: RouteProfile::Main,
+        advertised: true,
+        supports_reasoning_all_turns: true,
+    },
+    ModelAlias {
+        alias_id: "threadline-main-gpt-5.6-terra",
+        upstream_model_id: "gpt-5.6-terra",
+        profile: RouteProfile::Main,
+        advertised: true,
+        supports_reasoning_all_turns: true,
+    },
+    ModelAlias {
+        alias_id: "threadline-main-gpt-5.6-luna",
+        upstream_model_id: "gpt-5.6-luna",
+        profile: RouteProfile::Main,
+        advertised: true,
+        supports_reasoning_all_turns: true,
+    },
     ModelAlias {
         alias_id: "threadline-main-gpt-5.5",
         upstream_model_id: "gpt-5.5",
@@ -58,6 +79,27 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 8] = [
         upstream_model_id: "gpt-5.3-codex-spark",
         profile: RouteProfile::Utility,
         advertised: true,
+        supports_reasoning_all_turns: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-5.6-sol",
+        upstream_model_id: "gpt-5.6-sol",
+        profile: RouteProfile::Main,
+        advertised: false,
+        supports_reasoning_all_turns: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-5.6-terra",
+        upstream_model_id: "gpt-5.6-terra",
+        profile: RouteProfile::Main,
+        advertised: false,
+        supports_reasoning_all_turns: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-5.6-luna",
+        upstream_model_id: "gpt-5.6-luna",
+        profile: RouteProfile::Main,
+        advertised: false,
         supports_reasoning_all_turns: false,
     },
     ModelAlias {
@@ -167,11 +209,8 @@ mod tests {
         "threadline-main-gpt-5.6-luna",
     ];
 
-    const NEW_MAIN_RAW_COMPATIBILITY_IDS: [&str; 3] = [
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-    ];
+    const NEW_MAIN_RAW_COMPATIBILITY_IDS: [&str; 3] =
+        ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 
     #[test]
     fn supported_model_ids_match_main_public_contract() {
