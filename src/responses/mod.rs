@@ -59,6 +59,15 @@ enum TransientRouteKind {
     Utility,
 }
 
+impl TransientRouteKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AuxiliarySummary => "auxiliary_summary",
+            Self::Utility => "utility",
+        }
+    }
+}
+
 pub(crate) async fn responses_handler(
     State(state): State<ResponsesRouteState>,
     axum::Json(payload): axum::Json<Value>,
@@ -121,7 +130,13 @@ pub(crate) async fn responses_handler(
     let previous_response_id = request.previous_response_id;
     let is_continuation_request = previous_response_id.is_some();
     let prepared = if state.profile == RouteProfile::Utility {
-        start_transient_route(&state.services, base_request, TransientRouteKind::Utility).await?
+        start_transient_route(
+            &state.services,
+            base_request,
+            classification,
+            TransientRouteKind::Utility,
+        )
+        .await?
     } else {
         match classification {
             DownstreamRequestClassification::Normal => {
@@ -129,6 +144,11 @@ pub(crate) async fn responses_handler(
                     Ok(mut lease) => {
                         let mut upstream_request = base_request.clone();
                         inject_internal_tools(&mut upstream_request);
+                        strip_context_management_for_upstream(
+                            &mut upstream_request,
+                            "normal",
+                            classification,
+                        );
                         let mut reconnect_attempted = false;
                         let upstream = if let Some(previous_response_id) = &previous_response_id {
                             if !lease.has_open_upstream() {
@@ -284,6 +304,7 @@ pub(crate) async fn responses_handler(
                         start_transient_route(
                             &state.services,
                             base_request,
+                            classification,
                             TransientRouteKind::AuxiliarySummary,
                         )
                         .await?
@@ -295,6 +316,7 @@ pub(crate) async fn responses_handler(
                 start_transient_route(
                     &state.services,
                     base_request,
+                    classification,
                     TransientRouteKind::AuxiliarySummary,
                 )
                 .await?
@@ -351,6 +373,23 @@ fn strip_threadline_tools(payload: &mut serde_json::Map<String, Value>) {
             .and_then(Value::as_str)
             .is_some_and(is_internal_tool_name)
     });
+}
+
+fn strip_context_management_for_upstream(
+    payload: &mut serde_json::Map<String, Value>,
+    route_kind: &'static str,
+    classification: DownstreamRequestClassification,
+) -> bool {
+    let stripped = payload.remove("context_management").is_some();
+    if stripped {
+        debug!(
+            route_kind,
+            request_class = request_class_label(classification),
+            client_compaction_only = true,
+            "context_management_stripped"
+        );
+    }
+    stripped
 }
 
 fn request_class_label(classification: DownstreamRequestClassification) -> &'static str {
@@ -436,14 +475,13 @@ async fn acquire_lease(
 async fn start_transient_route(
     services: &ThreadlineServices,
     mut upstream_request: serde_json::Map<String, Value>,
+    classification: DownstreamRequestClassification,
     kind: TransientRouteKind,
 ) -> Result<PreparedResponseRoute, ThreadlineError> {
     strip_threadline_tools(&mut upstream_request);
+    strip_context_management_for_upstream(&mut upstream_request, kind.label(), classification);
 
-    if matches!(kind, TransientRouteKind::Utility) {
-        upstream_request.remove("previous_response_id");
-        upstream_request.remove("context_management");
-    }
+    upstream_request.remove("previous_response_id");
 
     let auth = services.auth_provider().load()?;
     let connected = services.connector().connect(auth, None).await?;

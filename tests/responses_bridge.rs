@@ -896,6 +896,7 @@ async fn context_management_only_ordinary_request_remains_retained_and_normal() 
     .expect("second request json");
     assert_eq!(second_payload["type"], "response.create");
     assert_eq!(second_payload["previous_response_id"], "response-1");
+    assert!(second_payload.get("context_management").is_none());
 
     let no_auxiliary_connect = timeout(
         Duration::from_millis(250),
@@ -1205,12 +1206,9 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
     .expect("summary request json");
     assert_eq!(request_payload["type"], "response.create");
     assert!(request_payload.get("previous_response_id").is_none());
-    assert_eq!(
-        request_payload["context_management"],
-        json!({
-            "type":"compaction",
-            "compact_threshold":12345
-        })
+    assert!(
+        request_payload.get("context_management").is_none(),
+        "header-classified AuxiliarySummary request should omit upstream context_management"
     );
     let tools = request_payload["tools"].as_array().expect("tools array");
     assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
@@ -1249,7 +1247,7 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
 }
 
 #[tokio::test]
-async fn summary_request_does_not_forward_previous_response_id_upstream() {
+async fn summary_request_omits_previous_response_id_and_context_management_upstream() {
     let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&summary_server),
@@ -1269,12 +1267,9 @@ async fn summary_request_does_not_forward_previous_response_id_upstream() {
     .expect("summary request json");
     assert_eq!(payload["type"], "response.create");
     assert!(payload.get("previous_response_id").is_none());
-    assert_eq!(
-        payload["context_management"],
-        json!({
-            "type": "compaction",
-            "compact_threshold": 12345
-        })
+    assert!(
+        payload.get("context_management").is_none(),
+        "AuxiliarySummary request should omit upstream context_management"
     );
     let tools = payload["tools"].as_array().expect("tools array");
     assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
@@ -1282,7 +1277,7 @@ async fn summary_request_does_not_forward_previous_response_id_upstream() {
 }
 
 #[tokio::test]
-async fn summary_request_all_shapes_omit_previous_response_id_and_preserve_only_non_threadline_tools_upstream()
+async fn summary_request_all_shapes_omit_previous_response_id_context_management_and_threadline_tools_upstream()
  {
     for shape in [
         SummaryRequestShape::Auto,
@@ -1325,13 +1320,9 @@ async fn summary_request_all_shapes_omit_previous_response_id_and_preserve_only_
             "previous_response_id should be omitted for {}",
             shape.label()
         );
-        assert_eq!(
-            payload["context_management"],
-            json!({
-                "type": "compaction",
-                "compact_threshold": 12345
-            }),
-            "context_management for {}",
+        assert!(
+            payload.get("context_management").is_none(),
+            "context_management should be omitted for {}",
             shape.label()
         );
         let tools = payload["tools"].as_array().expect("tools array");
@@ -1349,7 +1340,7 @@ async fn summary_request_all_shapes_omit_previous_response_id_and_preserve_only_
 }
 
 #[tokio::test]
-async fn summary_request_with_context_management_keeps_context_management_but_omits_previous_response_id()
+async fn summary_request_with_context_management_strips_context_management_and_previous_response_id_upstream()
  {
     let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
@@ -1369,16 +1360,74 @@ async fn summary_request_with_context_management_keeps_context_management_but_om
     ))
     .expect("summary request json");
     assert!(forwarded.get("previous_response_id").is_none());
-    assert_eq!(
-        forwarded["context_management"],
-        json!({
-            "type": "compaction",
-            "compact_threshold": 12345
-        })
-    );
+    assert!(forwarded.get("context_management").is_none());
     let tools = forwarded["tools"].as_array().expect("tools array");
     assert!(tools.iter().any(|tool| tool["name"] == "user_tool"));
     assert!(!tools.iter().any(|tool| tool["name"] == "threadline_echo"));
+}
+
+#[tokio::test]
+async fn context_management_stripped_diagnostics_are_privacy_safe() {
+    let trace_guard = TraceCaptureGuard::begin().await;
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+    let raw_context_secret = "secret-context-123";
+    let raw_prompt = "sensitive-user-prompt";
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input": raw_prompt,
+            "context_management": {
+                "type":"compaction",
+                "compact_threshold":12345,
+                "note": raw_context_secret
+            }
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert!(request_payload.get("context_management").is_none());
+
+    server
+        .send_text(&assistant_text_completed_event("response-context-stripped", "done").to_string())
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+
+    let logs = trace_guard.logs();
+    let stripped_line = logs
+        .lines()
+        .find(|line| {
+            line.contains("context_management_stripped")
+                && line.contains("client_compaction_only=true")
+                && (line.contains("route_kind=\"normal\"") || line.contains("route_kind=normal"))
+        })
+        .expect("context management stripped trace line");
+
+    assert!(stripped_line.contains("client_compaction_only=true"));
+    assert!(stripped_line.contains("route_kind="));
+    assert!(
+        stripped_line.contains("request_class=\"normal\"")
+            || stripped_line.contains("request_class=normal"),
+        "unexpected stripped diagnostics line: {stripped_line}"
+    );
+    assert!(!stripped_line.contains(raw_context_secret));
+    assert!(!stripped_line.contains(raw_prompt));
+    assert!(!stripped_line.contains("compact_threshold"));
+    assert!(!stripped_line.contains("note"));
+    assert!(!stripped_line.contains("{\"model\":\"gpt-5.4\""));
 }
 
 #[tokio::test]
@@ -1482,9 +1531,9 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
         .find(|line| {
             line.contains("responses_request_routed")
                 && line.contains("request_class=\"auxiliary_summary\"")
+                && line.contains("previous_response_id_present=true")
         })
         .expect("summary routing diagnostics trace line");
-    assert!(summary_line.contains("previous_response_id_present=true"));
     assert!(summary_line.contains("context_management_present=true"));
     assert!(summary_line.contains("interaction_type=\"none\""));
     assert!(summary_line.contains("interaction_type_compaction_hit=false"));
@@ -1712,15 +1761,17 @@ async fn summary_request_all_shape_response_ids_are_not_registered_as_continuati
 }
 
 #[tokio::test]
-async fn summary_request_negative_shapes_with_active_previous_response_id_remain_conflicts() {
-    for (name, input) in [
+async fn summary_request_broader_shapes_with_active_previous_response_id_follow_mixed_contract() {
+    for (name, input, expect_reroute) in [
         (
             "quote_only",
             vec![quoted_manual_summary_prompt_input_item()],
+            true,
         ),
         (
             "simple_history_only",
             vec![simple_history_context_input_item()],
+            false,
         ),
         (
             "quote_plus_simple_history",
@@ -1728,19 +1779,30 @@ async fn summary_request_negative_shapes_with_active_previous_response_id_remain
                 simple_history_context_input_item(),
                 quoted_manual_summary_prompt_input_item(),
             ],
+            true,
         ),
     ] {
-        let server = Arc::new(ScriptedWebSocketServer::start().await);
-        let connector = RecordingConnector::new(vec![PlannedConnection {
-            server: Arc::clone(&server),
-            turn_state: None,
-        }]);
+        let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+        let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = RecordingConnector::new(vec![
+            PlannedConnection {
+                server: Arc::clone(&retained_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&summary_server),
+                turn_state: None,
+            },
+        ]);
         let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
         let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
         assert_eq!(initial.status(), StatusCode::OK, "seed status for {name}");
-        let _ = server.recv_client_message().await.expect("seed request");
-        server
+        let _ = retained_server
+            .recv_client_message()
+            .await
+            .expect("seed request");
+        retained_server
             .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
             .await;
         let _ = to_bytes(initial.into_body(), usize::MAX)
@@ -1757,26 +1819,76 @@ async fn summary_request_negative_shapes_with_active_previous_response_id_remain
         )
         .await;
         assert_eq!(active.status(), StatusCode::OK, "active status for {name}");
-        let _ = server
+        let _ = retained_server
             .recv_client_message()
             .await
             .expect("active followup request");
 
-        let conflict =
+        let response =
             post_responses(app, summary_request_with_input(Some("response-1"), input)).await;
-        assert_eq!(
-            conflict.status(),
-            StatusCode::CONFLICT,
-            "conflict status for {name}"
-        );
-        let body = to_bytes(conflict.into_body(), usize::MAX)
-            .await
-            .expect("conflict body");
-        let payload: Value = serde_json::from_slice(&body).expect("conflict json body");
-        assert_eq!(
-            payload["error"]["code"], "retained_session_conflict",
-            "conflict code for {name}"
-        );
+        if expect_reroute {
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "rerouted status for {name}"
+            );
+
+            let payload: Value = serde_json::from_str(&message_text(
+                summary_server
+                    .recv_client_message()
+                    .await
+                    .expect("broader summary request"),
+            ))
+            .expect("broader summary request json");
+            assert_eq!(
+                payload["type"], "response.create",
+                "request type for {name}"
+            );
+            assert!(
+                payload.get("previous_response_id").is_none(),
+                "previous_response_id omitted for {name}"
+            );
+            assert!(
+                payload.get("context_management").is_none(),
+                "context_management omitted for {name}"
+            );
+            let tools = payload["tools"].as_array().expect("tools array");
+            assert!(
+                tools.iter().any(|tool| tool["name"] == "user_tool"),
+                "user tool retained for {name}"
+            );
+            assert!(
+                !tools.iter().any(|tool| tool["name"] == "threadline_echo"),
+                "threadline tool stripped for {name}"
+            );
+
+            summary_server
+                .send_text(
+                    &assistant_text_completed_event(
+                        "response-broader-summary",
+                        "summary completion",
+                    )
+                    .to_string(),
+                )
+                .await;
+            let _ = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("rerouted body");
+        } else {
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "conflict status for {name}"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("conflict body");
+            let payload: Value = serde_json::from_slice(&body).expect("conflict json body");
+            assert_eq!(
+                payload["error"]["code"], "retained_session_conflict",
+                "conflict code for {name}"
+            );
+        }
     }
 }
 
@@ -2972,6 +3084,81 @@ async fn completed_marker_can_be_reused_after_completed_chunk_before_done_or_eof
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
         .expect("resumed body");
+}
+
+#[tokio::test]
+async fn internal_tool_followup_strips_context_management_from_initial_and_followup_response_create()
+ {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"internal-tool-followup",
+            "context_management":{
+                "type":"compaction",
+                "compact_threshold":12345
+            }
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response_body_task = tokio::spawn(async move {
+        timeout(
+            Duration::from_secs(2),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("response body timeout")
+        .expect("response body")
+    });
+
+    let initial_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("initial request"),
+    ))
+    .expect("initial request json");
+    assert!(initial_payload.get("context_management").is_none());
+
+    server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-intermediate"}}"#)
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_payload: Value = serde_json::from_str(&message_text(
+        timeout(Duration::from_secs(2), server.recv_client_message())
+            .await
+            .expect("followup request timeout")
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert!(followup_payload.get("context_management").is_none());
+    assert_eq!(
+        followup_payload["previous_response_id"],
+        "response-intermediate"
+    );
+    assert_eq!(followup_payload["input"][0]["type"], "function_call_output");
+    assert_eq!(followup_payload["input"][0]["call_id"], "call-1");
+
+    server
+        .send_text(
+            &assistant_text_completed_event("response-final", "tool followup complete").to_string(),
+        )
+        .await;
+    let _ = response_body_task.await.expect("response body task");
 }
 
 #[tokio::test]

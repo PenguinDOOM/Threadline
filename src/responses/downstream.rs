@@ -1332,8 +1332,8 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_auxiliary_summary_conflict_fallback_detects_nested_vscode_summary_shape_without_context_management(
-    ) {
+    fn looks_like_auxiliary_summary_conflict_fallback_detects_nested_vscode_summary_shape_without_context_management()
+     {
         let payload = json!({
             "input": [
                 {
