@@ -245,13 +245,17 @@ pub(crate) async fn responses_handler(
                         }
                     }
                     Err(ThreadlineError::RetainedSessionConflict) => {
-                        let fallback_rerouted =
-                            looks_like_auxiliary_summary_conflict_fallback(&base_request);
-                        if !fallback_rerouted {
+                        let reroute_reason = retained_session_conflict_reroute_reason(
+                            &routing_diagnostics,
+                            &base_request,
+                        );
+                        if reroute_reason.is_none() {
                             return Err(ThreadlineError::RetainedSessionConflict);
                         }
+                        let reroute_reason = reroute_reason.expect("reroute reason present");
 
                         debug!(
+                            reroute_reason,
                             request_class = request_class_label(classification),
                             interaction_type = routing_diagnostics.interaction_type.label(),
                             interaction_type_compaction_hit =
@@ -285,7 +289,7 @@ pub(crate) async fn responses_handler(
                             summary_instruction_like_hit = routing_diagnostics
                                 .summary_hits
                                 .summary_instruction_like_hit,
-                            fallback_summary_input_hit = fallback_rerouted,
+                            fallback_summary_input_hit = reroute_reason == "fallback_summary_input",
                             tool_choice =
                                 routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
                             tools_count = routing_diagnostics.tools_count,
@@ -397,6 +401,25 @@ fn request_class_label(classification: DownstreamRequestClassification) -> &'sta
         DownstreamRequestClassification::Normal => "normal",
         DownstreamRequestClassification::AuxiliarySummary => "auxiliary_summary",
     }
+}
+
+fn retained_session_conflict_reroute_reason(
+    routing_diagnostics: &self::downstream::DownstreamRequestRoutingDiagnostics,
+    payload: &serde_json::Map<String, Value>,
+) -> Option<&'static str> {
+    if routing_diagnostics.interaction_type_compaction_hit {
+        return Some("interaction_type_compaction");
+    }
+
+    if routing_diagnostics.summary_hits.matches_auxiliary_summary() {
+        return Some("summary_fingerprint");
+    }
+
+    if looks_like_auxiliary_summary_conflict_fallback(payload) {
+        return Some("fallback_summary_input");
+    }
+
+    None
 }
 
 fn rewrite_stale_continuation_first_send_error(error: ThreadlineError) -> ThreadlineError {

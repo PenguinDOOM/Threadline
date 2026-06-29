@@ -1761,12 +1761,13 @@ async fn summary_request_all_shape_response_ids_are_not_registered_as_continuati
 }
 
 #[tokio::test]
-async fn summary_request_broader_shapes_with_active_previous_response_id_follow_mixed_contract() {
+async fn summary_request_broader_shapes_with_active_previous_response_id_keep_narrow_fallback_contract()
+ {
     for (name, input, expect_reroute) in [
         (
             "quote_only",
             vec![quoted_manual_summary_prompt_input_item()],
-            true,
+            false,
         ),
         (
             "simple_history_only",
@@ -1779,7 +1780,7 @@ async fn summary_request_broader_shapes_with_active_previous_response_id_follow_
                 simple_history_context_input_item(),
                 quoted_manual_summary_prompt_input_item(),
             ],
-            true,
+            false,
         ),
     ] {
         let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -2621,6 +2622,7 @@ async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
     assert!(rerouted_line.contains("new_auto_user_final_summary_prompt_hit=false"));
     assert!(rerouted_line.contains("summary_instruction_like_hit=false"));
     assert!(rerouted_line.contains("fallback_summary_input_hit=true"));
+    assert!(rerouted_line.contains("reroute_reason=\"fallback_summary_input\""));
     assert!(rerouted_line.contains("tool_choice=\"none\""));
     assert!(rerouted_line.contains("tools_count=2"));
     assert!(rerouted_line.contains("input_item_count=2"));

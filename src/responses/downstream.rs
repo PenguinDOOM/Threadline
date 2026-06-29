@@ -207,7 +207,7 @@ pub(super) struct SummaryFingerprintHits {
 }
 
 impl SummaryFingerprintHits {
-    fn matches_auxiliary_summary(&self) -> bool {
+    pub(super) fn matches_auxiliary_summary(&self) -> bool {
         let manual_primary = self.manual_summary_prompt_instruction_like;
         let manual_secondary = self.manual_structure_instruction_instruction_like
             || self.manual_tool_results_instruction_instruction_like
@@ -412,14 +412,40 @@ fn collect_conflict_fallback_summary_from_input_item(
         return;
     };
 
-    if item.get("type").and_then(Value::as_str) == Some("message") {
-        if let Some(content) = item.get("content").and_then(Value::as_array) {
-            for content_item in content {
-                collect_conflict_fallback_summary_from_input_item(content_item, fingerprints);
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            let source_category =
+                InputSourceCategory::from_role(item.get("role").and_then(Value::as_str));
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for content_item in content {
+                    collect_conflict_fallback_summary_from_content_item(
+                        content_item,
+                        source_category,
+                        fingerprints,
+                    );
+                }
             }
         }
-        return;
+        Some("input_text") => {
+            let Some(text) = item.get("text").and_then(Value::as_str) else {
+                return;
+            };
+
+            // Direct top-level input_text summary prompts remain eligible as explicit fallback traffic.
+            fingerprints.record_text_with_instruction_like(text, true);
+        }
+        Some(_) | None => {}
     }
+}
+
+fn collect_conflict_fallback_summary_from_content_item(
+    value: &Value,
+    source_category: InputSourceCategory,
+    fingerprints: &mut SummaryFingerprintHits,
+) {
+    let Some(item) = value.as_object() else {
+        return;
+    };
 
     if item.get("type").and_then(Value::as_str) != Some("input_text") {
         return;
@@ -429,8 +455,15 @@ fn collect_conflict_fallback_summary_from_input_item(
         return;
     };
 
-    // Conflict fallback intentionally accepts only direct top-level input_text items.
-    fingerprints.record_text_with_instruction_like(text, true);
+    fingerprints.record_text(
+        text,
+        SummaryObservationContext {
+            content_item_type: Some("input_text"),
+            under_content_array: true,
+            source_category,
+            ..SummaryObservationContext::default()
+        },
+    );
 }
 
 fn collect_summary_fingerprints_into_input(
@@ -1358,6 +1391,33 @@ mod tests {
             .expect("payload object for conflict fallback test");
 
         assert!(looks_like_auxiliary_summary_conflict_fallback(payload));
+    }
+
+    #[test]
+    fn looks_like_auxiliary_summary_conflict_fallback_rejects_nested_ordinary_quoted_text() {
+        let payload = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": format!(
+                                "Quoted prompt: {}",
+                                manual_summary_text()
+                            )
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let payload = payload
+            .as_object()
+            .expect("payload object for conflict fallback test");
+
+        assert!(!looks_like_auxiliary_summary_conflict_fallback(payload));
     }
 
     #[test]
