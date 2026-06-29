@@ -939,6 +939,28 @@ async fn missing_previous_response_id_returns_stable_not_found() {
 }
 
 #[tokio::test]
+async fn previous_response_not_found_remains_stable_with_simple_history_context_and_context_management()
+ {
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(FailingConnector));
+
+    let response = post_responses(
+        app,
+        summary_request_with_input(
+            Some("response-missing"),
+            vec![simple_history_context_input_item()],
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let payload: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
+}
+
+#[tokio::test]
 async fn summary_request_with_active_previous_response_id_uses_auxiliary_session() {
     let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
     let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -5710,6 +5732,64 @@ async fn completed_response_preserves_compaction_output() {
     assert!(output_text_delta_strings(&capture.downstream_events).is_empty());
     assert_eq!(capture.downstream_events[0].event, "response.completed");
     assert_eq!(capture.downstream_events[0].payload, completed_event);
+    assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn completed_response_preserves_compaction_marker_items_while_hiding_internal_function_calls()
+{
+    let capture = capture_completed_output_stream(vec![json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response-completed-compaction-sanitized",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "threadline_echo",
+                    "call_id": "call-1",
+                    "arguments": "{\"value\":\"alpha\"}"
+                },
+                {
+                    "id": "cmp-preserved",
+                    "type": "compaction",
+                    "tool_name": "threadline_echo",
+                    "encrypted_content": "opaque-compaction"
+                },
+                {
+                    "id": "ctx-preserved",
+                    "type": "context",
+                    "encrypted_content": "opaque-context"
+                }
+            ]
+        }
+    })])
+    .await;
+
+    assert_eq!(capture.downstream_events.len(), 1);
+    assert!(output_text_delta_strings(&capture.downstream_events).is_empty());
+    assert_eq!(capture.downstream_events[0].event, "response.completed");
+    assert_eq!(
+        capture.downstream_events[0].payload,
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "response-completed-compaction-sanitized",
+                "output": [
+                    {
+                        "id": "cmp-preserved",
+                        "type": "compaction",
+                        "tool_name": "threadline_echo",
+                        "encrypted_content": "opaque-compaction"
+                    },
+                    {
+                        "id": "ctx-preserved",
+                        "type": "context",
+                        "encrypted_content": "opaque-context"
+                    }
+                ]
+            }
+        })
+    );
     assert_eq!(capture.done_frame, "data: [DONE]");
 }
 
