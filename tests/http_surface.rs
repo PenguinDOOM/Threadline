@@ -44,11 +44,8 @@ const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 3] = [
     "threadline-main-gpt-5.6-luna",
 ];
 
-const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 3] = [
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-];
+const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 3] =
+    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 
 const ADVERTISED_MAIN_MODEL_IDS: [&str; 5] = [
     "threadline-main-gpt-5.6-sol",
@@ -320,7 +317,11 @@ async fn responses_utility_profile_rejects_new_main_visible_aliases_before_auth_
 
         let response = post_responses_json(app, json!({ "model": model_id })).await;
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "model_id={model_id}");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "model_id={model_id}"
+        );
 
         let payload = read_json_body(response).await;
         assert_invalid_model_error(&payload);
@@ -337,7 +338,11 @@ async fn responses_utility_profile_rejects_new_main_compatibility_ids_before_aut
 
         let response = post_responses_json(app, json!({ "model": model_id })).await;
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "model_id={model_id}");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "model_id={model_id}"
+        );
 
         let payload = read_json_body(response).await;
         assert_invalid_model_error(&payload);
@@ -498,7 +503,7 @@ async fn responses_endpoint_rejects_unsupported_reasoning_all_turns_before_retai
 
 #[tokio::test]
 async fn responses_endpoint_rejects_new_raw_main_compatibility_ids_for_reasoning_all_turns_before_auth_or_upstream()
-{
+ {
     for model_id in NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS {
         let app = build_router_with_services(
             ThreadlineConfig::default(),
@@ -517,7 +522,11 @@ async fn responses_endpoint_rejects_new_raw_main_compatibility_ids_for_reasoning
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "model_id={model_id}");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "model_id={model_id}"
+        );
 
         let payload = read_json_body(response).await;
         assert_unsupported_reasoning_context_error(&payload);
