@@ -93,6 +93,9 @@ These are the visible model ids that Threadline advertises from `/v1/models`.
 
 Main profile aliases:
 
+- `threadline-main-gpt-5.6-sol`
+- `threadline-main-gpt-5.6-terra`
+- `threadline-main-gpt-5.6-luna`
 - `threadline-main-gpt-5.5`
 - `threadline-main-gpt-5.4`
 
@@ -101,11 +104,13 @@ Utility profile aliases:
 - `threadline-utility-gpt-5.4-mini`
 - `threadline-utility-gpt-5.3-codex-spark`
 
-These visible ids are aliases for VS Code selection and routing. The upstream model ids sent to Codex remain `gpt-*` ids such as `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`.
+The `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` entries are next models. Threadline currently covers local advertisement, validation, and `model`-field rewriting for those ids. Live upstream behavior remains unverified until upstream release makes direct testing possible.
+
+These visible ids are aliases for VS Code selection and routing. The upstream model ids sent to Codex remain `gpt-*` ids such as `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`.
 
 For Main compatibility, Threadline still accepts direct `gpt-*` ids on the Main profile even though `/v1/models` advertises only the `threadline-main-*` aliases.
 
-Persistent CoT with `reasoning.context=all_turns` does not currently support the raw compatibility ids `gpt-5.5` and `gpt-5.4`; revisit that later rather than enabling it now. For now, keep `github.copilot.chat.responsesApi.persistentCoT.enabled=false` in VS Code; the current default is already `false`. When supported all-turn reasoning is needed, use the advertised Threadline aliases rather than the raw compatibility ids.
+Persistent CoT with `reasoning.context=all_turns` does not currently support the raw compatibility ids `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, and `gpt-5.4`; revisit that later rather than enabling it now. For now, keep `github.copilot.chat.responsesApi.persistentCoT.enabled=false` in VS Code; the current default is already `false`. When supported all-turn reasoning is needed, use the advertised Threadline aliases rather than the raw compatibility ids.
 
 ## VS Code Custom Endpoint Setup
 
@@ -117,6 +122,18 @@ Use distinct visible ids and distinct profile-specific URLs so VS Code can keep 
 		{
 			"uri": "http://127.0.0.1:8100/v1",
 			"models": [
+				{
+					"id": "threadline-main-gpt-5.6-sol",
+					"name": "Threadline Main GPT-5.6 Sol"
+				},
+				{
+					"id": "threadline-main-gpt-5.6-terra",
+					"name": "Threadline Main GPT-5.6 Terra"
+				},
+				{
+					"id": "threadline-main-gpt-5.6-luna",
+					"name": "Threadline Main GPT-5.6 Luna"
+				},
 				{
 					"id": "threadline-main-gpt-5.5",
 					"name": "Threadline Main GPT-5.5"

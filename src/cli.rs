@@ -161,14 +161,85 @@ mod login_cli_tests {
         let readme = readme_text();
         let removed_flag = removed_model_flag();
         let removed_env_var = removed_model_env_var();
+        let supported_aliases_section = readme_section_containing(&readme, "Main profile aliases:")
+            .expect("README should document the supported model alias list");
+        let unreleased_caveat = readme_section_containing(
+            &readme,
+            "The `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` entries are next models.",
+        )
+        .expect("README should document the GPT-5.6 unreleased caveat");
+        let raw_upstream_ids_section =
+            readme_section_containing(&readme, "The upstream model ids sent to Codex remain")
+                .expect("README should explain raw upstream model ids");
+        let all_turns_caveat =
+            readme_section_containing(&readme, "Persistent CoT with `reasoning.context=all_turns`")
+                .expect("README should document the raw compatibility all-turns caveat");
+        let custom_endpoint_json =
+            readme_section_containing(&readme, "\"id\": \"threadline-main-gpt-5.6-sol\"")
+                .expect("README should include the VS Code custom endpoint JSON example");
 
         assert!(!readme.contains(&removed_flag));
         assert!(!readme.contains(&removed_env_var));
 
-        for model_id in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+        for visible_alias in [
+            "threadline-main-gpt-5.6-sol",
+            "threadline-main-gpt-5.6-terra",
+            "threadline-main-gpt-5.6-luna",
+        ] {
             assert!(
-                readme.contains(model_id),
-                "README should list supported model id {model_id}"
+                supported_aliases_section.contains(visible_alias),
+                "README should list supported alias {visible_alias} in the Supported Model Aliases section"
+            );
+            assert!(
+                custom_endpoint_json.contains(visible_alias),
+                "README should include visible alias {visible_alias} in the VS Code custom endpoint JSON"
+            );
+        }
+
+        for raw_model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(
+                raw_upstream_ids_section.contains(raw_model_id),
+                "README should explain raw upstream id {raw_model_id} in the upstream-id section"
+            );
+            assert!(
+                all_turns_caveat.contains(raw_model_id),
+                "README should include raw compatibility id {raw_model_id} in the all-turns caveat"
+            );
+        }
+
+        assert!(
+            raw_upstream_ids_section
+                .contains("These visible ids are aliases for VS Code selection and routing."),
+            "README should distinguish visible aliases from raw upstream ids"
+        );
+        assert!(
+            raw_upstream_ids_section.contains("The upstream model ids sent to Codex remain `gpt-*` ids such as `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`"),
+            "README raw upstream-id explanation should explicitly list the raw gpt-5.6 ids"
+        );
+        assert!(
+            unreleased_caveat.contains("Threadline currently covers local advertisement, validation, and `model`-field rewriting for those ids."),
+            "README should describe the GPT-5.6 entries as local-only coverage"
+        );
+        assert!(
+            unreleased_caveat.contains("Live upstream behavior remains unverified until upstream release makes direct testing possible."),
+            "README should keep the GPT-5.6 caveat explicitly unverified upstream"
+        );
+        assert!(
+            !unreleased_caveat.contains("live upstream verification"),
+            "README should not claim live upstream verification for unreleased GPT-5.6 ids"
+        );
+
+        for raw_model_id in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+            assert!(
+                raw_upstream_ids_section.contains(raw_model_id),
+                "README should list supported raw model id {raw_model_id} in the upstream-id section"
+            );
+        }
+
+        for all_turns_raw_model_id in ["gpt-5.5", "gpt-5.4"] {
+            assert!(
+                all_turns_caveat.contains(all_turns_raw_model_id),
+                "README should keep raw compatibility id {all_turns_raw_model_id} in the all-turns caveat"
             );
         }
     }
