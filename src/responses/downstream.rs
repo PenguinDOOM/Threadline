@@ -155,10 +155,6 @@ fn is_auxiliary_summary_request(summary_hits: &SummaryFingerprintHits) -> bool {
 pub(super) fn looks_like_auxiliary_summary_conflict_fallback(
     payload: &serde_json::Map<String, Value>,
 ) -> bool {
-    if !payload.contains_key("context_management") {
-        return false;
-    }
-
     let Some(input) = payload.get("input") else {
         return false;
     };
@@ -415,6 +411,15 @@ fn collect_conflict_fallback_summary_from_input_item(
     let Some(item) = value.as_object() else {
         return;
     };
+
+    if item.get("type").and_then(Value::as_str) == Some("message") {
+        if let Some(content) = item.get("content").and_then(Value::as_array) {
+            for content_item in content {
+                collect_conflict_fallback_summary_from_input_item(content_item, fingerprints);
+            }
+        }
+        return;
+    }
 
     if item.get("type").and_then(Value::as_str) != Some("input_text") {
         return;
@@ -687,10 +692,10 @@ pub(super) fn sse_error_chunk(error: &ThreadlineError) -> Bytes {
 mod tests {
     use super::{
         DownstreamInteractionType, DownstreamRequestClassification, DownstreamRequestMetadata,
-        parse_downstream_request, parse_downstream_request_with_metadata, safe_scalar_field,
-        sse_done_chunk, sse_error_chunk, sse_json_chunk, sse_payload_chunk,
-        sse_terminal_response_failed_chunk, sse_terminal_response_incomplete_chunk,
-        wants_reasoning_all_turns,
+        looks_like_auxiliary_summary_conflict_fallback, parse_downstream_request,
+        parse_downstream_request_with_metadata, safe_scalar_field, sse_done_chunk, sse_error_chunk,
+        sse_json_chunk, sse_payload_chunk, sse_terminal_response_failed_chunk,
+        sse_terminal_response_incomplete_chunk, wants_reasoning_all_turns,
     };
     use crate::errors::ThreadlineError;
     use serde_json::{Value, json};
@@ -1013,6 +1018,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_downstream_request_classifies_conversation_compaction_with_context_management() {
+        let request = parse_downstream_request_with_metadata(
+            json!({
+                "previous_response_id": "resp_123",
+                "context_management": {
+                    "type": "compaction",
+                    "compact_threshold": 12345
+                },
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Please continue the earlier task."
+                            }
+                        ]
+                    }
+                ]
+            }),
+            DownstreamRequestMetadata::from_interaction_type_header_value(Some(
+                "conversation-compaction",
+            )),
+        )
+        .expect("parse request");
+
+        assert_eq!(
+            request.routing_diagnostics().interaction_type,
+            DownstreamInteractionType::ConversationCompaction
+        );
+        assert!(
+            request
+                .routing_diagnostics()
+                .interaction_type_compaction_hit
+        );
+        assert_eq!(
+            request.classification,
+            DownstreamRequestClassification::AuxiliarySummary
+        );
+    }
+
+    #[test]
     fn parse_downstream_request_does_not_classify_fingerprints_outside_input() {
         let request = parse_downstream_request(json!({
             "previous_response_id": "resp_123",
@@ -1281,6 +1329,35 @@ mod tests {
                     .interaction_type_compaction_hit
             );
         }
+    }
+
+    #[test]
+    fn looks_like_auxiliary_summary_conflict_fallback_detects_nested_vscode_summary_shape_without_context_management(
+    ) {
+        let payload = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": manual_summary_text()
+                        },
+                        {
+                            "type": "input_text",
+                            "text": simple_history_context_text()
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let payload = payload
+            .as_object()
+            .expect("payload object for conflict fallback test");
+
+        assert!(looks_like_auxiliary_summary_conflict_fallback(payload));
     }
 
     #[test]

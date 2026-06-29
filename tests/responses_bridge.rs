@@ -836,6 +836,86 @@ async fn context_management_compaction_does_not_override_stale_marker_semantics(
 }
 
 #[tokio::test]
+async fn context_management_only_ordinary_request_remains_retained_and_normal() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let auxiliary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&auxiliary_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let first_response =
+        post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("first request message");
+    retained_server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-1"}}"#)
+        .await;
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "first completion").to_string())
+        .await;
+    let _ = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+
+    let second_response = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"second",
+            "previous_response_id":"response-1",
+            "context_management": {
+                "type":"compaction",
+                "compact_threshold":12345
+            }
+        }),
+    )
+    .await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+
+    let second_payload: Value = serde_json::from_str(&message_text(
+        timeout(
+            Duration::from_millis(250),
+            retained_server.recv_client_message(),
+        )
+        .await
+        .expect("retained followup request timeout")
+        .expect("retained followup request"),
+    ))
+    .expect("second request json");
+    assert_eq!(second_payload["type"], "response.create");
+    assert_eq!(second_payload["previous_response_id"], "response-1");
+
+    let no_auxiliary_connect = timeout(
+        Duration::from_millis(250),
+        auxiliary_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_auxiliary_connect.is_err());
+
+    retained_server
+        .send_text(&assistant_text_completed_event("response-2", "second completion").to_string())
+        .await;
+    let _ = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .expect("second body");
+
+    let requested_sessions = connector.recorded_requested_sessions().await;
+    assert_eq!(requested_sessions.len(), 1);
+}
+
+#[tokio::test]
 async fn missing_previous_response_id_returns_stable_not_found() {
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(FailingConnector));
 
