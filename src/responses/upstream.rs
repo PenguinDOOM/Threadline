@@ -72,12 +72,34 @@ pub(super) fn build_response_create_payload(request: Value) -> Result<Value, Thr
     }
 
     remove_codex_unsupported_response_fields(&mut payload);
+    normalize_codex_reasoning_fields(&mut payload);
     Ok(Value::Object(payload))
 }
 
 pub(super) fn remove_codex_unsupported_response_fields(payload: &mut Map<String, Value>) {
     for field in UNSUPPORTED_RESPONSE_FIELDS {
         payload.remove(*field);
+    }
+}
+
+pub(super) fn normalize_codex_reasoning_fields(payload: &mut Map<String, Value>) {
+    let remove_reasoning = match payload.get_mut("reasoning").and_then(Value::as_object_mut) {
+        Some(reasoning) => {
+            // VS Code briefly sent `reasoning.summary = "off"` to disable reasoning summaries.
+            // Codex/Responses API does not accept "off"; disabling summaries means omitting
+            // the `summary` field entirely. Preserve valid values and only strip this known
+            // compatibility value.
+            if reasoning.get("summary").and_then(Value::as_str) == Some("off") {
+                reasoning.remove("summary");
+            }
+
+            reasoning.is_empty()
+        }
+        None => false,
+    };
+
+    if remove_reasoning {
+        payload.remove("reasoning");
     }
 }
 
