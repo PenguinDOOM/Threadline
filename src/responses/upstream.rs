@@ -160,6 +160,40 @@ mod tests {
     }
 
     #[test]
+    fn build_response_create_payload_omits_off_reasoning_summary() {
+        let payload = build_response_create_payload(json!({
+            "model": "gpt-test",
+            "instructions": "keep",
+            "reasoning": {
+                "effort": "medium",
+                "summary": "off"
+            }
+        }))
+        .expect("response.create payload");
+
+        assert_eq!(
+            payload["reasoning"],
+            json!({
+                "effort": "medium"
+            })
+        );
+    }
+
+    #[test]
+    fn build_response_create_payload_removes_empty_reasoning_after_off_summary() {
+        let payload = build_response_create_payload(json!({
+            "model": "gpt-test",
+            "instructions": "keep",
+            "reasoning": {
+                "summary": "off"
+            }
+        }))
+        .expect("response.create payload");
+
+        assert!(payload.get("reasoning").is_none());
+    }
+
+    #[test]
     fn build_response_create_payload_preserves_context_management_and_previous_response_id() {
         let payload = build_response_create_payload(json!({
             "model": "gpt-test",
