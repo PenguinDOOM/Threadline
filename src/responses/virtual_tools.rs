@@ -18,11 +18,20 @@ pub(super) struct VirtualToolSummarizerDetection {
 
 impl VirtualToolSummarizerDetection {
     pub(super) fn is_match(self) -> bool {
-        false
+        self.required_hit_count() == 5
     }
 
     pub(super) fn required_hit_count(self) -> usize {
-        0
+        [
+            self.semantic_similarity_hit,
+            self.group_index_tag_hit,
+            self.group_index_field_hit,
+            self.group_name_field_hit,
+            self.summary_field_hit,
+        ]
+        .into_iter()
+        .filter(|hit| *hit)
+        .count()
     }
 }
 
@@ -35,15 +44,78 @@ pub(super) enum VirtualToolSummarizerInstructionMutation {
 }
 
 pub(super) fn detect_virtual_tool_summarizer_request(
-    _request: &Map<String, Value>,
+    request: &Map<String, Value>,
 ) -> VirtualToolSummarizerDetection {
-    VirtualToolSummarizerDetection::default()
+    let mut detection = VirtualToolSummarizerDetection::default();
+
+    if let Some(input) = request.get("input") {
+        visit_input_strings(input, &mut |text| update_detection(&mut detection, text));
+    }
+
+    if let Some(instructions) = request.get("instructions").and_then(Value::as_str) {
+        update_detection(&mut detection, instructions);
+    }
+
+    detection
 }
 
 pub(super) fn inject_virtual_tool_summarizer_instruction(
-    _request: &mut Map<String, Value>,
+    request: &mut Map<String, Value>,
 ) -> VirtualToolSummarizerInstructionMutation {
-    VirtualToolSummarizerInstructionMutation::SkippedNonString
+    match request.get_mut("instructions") {
+        Some(Value::String(instructions)) => {
+            if instructions.contains(VIRTUAL_TOOL_SUMMARIZER_COMPATIBILITY_INSTRUCTION) {
+                VirtualToolSummarizerInstructionMutation::AlreadyPresent
+            } else {
+                instructions.push_str("\n\n");
+                instructions.push_str(VIRTUAL_TOOL_SUMMARIZER_COMPATIBILITY_INSTRUCTION);
+                VirtualToolSummarizerInstructionMutation::Appended
+            }
+        }
+        Some(Value::Null) => {
+            request.insert(
+                "instructions".to_string(),
+                Value::String(VIRTUAL_TOOL_SUMMARIZER_COMPATIBILITY_INSTRUCTION.to_string()),
+            );
+            VirtualToolSummarizerInstructionMutation::Inserted
+        }
+        Some(_) => VirtualToolSummarizerInstructionMutation::SkippedNonString,
+        None => {
+            request.insert(
+                "instructions".to_string(),
+                Value::String(VIRTUAL_TOOL_SUMMARIZER_COMPATIBILITY_INSTRUCTION.to_string()),
+            );
+            VirtualToolSummarizerInstructionMutation::Inserted
+        }
+    }
+}
+
+fn visit_input_strings(value: &Value, visit: &mut impl FnMut(&str)) {
+    match value {
+        Value::String(text) => visit(text),
+        Value::Array(items) => {
+            for item in items {
+                visit_input_strings(item, visit);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values() {
+                visit_input_strings(value, visit);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn update_detection(detection: &mut VirtualToolSummarizerDetection, text: &str) {
+    let lower = text.to_ascii_lowercase();
+
+    detection.semantic_similarity_hit |=
+        lower.contains("clustered together based on semantic similarity");
+    detection.group_index_tag_hit |= lower.contains("<group index=");
+    detection.group_index_field_hit |= text.contains("groupIndex");
+    detection.group_name_field_hit |= text.contains("groupName");
+    detection.summary_field_hit |= lower.contains("summary");
 }
 
 #[cfg(test)]
