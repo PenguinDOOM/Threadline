@@ -257,7 +257,8 @@ mod tests {
 
     #[test]
     fn detect_virtual_tool_summarizer_matches_top_level_string_instructions() {
-        let request = utility_request_with_string_instructions(virtual_tool_summarizer_prompt_text());
+        let request =
+            utility_request_with_string_instructions(virtual_tool_summarizer_prompt_text());
         let detection = detect_virtual_tool_summarizer_request(&request);
 
         assert!(detection.semantic_similarity_hit);
@@ -301,10 +302,8 @@ mod tests {
 
     #[test]
     fn detect_virtual_tool_summarizer_rejects_group_fields_without_primary_fingerprints() {
-        let request = utility_request_with_input(vec![input_text_message(
-            "user",
-            field_only_prompt_text(),
-        )]);
+        let request =
+            utility_request_with_input(vec![input_text_message("user", field_only_prompt_text())]);
 
         assert!(!detect_virtual_tool_summarizer_request(&request).is_match());
     }
@@ -355,10 +354,7 @@ mod tests {
 
         let outcome = inject_virtual_tool_summarizer_instruction(&mut request);
 
-        assert_eq!(
-            outcome,
-            VirtualToolSummarizerInstructionMutation::Appended
-        );
+        assert_eq!(outcome, VirtualToolSummarizerInstructionMutation::Appended);
         assert_eq!(
             request.get("instructions"),
             Some(&Value::String(format!(

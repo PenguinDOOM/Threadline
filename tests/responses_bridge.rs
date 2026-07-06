@@ -4954,7 +4954,9 @@ async fn utility_virtual_tool_summarizer_instruction_is_injected() {
     );
 
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-virtual-tool"}}"#)
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-utility-virtual-tool"}}"#,
+        )
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -5118,10 +5120,15 @@ async fn main_profile_virtual_tool_summarizer_is_not_injected() {
         server.recv_client_message().await.expect("request message"),
     ))
     .expect("request json");
-    assert_eq!(request_payload["instructions"], Value::String(String::new()));
+    assert_eq!(
+        request_payload["instructions"],
+        Value::String(String::new())
+    );
 
     server
-        .send_text(r#"{"type":"response.completed","response":{"id":"response-main-virtual-tool"}}"#)
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-main-virtual-tool"}}"#,
+        )
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -5157,7 +5164,10 @@ async fn utility_ordinary_request_does_not_receive_virtual_tool_instruction() {
         server.recv_client_message().await.expect("request message"),
     ))
     .expect("request json");
-    assert_eq!(request_payload["instructions"], Value::String(String::new()));
+    assert_eq!(
+        request_payload["instructions"],
+        Value::String(String::new())
+    );
 
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-ordinary"}}"#)
