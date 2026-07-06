@@ -25,6 +25,9 @@ use self::downstream::{
 };
 use self::translation::{ResponseStreamLease, ResponseStreamState, response_stream};
 use self::upstream::send_response_create;
+use self::virtual_tools::{
+    detect_virtual_tool_summarizer_request, inject_virtual_tool_summarizer_instruction,
+};
 
 #[cfg(test)]
 pub(crate) use self::downstream::DownstreamInteractionType;
@@ -127,10 +130,15 @@ pub(crate) async fn responses_handler(
             .unwrap_or("none"),
         "responses_request_routed"
     );
-    let base_request = request.payload;
+    let mut base_request = request.payload;
     let previous_response_id = request.previous_response_id;
     let is_continuation_request = previous_response_id.is_some();
     let prepared = if state.profile == RouteProfile::Utility {
+        maybe_inject_virtual_tool_summarizer_instruction(
+            model_alias.upstream_model_id,
+            &routing_diagnostics,
+            &mut base_request,
+        );
         start_transient_route(
             &state.services,
             base_request,
@@ -558,6 +566,56 @@ fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError {
         RegistryAcquireError::RetainedSessionCapacityExceeded => {
             ThreadlineError::RetainedSessionCapacityExceeded
         }
+    }
+}
+
+fn maybe_inject_virtual_tool_summarizer_instruction(
+    model: &str,
+    routing_diagnostics: &downstream::DownstreamRequestRoutingDiagnostics,
+    request: &mut serde_json::Map<String, Value>,
+) {
+    let detection = detect_virtual_tool_summarizer_request(request);
+    if !detection.is_match() {
+        return;
+    }
+
+    let instructions_existed = request.contains_key("instructions");
+    debug!(
+        profile = "utility",
+        model,
+        input_item_count = routing_diagnostics.input_item_count,
+        tools_count = routing_diagnostics.tools_count,
+        instructions_existed,
+        semantic_similarity_hit = detection.semantic_similarity_hit,
+        group_index_tag_hit = detection.group_index_tag_hit,
+        group_index_field_hit = detection.group_index_field_hit,
+        group_name_field_hit = detection.group_name_field_hit,
+        summary_field_hit = detection.summary_field_hit,
+        required_hit_count = detection.required_hit_count(),
+        "virtual_tools_summarizer_request_detected"
+    );
+
+    let mutation = inject_virtual_tool_summarizer_instruction(request);
+    if mutation.injected() {
+        debug!(
+            profile = "utility",
+            model,
+            instructions_existed,
+            mutation = mutation.outcome_label(),
+            "virtual_tools_summarizer_instruction_injected"
+        );
+        return;
+    }
+
+    if let Some(skip_reason) = mutation.skip_reason() {
+        debug!(
+            profile = "utility",
+            model,
+            instructions_existed,
+            skip_reason,
+            mutation = mutation.outcome_label(),
+            "virtual_tools_summarizer_instruction_skipped"
+        );
     }
 }
 

@@ -43,6 +43,29 @@ pub(super) enum VirtualToolSummarizerInstructionMutation {
     SkippedNonString,
 }
 
+impl VirtualToolSummarizerInstructionMutation {
+    pub(super) fn outcome_label(self) -> &'static str {
+        match self {
+            Self::Appended => "appended",
+            Self::Inserted => "inserted",
+            Self::AlreadyPresent => "already_present",
+            Self::SkippedNonString => "skipped_non_string",
+        }
+    }
+
+    pub(super) fn skip_reason(self) -> Option<&'static str> {
+        match self {
+            Self::AlreadyPresent => Some("already_present"),
+            Self::SkippedNonString => Some("instructions_non_string"),
+            Self::Appended | Self::Inserted => None,
+        }
+    }
+
+    pub(super) fn injected(self) -> bool {
+        matches!(self, Self::Appended | Self::Inserted)
+    }
+}
+
 pub(super) fn detect_virtual_tool_summarizer_request(
     request: &Map<String, Value>,
 ) -> VirtualToolSummarizerDetection {

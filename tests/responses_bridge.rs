@@ -557,6 +557,79 @@ fn summary_request_with_input(previous_response_id: Option<&str>, input: Vec<Val
     payload
 }
 
+fn virtual_tool_summarizer_prompt_text() -> &'static str {
+    concat!(
+        "Tool groups should be clustered together based on semantic similarity.\n",
+        "Render each result with XML-like wrappers such as <group index=\"0\">.\n",
+        "Return a JSON array where every object contains groupIndex, groupName, and summary.\n",
+        "Use the requested schema exactly and keep each summary concise."
+    )
+}
+
+fn virtual_tool_summarizer_compatibility_instruction() -> &'static str {
+    concat!(
+        "Compatibility requirement for VS Code Copilot virtual tool summarization:\n",
+        "Return the JSON array inside a Markdown fenced code block using ```json.\n",
+        "Do not include any text before or after the code block.\n",
+        "The fenced code block content must be a valid JSON array matching the requested schema."
+    )
+}
+
+fn utility_virtual_tool_summarizer_request() -> Value {
+    json!({
+        "model":"threadline-utility-gpt-5.4-mini",
+        "input":[
+            {
+                "type":"message",
+                "role":"system",
+                "content":[
+                    {
+                        "type":"input_text",
+                        "text":"You are a utility assistant."
+                    }
+                ]
+            },
+            {
+                "type":"message",
+                "role":"user",
+                "content":[
+                    {
+                        "type":"input_text",
+                        "text": virtual_tool_summarizer_prompt_text()
+                    }
+                ]
+            }
+        ],
+        "tools":[
+            {
+                "type":"function",
+                "name":"workspace_search",
+                "description":"Search repository files",
+                "parameters":{"type":"object"}
+            }
+        ]
+    })
+}
+
+fn count_instruction_occurrences(text: &str) -> usize {
+    text.match_indices(virtual_tool_summarizer_compatibility_instruction())
+        .count()
+}
+
+fn assert_empty_instructions_without_virtual_tool_compatibility(request_payload: &Value) {
+    let instructions = request_payload["instructions"]
+        .as_str()
+        .expect("string instructions");
+    assert!(
+        instructions.is_empty(),
+        "expected default empty upstream instructions for auxiliary request, got {instructions:?}"
+    );
+    assert!(
+        !instructions.contains(virtual_tool_summarizer_compatibility_instruction()),
+        "auxiliary request should not include virtual tool compatibility instructions"
+    );
+}
+
 fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
     summary_request_with_shape(previous_response_id, SummaryRequestShape::Auto)
 }
@@ -1115,6 +1188,7 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
             "previous_response_id should be omitted for {}",
             shape.label()
         );
+        assert_empty_instructions_without_virtual_tool_compatibility(&summary_payload);
 
         let requested_sessions = connector.recorded_requested_sessions().await;
         assert_eq!(
@@ -4853,6 +4927,247 @@ async fn utility_terminal_completion_drops_transient_upstream_handle() {
 }
 
 #[tokio::test]
+async fn utility_virtual_tool_summarizer_instruction_is_injected() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(app, utility_virtual_tool_summarizer_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(
+        request_payload["instructions"],
+        Value::String(virtual_tool_summarizer_compatibility_instruction().to_string())
+    );
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-virtual-tool"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_virtual_tool_summarizer_appends_existing_instructions() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let mut payload = utility_virtual_tool_summarizer_request();
+    payload["instructions"] = json!("Keep the reply short.");
+
+    let response = post_responses(app, payload).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(
+        request_payload["instructions"],
+        Value::String(format!(
+            "Keep the reply short.\n\n{}",
+            virtual_tool_summarizer_compatibility_instruction()
+        ))
+    );
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-virtual-tool-append"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_virtual_tool_summarizer_does_not_duplicate_existing_instruction() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let mut payload = utility_virtual_tool_summarizer_request();
+    payload["instructions"] = json!(virtual_tool_summarizer_compatibility_instruction());
+
+    let response = post_responses(app, payload).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    let instructions = request_payload["instructions"]
+        .as_str()
+        .expect("string instructions");
+    assert_eq!(count_instruction_occurrences(instructions), 1);
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-virtual-tool-idempotent"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_virtual_tool_summarizer_skips_non_string_instructions_without_payload_damage() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let mut payload = utility_virtual_tool_summarizer_request();
+    payload["instructions"] = json!({
+        "type":"structured",
+        "text":"keep structure"
+    });
+
+    let response = post_responses(app, payload).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(
+        request_payload["instructions"],
+        json!({
+            "type":"structured",
+            "text":"keep structure"
+        })
+    );
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-virtual-tool-non-string"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn main_profile_virtual_tool_summarizer_is_not_injected() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":[
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[
+                        {
+                            "type":"input_text",
+                            "text": virtual_tool_summarizer_prompt_text()
+                        }
+                    ]
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(request_payload["instructions"], Value::String(String::new()));
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-main-virtual-tool"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_ordinary_request_does_not_receive_virtual_tool_instruction() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-utility-gpt-5.4-mini",
+            "input":"Return a short utility answer about the current repository status."
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(request_payload["instructions"], Value::String(String::new()));
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-ordinary"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
 async fn missing_or_null_instructions_are_normalized_for_upstream_response_create() {
     let missing_server = Arc::new(ScriptedWebSocketServer::start().await);
     let null_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -6495,7 +6810,11 @@ async fn auxiliary_summary_compaction_only_completed_preserves_transient_behavio
 
     let response = post_responses(app.clone(), auxiliary_summary_request(None)).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let _ = server.recv_client_message().await.expect("summary request");
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("summary request"),
+    ))
+    .expect("summary request json");
+    assert_empty_instructions_without_virtual_tool_compatibility(&request_payload);
 
     let completed_event = json!({
         "type": "response.completed",
