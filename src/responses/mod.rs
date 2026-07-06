@@ -17,6 +17,7 @@ use crate::ws_pump::LiveUpstreamWebSocket;
 mod downstream;
 mod translation;
 mod upstream;
+mod virtual_tools;
 
 use self::downstream::{
     DownstreamRequestClassification, looks_like_auxiliary_summary_conflict_fallback,
