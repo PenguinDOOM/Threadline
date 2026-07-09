@@ -309,6 +309,8 @@ mod tests {
         }))
         .expect("response.create payload");
 
+        assert_eq!(payload["type"], "response.create");
+        assert_eq!(payload["store"], false);
         assert_eq!(payload["input"][0]["role"], "developer");
         assert_eq!(
             payload["input"][0]["content"],
@@ -332,6 +334,66 @@ mod tests {
                 .all(|item| item.get("role").and_then(Value::as_str) != Some("system")),
             "upstream response.create payload must not forward system input roles"
         );
+    }
+
+    #[test]
+    fn build_response_create_payload_leaves_non_system_input_shapes_unchanged() {
+        let non_array_input = json!({
+            "unexpected": true,
+            "role": "system"
+        });
+        let payload = build_response_create_payload(json!({
+            "model": "gpt-test",
+            "input": non_array_input.clone()
+        }))
+        .expect("response.create payload");
+
+        assert_eq!(payload["type"], "response.create");
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["input"], non_array_input);
+
+        let mixed_input = json!([
+            "raw text item",
+            17,
+            {
+                "role": 99,
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "numeric roles must stay untouched"
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "user stays user"
+                    }
+                ],
+                "custom_field": {
+                    "preserve": true
+                }
+            },
+            {
+                "role": "assistant",
+                "content": []
+            },
+            {
+                "role": "developer",
+                "content": []
+            }
+        ]);
+        let payload = build_response_create_payload(json!({
+            "model": "gpt-test",
+            "input": mixed_input.clone()
+        }))
+        .expect("response.create payload");
+
+        assert_eq!(payload["type"], "response.create");
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["input"], mixed_input);
     }
 
     #[test]
