@@ -109,6 +109,9 @@ pub(super) fn normalize_system_input_roles_for_codex(payload: &mut Map<String, V
         return;
     };
 
+    // VS Code Custom Endpoint may send initial guidance as input role "system", but
+    // Codex rejects that role. Rewrite only the role to "developer" so retained
+    // history keeps the guidance in input instead of hoisting it into instructions.
     for item in input {
         let Some(object) = item.as_object_mut() else {
             continue;
@@ -285,6 +288,8 @@ mod tests {
             "model": "gpt-test",
             "input": [
                 {
+                    "id": "msg_system_1",
+                    "type": "message",
                     "role": "system",
                     "content": [
                         {
@@ -311,6 +316,8 @@ mod tests {
 
         assert_eq!(payload["type"], "response.create");
         assert_eq!(payload["store"], false);
+        assert_eq!(payload["input"][0]["id"], "msg_system_1");
+        assert_eq!(payload["input"][0]["type"], "message");
         assert_eq!(payload["input"][0]["role"], "developer");
         assert_eq!(
             payload["input"][0]["content"],
