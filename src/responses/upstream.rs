@@ -71,6 +71,7 @@ pub(super) fn build_response_create_payload(request: Value) -> Result<Value, Thr
         payload.insert("instructions".to_string(), Value::String(String::new()));
     }
 
+    normalize_system_input_roles_for_codex(&mut payload);
     remove_codex_unsupported_response_fields(&mut payload);
     normalize_codex_reasoning_fields(&mut payload);
     Ok(Value::Object(payload))
@@ -100,6 +101,22 @@ pub(super) fn normalize_codex_reasoning_fields(payload: &mut Map<String, Value>)
 
     if remove_reasoning {
         payload.remove("reasoning");
+    }
+}
+
+pub(super) fn normalize_system_input_roles_for_codex(payload: &mut Map<String, Value>) {
+    let Some(input) = payload.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for item in input {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+
+        if object.get("role").and_then(Value::as_str) == Some("system") {
+            object.insert("role".to_string(), Value::String("developer".to_string()));
+        }
     }
 }
 
@@ -156,7 +173,7 @@ fn require_payload_object(payload: Value) -> Result<Map<String, Value>, Threadli
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{build_followup_tool_outputs_payload, build_response_create_payload};
 
@@ -260,6 +277,61 @@ mod tests {
         assert!(payload.get("max_tokens").is_none());
         assert!(payload.get("max_completion_tokens").is_none());
         assert!(payload.get("truncation").is_none());
+    }
+
+    #[test]
+    fn build_response_create_payload_converts_system_input_roles_to_developer() {
+        let payload = build_response_create_payload(json!({
+            "model": "gpt-test",
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Follow project instructions."
+                        }
+                    ],
+                    "custom_field": {
+                        "preserve": true
+                    }
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Hello"
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("response.create payload");
+
+        assert_eq!(payload["input"][0]["role"], "developer");
+        assert_eq!(
+            payload["input"][0]["content"],
+            json!([
+                {
+                    "type": "input_text",
+                    "text": "Follow project instructions."
+                }
+            ])
+        );
+        assert_eq!(
+            payload["input"][0]["custom_field"],
+            json!({ "preserve": true })
+        );
+        assert_eq!(payload["input"][1]["role"], "user");
+        assert!(
+            payload["input"]
+                .as_array()
+                .expect("input array")
+                .iter()
+                .all(|item| item.get("role").and_then(Value::as_str) != Some("system")),
+            "upstream response.create payload must not forward system input roles"
+        );
     }
 
     #[test]
