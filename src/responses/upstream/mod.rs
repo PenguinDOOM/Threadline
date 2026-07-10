@@ -16,10 +16,7 @@ fn inject_reasoning_all_turns(payload: &mut Map<String, Value>) {
         return;
     };
 
-    if !matches!(
-        model,
-        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
-    ) {
+    if !matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") {
         return;
     }
 
@@ -96,7 +93,7 @@ pub(super) async fn send_followup_tool_outputs(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::build_response_create_payload;
 
