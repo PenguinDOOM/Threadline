@@ -116,6 +116,7 @@ Main profile aliases:
 
 Utility profile aliases:
 
+- `threadline-utility-gpt-5.6-luna`
 - `threadline-utility-gpt-5.4-mini`
 - `threadline-utility-gpt-5.3-codex-spark`
 
@@ -166,6 +167,11 @@ Use distinct visible ids and distinct profile-specific URLs so VS Code can keep 
 		{
 			"uri": "http://127.0.0.1:8101/v1",
 			"models": [
+				{
+					"id": "threadline-utility-gpt-5.6-luna",
+					"name": "Threadline Utility GPT-5.6 Luna",
+					"supportsReasoningEffort": true
+				},
 				{
 					"id": "threadline-utility-gpt-5.4-mini",
 					"name": "Threadline Utility GPT-5.4 Mini",
