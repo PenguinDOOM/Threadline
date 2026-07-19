@@ -55,7 +55,8 @@ const ADVERTISED_MAIN_MODEL_IDS: [&str; 5] = [
     "threadline-main-gpt-5.4",
 ];
 
-const ADVERTISED_UTILITY_MODEL_IDS: [&str; 2] = [
+const ADVERTISED_UTILITY_MODEL_IDS: [&str; 3] = [
+    "threadline-utility-gpt-5.6-luna",
     "threadline-utility-gpt-5.4-mini",
     "threadline-utility-gpt-5.3-codex-spark",
 ];
@@ -75,7 +76,8 @@ const ACCEPTED_MAIN_MODEL_IDS: [&str; 12] = [
     "gpt-5.3-codex-spark",
 ];
 
-const UNSUPPORTED_MODEL_IDS: [&str; 4] = [
+const UNSUPPORTED_MODEL_IDS: [&str; 5] = [
+    "threadline-utility-gpt-5.6-luna",
     "threadline-utility-gpt-5.4-mini",
     "threadline-utility-gpt-5.3-codex-spark",
     "codex-mini-latest",
@@ -544,6 +546,28 @@ async fn responses_endpoint_accepts_each_supported_model_before_missing_auth_err
         let response = post_responses_json(app, json!({ "model": model_id })).await;
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let payload = read_json_body(response).await;
+        assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
+        assert_eq!(payload["error"]["type"], "configuration_error");
+    }
+}
+
+#[tokio::test]
+async fn responses_utility_profile_accepts_each_advertised_model_before_missing_auth_error() {
+    for model_id in ADVERTISED_UTILITY_MODEL_IDS {
+        let app = build_router_with_services(
+            utility_config(),
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(app, json!({ "model": model_id })).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "model_id={model_id}"
+        );
 
         let payload = read_json_body(response).await;
         assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");

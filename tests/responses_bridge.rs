@@ -4792,6 +4792,15 @@ async fn persistent_reasoning_does_not_auto_inject_for_ineligible_main_or_utilit
             enabled_utility_config,
             "threadline-utility-gpt-5.4-mini",
         ),
+        (
+            "utility luna",
+            ThreadlineConfig {
+                profile: RouteProfile::Utility,
+                persistent_reasoning_enabled: true,
+                ..ThreadlineConfig::default()
+            },
+            "threadline-utility-gpt-5.6-luna",
+        ),
     ];
 
     for (case_name, config, model) in cases {
@@ -4845,6 +4854,48 @@ async fn utility_model_alias_rewrites_upstream_model() {
 
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-alias"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_luna_alias_rewrites_upstream_model() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-utility-gpt-5.6-luna",
+            "input":"utility-luna-alias"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(request_payload["type"], "response.create");
+    assert_eq!(request_payload["model"], "gpt-5.6-luna");
+
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-utility-luna-alias"}}"#,
+        )
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -4942,6 +4993,58 @@ async fn utility_reasoning_all_turns_and_encrypted_content_are_preserved_for_sup
     server
         .send_text(
             r#"{"type":"response.completed","response":{"id":"response-utility-all-turns"}}"#,
+        )
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn utility_luna_reasoning_all_turns_and_encrypted_content_are_preserved() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-utility-gpt-5.6-luna",
+            "input":"utility-luna-all-turns",
+            "reasoning":{"context":"all_turns","effort":"high"},
+            "include":["reasoning.encrypted_content"]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(request_payload["type"], "response.create");
+    assert_eq!(request_payload["model"], "gpt-5.6-luna");
+    assert_eq!(
+        request_payload["reasoning"],
+        json!({"context":"all_turns","effort":"high"})
+    );
+    assert_eq!(
+        request_payload["include"],
+        json!(["reasoning.encrypted_content"])
+    );
+
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-utility-luna-all-turns"}}"#,
         )
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)

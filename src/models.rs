@@ -256,6 +256,7 @@ mod tests {
         assert_eq!(
             advertised_model_ids_for_profile(RouteProfile::Utility),
             &[
+                "threadline-utility-gpt-5.6-luna",
                 "threadline-utility-gpt-5.4-mini",
                 "threadline-utility-gpt-5.3-codex-spark",
             ]
@@ -269,6 +270,7 @@ mod tests {
         }
         assert!(is_supported_model("threadline-main-gpt-5.5"));
         assert!(is_supported_model("threadline-main-gpt-5.4"));
+        assert!(is_supported_model("threadline-utility-gpt-5.6-luna"));
         assert!(is_supported_model("threadline-utility-gpt-5.4-mini"));
         assert!(is_supported_model("threadline-utility-gpt-5.3-codex-spark"));
         for model_id in NEW_MAIN_RAW_COMPATIBILITY_IDS {
@@ -328,6 +330,52 @@ mod tests {
         assert!(utility.advertised);
         assert!(!utility.persistent_reasoning_eligible);
         assert!(utility.supports_reasoning_all_turns);
+    }
+
+    #[test]
+    fn utility_luna_alias_contract_exposes_utility_capabilities() {
+        let utility = resolve_request_model_for_profile(
+            json!({ "model": "threadline-utility-gpt-5.6-luna" })
+                .as_object()
+                .unwrap(),
+            RouteProfile::Utility,
+        )
+        .unwrap();
+
+        assert_eq!(utility.alias_id, "threadline-utility-gpt-5.6-luna");
+        assert_eq!(utility.upstream_model_id, "gpt-5.6-luna");
+        assert_eq!(utility.profile, RouteProfile::Utility);
+        assert!(utility.advertised);
+        assert!(utility.supports_reasoning_all_turns);
+        assert!(!utility.persistent_reasoning_eligible);
+    }
+
+    #[test]
+    fn utility_luna_alias_is_rejected_by_main_profile() {
+        assert_eq!(
+            resolve_request_model_for_profile(
+                json!({ "model": "threadline-utility-gpt-5.6-luna" })
+                    .as_object()
+                    .unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap_err()
+            .to_string(),
+            "The /v1/responses request must include a supported string model."
+        );
+    }
+
+    #[test]
+    fn utility_luna_raw_model_is_rejected_by_utility_profile() {
+        assert_eq!(
+            resolve_request_model_for_profile(
+                json!({ "model": "gpt-5.6-luna" }).as_object().unwrap(),
+                RouteProfile::Utility,
+            )
+            .unwrap_err()
+            .to_string(),
+            "The /v1/responses request must include a supported string model."
+        );
     }
 
     #[test]

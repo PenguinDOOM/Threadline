@@ -46,6 +46,7 @@ mod login_cli_tests {
     use std::path::PathBuf;
 
     use clap::{Command, CommandFactory, Parser};
+    use serde_json::Value;
 
     use super::{ThreadlineCli, ThreadlineCliAction, ThreadlineCommand};
 
@@ -163,6 +164,9 @@ mod login_cli_tests {
         let removed_env_var = removed_model_env_var();
         let supported_aliases_section = readme_section_containing(&readme, "Main profile aliases:")
             .expect("README should document the supported model alias list");
+        let utility_aliases_section =
+            readme_section_containing(&readme, "Utility profile aliases:")
+                .expect("README should document the supported Utility model alias list");
         let unreleased_caveat = readme_section_containing(
             &readme,
             "The `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` entries are next models.",
@@ -174,9 +178,16 @@ mod login_cli_tests {
         let all_turns_caveat =
             readme_section_containing(&readme, "Persistent CoT with `reasoning.context=all_turns`")
                 .expect("README should document the raw compatibility all-turns caveat");
-        let custom_endpoint_json =
+        let custom_endpoint_section =
             readme_section_containing(&readme, "\"id\": \"threadline-main-gpt-5.6-sol\"")
                 .expect("README should include the VS Code custom endpoint JSON example");
+        let custom_endpoint_json = custom_endpoint_section
+            .split_once("```json")
+            .and_then(|(_, section)| section.split_once("```"))
+            .map(|(json, _)| json.trim())
+            .expect("README custom endpoint example should be a fenced JSON block");
+        let custom_endpoint_document: Value = serde_json::from_str(custom_endpoint_json)
+            .expect("README custom endpoint example should contain valid JSON");
 
         assert!(!readme.contains(&removed_flag));
         assert!(!readme.contains(&removed_env_var));
@@ -195,6 +206,52 @@ mod login_cli_tests {
                 "README should include visible alias {visible_alias} in the VS Code custom endpoint JSON"
             );
         }
+
+        assert!(
+            utility_aliases_section.contains("threadline-utility-gpt-5.6-luna"),
+            "README should list the Utility Luna alias in the Utility aliases section"
+        );
+        let utility_endpoint = custom_endpoint_document
+            .get("chat.customEndpoints")
+            .and_then(Value::as_array)
+            .and_then(|endpoints| {
+                endpoints.iter().find(|endpoint| {
+                    endpoint.get("uri").and_then(Value::as_str) == Some("http://127.0.0.1:8101/v1")
+                })
+            })
+            .expect("README should include the Utility custom endpoint");
+        let utility_luna_model = utility_endpoint
+            .get("models")
+            .and_then(Value::as_array)
+            .and_then(|models| {
+                models.iter().find(|model| {
+                    model.get("id").and_then(Value::as_str)
+                        == Some("threadline-utility-gpt-5.6-luna")
+                })
+            })
+            .expect("README should include the Utility Luna model");
+        assert_eq!(
+            utility_luna_model.get("name").and_then(Value::as_str),
+            Some("Threadline Utility GPT-5.6 Luna")
+        );
+        assert_eq!(
+            utility_luna_model
+                .get("supportsReasoningEffort")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            custom_endpoint_json.contains(
+                "\"chat.utilityModel\": \"customendpoint/threadline-utility-gpt-5.4-mini\""
+            ),
+            "README should keep the default Utility model selector on GPT-5.4 Mini"
+        );
+        assert!(
+            custom_endpoint_json.contains(
+                "\"chat.utilitySmallModel\": \"customendpoint/threadline-utility-gpt-5.4-mini\""
+            ),
+            "README should keep the small Utility model selector on GPT-5.4 Mini"
+        );
 
         for raw_model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             assert!(
