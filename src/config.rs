@@ -96,8 +96,8 @@ pub struct ThreadlineConfig {
         long,
         env = "THREADLINE_PERSISTENT_REASONING_ENABLED",
         default_value_t = DEFAULT_PERSISTENT_REASONING_ENABLED,
-        help = "Enable persistent reasoning context for eligible main model aliases.",
-        long_help = "Enable persistent reasoning context for eligible Main-scope model aliases. When enabled, Threadline sets reasoning.context=all_turns only for eligible aliases in the Main scope."
+        help = "Enable persistent reasoning context for eligible Main model requests.",
+        long_help = "Enable persistent reasoning context for eligible Main-scope model requests. When enabled, Threadline sets reasoning.context=all_turns only for eligible requests in the Main scope."
     )]
     pub persistent_reasoning_enabled: bool,
 
@@ -427,6 +427,7 @@ mod tests {
                     "reasoning",
                     "eligible",
                     "main",
+                    "request",
                     "reasoning.context",
                     "all_turns",
                 ][..],

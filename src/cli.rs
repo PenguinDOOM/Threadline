@@ -391,10 +391,31 @@ mod login_cli_tests {
                 "README should identify advertised Main alias {advertised_main_alias} as eligible"
             );
         }
+        for raw_main_compatibility_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(
+                persistent_reasoning_scope.contains(raw_main_compatibility_id),
+                "README should identify raw Main compatibility id {raw_main_compatibility_id} as eligible"
+            );
+        }
         assert!(
-            persistent_reasoning_scope.contains("raw compatibility ids")
-                && persistent_reasoning_scope.contains("not automatically eligible"),
-            "README should exclude raw compatibility ids from automatic eligibility"
+            persistent_reasoning_scope.contains("support that client-explicit value on Main")
+                && persistent_reasoning_scope.contains("also eligible for server-side injection"),
+            "README should document explicit and automatic persistent reasoning for raw GPT-5.6 Main compatibility ids"
+        );
+        assert!(
+            persistent_reasoning_scope.contains("raw compatibility ids `gpt-5.5` and `gpt-5.4`")
+                && persistent_reasoning_scope.contains("remain excluded from automatic injection")
+                && persistent_reasoning_scope
+                    .contains("continue to reject client-explicit `reasoning.context=all_turns`"),
+            "README should retain the GPT-5.5 and GPT-5.4 raw compatibility caveat"
+        );
+        assert!(
+            persistent_reasoning_scope
+                .contains("Utility requests remain excluded from automatic injection")
+                && persistent_reasoning_scope.contains(
+                    "supporting Utility aliases preserve client-explicit `reasoning.context=all_turns`",
+                ),
+            "README should distinguish Utility automatic ineligibility from client-explicit all_turns support"
         );
 
         assert!(

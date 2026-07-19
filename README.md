@@ -55,7 +55,7 @@ Threadline reads configuration from CLI flags or environment variables.
 | `--codex-client-version` | `THREADLINE_CODEX_CLIENT_VERSION` | `0.136.0` | Codex client version Threadline sends to the upstream backend for compatibility. |
 | `--retained-session-capacity` | `THREADLINE_RETAINED_SESSION_CAPACITY` | `64` | Maximum number of retained sessions kept available for response continuation. |
 | `--jobs-enabled` | `THREADLINE_JOBS_ENABLED` | `false` | Enables local job execution support for long-running work. |
-| `--persistent-reasoning-enabled` | `THREADLINE_PERSISTENT_REASONING_ENABLED` | `false` | Enables server-side persistent reasoning for eligible Main model requests. When enabled, eligible advertised Main aliases automatically receive `reasoning.context=all_turns`. |
+| `--persistent-reasoning-enabled` | `THREADLINE_PERSISTENT_REASONING_ENABLED` | `false` | Enables server-side persistent reasoning for eligible Main model requests. When enabled, eligible Main requests automatically receive `reasoning.context=all_turns`. |
 | `--job-output-buffer-limit-bytes` | `THREADLINE_JOB_OUTPUT_BUFFER_LIMIT_BYTES` | `32768` | Maximum in-memory buffered job output before older output is dropped. |
 | `--job-retention-ttl-secs` | `THREADLINE_JOB_RETENTION_TTL_SECS` | `300` | How long completed job metadata and buffered output remain available after completion. |
 | `--job-allowed-commands` | `THREADLINE_JOB_ALLOWED_COMMANDS` | None | comma-separated exact program names allowed for jobs. Threadline compares `command[0]` against each configured entry exactly, without normalizing wrappers, paths, or aliases. |
@@ -128,9 +128,9 @@ For Main compatibility, Threadline still accepts direct `gpt-*` ids on the Main 
 
 ## Persistent Reasoning
 
-The previous experimental unconditional injection is now default-off. Users who need server-side automatic injection must opt in with `--persistent-reasoning-enabled` or `THREADLINE_PERSISTENT_REASONING_ENABLED=true`. With the setting enabled, Threadline automatically adds `reasoning.context=all_turns` only to eligible Main requests using the advertised aliases `threadline-main-gpt-5.6-sol`, `threadline-main-gpt-5.6-terra`, and `threadline-main-gpt-5.6-luna`. The advertised `threadline-main-gpt-5.5` and `threadline-main-gpt-5.4` aliases, raw compatibility ids, and Utility requests are not automatically eligible.
+The previous experimental unconditional injection is now default-off. Users who need server-side automatic injection must opt in with `--persistent-reasoning-enabled` or `THREADLINE_PERSISTENT_REASONING_ENABLED=true`. With the setting enabled, Threadline automatically adds `reasoning.context=all_turns` only to eligible Main requests using the advertised aliases `threadline-main-gpt-5.6-sol`, `threadline-main-gpt-5.6-terra`, and `threadline-main-gpt-5.6-luna`, or the raw compatibility ids `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. The advertised `threadline-main-gpt-5.5` and `threadline-main-gpt-5.4` aliases, raw compatibility ids `gpt-5.5` and `gpt-5.4`, and Utility requests are not automatically eligible.
 
-Threadline's server-side setting is independent of VS Code's `github.copilot.chat.responsesApi.persistentCoT.enabled` setting. Threadline `false` does not remove a client-explicit `reasoning.context=all_turns`; Threadline `true` injects it for eligible Main requests even when the VS Code setting is `false`. Persistent CoT with `reasoning.context=all_turns` remains rejected for the raw compatibility ids `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, and `gpt-5.4`.
+Threadline's server-side setting is independent of VS Code's `github.copilot.chat.responsesApi.persistentCoT.enabled` setting. Threadline `false` does not remove a client-explicit `reasoning.context=all_turns`; the raw compatibility ids `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` support that client-explicit value on Main and are also eligible for server-side injection when Threadline is `true`. Threadline `true` injects it for eligible Main requests even when the VS Code setting is `false`. The raw compatibility ids `gpt-5.5` and `gpt-5.4` remain excluded from automatic injection and continue to reject client-explicit `reasoning.context=all_turns`. Utility requests remain excluded from automatic injection, while supporting Utility aliases preserve client-explicit `reasoning.context=all_turns` under the existing capability policy. Persistent CoT with `reasoning.context=all_turns` remains rejected for the raw compatibility ids `gpt-5.5` and `gpt-5.4` when requested explicitly by the client.
 
 ## VS Code Custom Endpoint Setup
 
@@ -190,6 +190,8 @@ Use distinct visible ids and distinct profile-specific URLs so VS Code can keep 
 ```
 
 The visible ids in this JSON are aliases only. VS Code uses `customendpoint/threadline-main-gpt-5.5` and `customendpoint/threadline-utility-gpt-5.4-mini` as local model selectors, while Threadline rewrites the upstream `model` field to the matching `gpt-*` id.
+
+When a GPT-5.6-specific prompt selection needs a raw compatibility model, a Main Custom Endpoint configuration can use one of the raw GPT-5.6 ids `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna` as a compatibility option. This documents an available compatibility option; it does not claim or guarantee how VS Code selects internal prompts.
 
 Utility preserves `reasoning.effort` by default when the client sends it. The `supportsReasoningEffort` model setting only controls whether VS Code shows the effort picker for that visible model id.
 

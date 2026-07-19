@@ -4660,6 +4660,87 @@ async fn advertised_main_gpt_5_6_injects_persistent_reasoning_and_preserves_reas
 }
 
 #[tokio::test]
+async fn raw_main_gpt_5_6_injects_persistent_reasoning_for_missing_null_and_object_reasoning() {
+    let enabled_main_config = ThreadlineConfig {
+        persistent_reasoning_enabled: true,
+        ..ThreadlineConfig::default()
+    };
+    let reasoning_cases = [
+        (
+            "missing",
+            json!({ "input": "missing reasoning" }),
+            json!({ "context": "all_turns" }),
+        ),
+        (
+            "null",
+            json!({ "input": "null reasoning", "reasoning": null }),
+            json!({ "context": "all_turns" }),
+        ),
+        (
+            "object",
+            json!({
+                "input": "object reasoning",
+                "reasoning": { "effort": "high", "summary": "detailed" }
+            }),
+            json!({ "context": "all_turns", "effort": "high", "summary": "detailed" }),
+        ),
+    ];
+
+    for model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        for (case_name, request, expected_reasoning) in &reasoning_cases {
+            let mut request = request.clone();
+            request
+                .as_object_mut()
+                .expect("reasoning test request should be an object")
+                .insert("model".to_string(), json!(model_id));
+
+            let request_payload =
+                completed_response_create_payload(enabled_main_config.clone(), request).await;
+            assert_eq!(
+                request_payload["model"], model_id,
+                "model_id={model_id}, case={case_name}"
+            );
+            assert_eq!(
+                request_payload["reasoning"], *expected_reasoning,
+                "model_id={model_id}, case={case_name}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn raw_main_gpt_5_6_preserves_disabled_default_and_client_explicit_all_turns() {
+    for model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        let disabled_payload = completed_response_create_payload(
+            ThreadlineConfig::default(),
+            json!({ "model": model_id, "input": "disabled reasoning" }),
+        )
+        .await;
+        assert_eq!(disabled_payload["model"], model_id, "model_id={model_id}");
+        assert!(
+            disabled_payload.get("reasoning").is_none(),
+            "model_id={model_id}: disabled default should not inject reasoning"
+        );
+
+        let explicit_payload = completed_response_create_payload(
+            ThreadlineConfig::default(),
+            json!({
+                "model": model_id,
+                "input": "explicit all turns",
+                "reasoning": { "context": "all_turns", "effort": "medium", "summary": "auto" }
+            }),
+        )
+        .await;
+        assert_eq!(explicit_payload["model"], model_id, "model_id={model_id}");
+        assert_eq!(
+            explicit_payload["reasoning"],
+            json!({ "context": "all_turns", "effort": "medium", "summary": "auto" }),
+            "model_id={model_id}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes() {
     let enabled_main_config = ThreadlineConfig {
         persistent_reasoning_enabled: true,
@@ -4763,21 +4844,6 @@ async fn persistent_reasoning_does_not_auto_inject_for_ineligible_main_or_utilit
     };
     let cases = [
         (
-            "raw gpt-5.6-sol",
-            enabled_main_config.clone(),
-            "gpt-5.6-sol",
-        ),
-        (
-            "raw gpt-5.6-terra",
-            enabled_main_config.clone(),
-            "gpt-5.6-terra",
-        ),
-        (
-            "raw gpt-5.6-luna",
-            enabled_main_config.clone(),
-            "gpt-5.6-luna",
-        ),
-        (
             "advertised gpt-5.5",
             enabled_main_config.clone(),
             "threadline-main-gpt-5.5",
@@ -4786,6 +4852,38 @@ async fn persistent_reasoning_does_not_auto_inject_for_ineligible_main_or_utilit
             "advertised gpt-5.4",
             enabled_main_config,
             "threadline-main-gpt-5.4",
+        ),
+        (
+            "raw gpt-5.5",
+            ThreadlineConfig {
+                persistent_reasoning_enabled: true,
+                ..ThreadlineConfig::default()
+            },
+            "gpt-5.5",
+        ),
+        (
+            "raw gpt-5.4",
+            ThreadlineConfig {
+                persistent_reasoning_enabled: true,
+                ..ThreadlineConfig::default()
+            },
+            "gpt-5.4",
+        ),
+        (
+            "raw gpt-5.4-mini",
+            ThreadlineConfig {
+                persistent_reasoning_enabled: true,
+                ..ThreadlineConfig::default()
+            },
+            "gpt-5.4-mini",
+        ),
+        (
+            "raw gpt-5.3-codex-spark",
+            ThreadlineConfig {
+                persistent_reasoning_enabled: true,
+                ..ThreadlineConfig::default()
+            },
+            "gpt-5.3-codex-spark",
         ),
         (
             "utility profile",

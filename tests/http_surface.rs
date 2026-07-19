@@ -504,7 +504,7 @@ async fn responses_endpoint_rejects_unsupported_reasoning_all_turns_before_retai
 }
 
 #[tokio::test]
-async fn responses_endpoint_rejects_new_raw_main_compatibility_ids_for_reasoning_all_turns_before_auth_or_upstream()
+async fn responses_endpoint_allows_raw_gpt_5_6_main_compatibility_ids_for_reasoning_all_turns_to_reach_existing_auth_path()
  {
     for model_id in NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS {
         let app = build_router_with_services(
@@ -517,6 +517,40 @@ async fn responses_endpoint_rejects_new_raw_main_compatibility_ids_for_reasoning
             json!({
                 "model": model_id,
                 "input": "main-all-turns-next-model",
+                "reasoning": {
+                    "context": "all_turns"
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "model_id={model_id}"
+        );
+
+        let payload = read_json_body(response).await;
+        assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
+        assert_eq!(payload["error"]["type"], "configuration_error");
+        assert_ne!(payload["error"]["code"], "unsupported_reasoning_context");
+    }
+}
+
+#[tokio::test]
+async fn responses_endpoint_rejects_legacy_raw_main_compatibility_ids_for_reasoning_all_turns_before_auth_or_upstream()
+ {
+    for model_id in ["gpt-5.5", "gpt-5.4"] {
+        let app = build_router_with_services(
+            ThreadlineConfig::default(),
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(
+            app,
+            json!({
+                "model": model_id,
+                "input": "main-all-turns-legacy-model",
                 "reasoning": {
                     "context": "all_turns"
                 }

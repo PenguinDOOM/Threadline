@@ -102,24 +102,24 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 15] = [
         upstream_model_id: "gpt-5.6-sol",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "gpt-5.6-terra",
         upstream_model_id: "gpt-5.6-terra",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "gpt-5.6-luna",
         upstream_model_id: "gpt-5.6-luna",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "gpt-5.5",
@@ -449,8 +449,8 @@ mod tests {
             assert_eq!(compatibility.upstream_model_id, model_id);
             assert_eq!(compatibility.profile, RouteProfile::Main);
             assert!(!compatibility.advertised);
-            assert!(!compatibility.persistent_reasoning_eligible);
-            assert!(!compatibility.supports_reasoning_all_turns);
+            assert!(compatibility.persistent_reasoning_eligible);
+            assert!(compatibility.supports_reasoning_all_turns);
 
             assert_eq!(
                 resolve_request_model_for_profile(
@@ -534,34 +534,41 @@ mod tests {
         assert!(!utility_unsupported.supports_reasoning_all_turns);
 
         let hidden_compatibility = resolve_request_model_for_profile(
+            json!({ "model": "gpt-5.6-sol" }).as_object().unwrap(),
+            RouteProfile::Main,
+        )
+        .unwrap();
+        assert!(hidden_compatibility.supports_reasoning_all_turns);
+
+        let hidden_compatibility_secondary = resolve_request_model_for_profile(
+            json!({ "model": "gpt-5.6-terra" }).as_object().unwrap(),
+            RouteProfile::Main,
+        )
+        .unwrap();
+        assert!(hidden_compatibility_secondary.supports_reasoning_all_turns);
+
+        let hidden_compatibility_tertiary = resolve_request_model_for_profile(
+            json!({ "model": "gpt-5.6-luna" }).as_object().unwrap(),
+            RouteProfile::Main,
+        )
+        .unwrap();
+        assert!(hidden_compatibility_tertiary.supports_reasoning_all_turns);
+
+        let hidden_compatibility_quaternary = resolve_request_model_for_profile(
             json!({ "model": "gpt-5.5" }).as_object().unwrap(),
             RouteProfile::Main,
         )
         .unwrap();
-        assert!(!hidden_compatibility.supports_reasoning_all_turns);
-
-        let hidden_compatibility_secondary = resolve_request_model_for_profile(
-            json!({ "model": "gpt-5.4" }).as_object().unwrap(),
-            RouteProfile::Main,
-        )
-        .unwrap();
-        assert!(!hidden_compatibility_secondary.supports_reasoning_all_turns);
-
-        let hidden_compatibility_tertiary = resolve_request_model_for_profile(
-            json!({ "model": "gpt-5.4-mini" }).as_object().unwrap(),
-            RouteProfile::Main,
-        )
-        .unwrap();
-        assert!(!hidden_compatibility_tertiary.supports_reasoning_all_turns);
-
-        let hidden_compatibility_quaternary = resolve_request_model_for_profile(
-            json!({ "model": "gpt-5.3-codex-spark" })
-                .as_object()
-                .unwrap(),
-            RouteProfile::Main,
-        )
-        .unwrap();
         assert!(!hidden_compatibility_quaternary.supports_reasoning_all_turns);
+
+        for model_id in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+            let compatibility = resolve_request_model_for_profile(
+                json!({ "model": model_id }).as_object().unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap();
+            assert!(!compatibility.supports_reasoning_all_turns);
+        }
     }
 
     #[test]
@@ -578,9 +585,6 @@ mod tests {
         for model_id in [
             "threadline-main-gpt-5.5",
             "threadline-main-gpt-5.4",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
             "gpt-5.5",
             "gpt-5.4",
             "gpt-5.4-mini",
