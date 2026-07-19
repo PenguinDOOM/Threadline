@@ -97,8 +97,15 @@ impl UpstreamConnector for RecordingConnector {
 }
 
 fn build_test_router(connector: Arc<dyn UpstreamConnector>) -> axum::Router {
+    build_test_router_with_config(ThreadlineConfig::default(), connector)
+}
+
+fn build_test_router_with_config(
+    config: ThreadlineConfig,
+    connector: Arc<dyn UpstreamConnector>,
+) -> axum::Router {
     build_router_with_services(
-        ThreadlineConfig::default(),
+        config,
         ThreadlineServices::new(Arc::new(StaticAuthProvider), connector),
     )
 }
@@ -661,6 +668,99 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     assert_done_frame(frames[2]);
     assert!(!body_text.contains("threadline_echo"));
     assert!(!body_text.contains("response-intermediate"));
+    assert!(!body_text.contains("event: response.output_item.done"));
+    assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn internal_tool_followup_preserves_persistent_reasoning_context_and_outputs() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router_with_config(
+        ThreadlineConfig {
+            persistent_reasoning_enabled: true,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-main-gpt-5.6-terra",
+            "input":"run persistent internal tool loop",
+            "reasoning":{"effort":"high","summary":"auto"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes")
+    });
+
+    let first_request: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("initial request"),
+    ))
+    .expect("initial request json");
+    let expected_reasoning = json!({"context":"all_turns","effort":"high","summary":"auto"});
+    assert_eq!(first_request["type"], "response.create");
+    assert_eq!(first_request["model"], "gpt-5.6-terra");
+    assert_eq!(first_request["reasoning"], expected_reasoning);
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-persistent","name":"threadline_echo","arguments":"{\"value\":\"persistent output\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-persistent-intermediate"}}"#,
+        )
+        .await;
+
+    let followup_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup_request["type"], "response.create");
+    assert_eq!(
+        followup_request["reasoning"],
+        json!({"context":"all_turns","effort":"high","summary":"auto"})
+    );
+    assert_eq!(
+        followup_request["previous_response_id"],
+        "response-persistent-intermediate"
+    );
+    assert_eq!(
+        followup_request["input"],
+        json!([{
+            "type":"function_call_output",
+            "call_id":"call-persistent",
+            "output":"persistent output"
+        }])
+    );
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"persistent final answer"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-persistent-final"}}"#)
+        .await;
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(body_text.contains("persistent final answer"));
+    assert!(!body_text.contains("threadline_echo"));
+    assert!(!body_text.contains("response-persistent-intermediate"));
     assert!(!body_text.contains("event: response.output_item.done"));
     assert!(server.take_pending_client_messages().await.is_empty());
 }

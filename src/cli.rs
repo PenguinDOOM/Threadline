@@ -264,6 +264,11 @@ mod login_cli_tests {
             ),
             ("--jobs-enabled", "THREADLINE_JOBS_ENABLED", Some("false")),
             (
+                "--persistent-reasoning-enabled",
+                "THREADLINE_PERSISTENT_REASONING_ENABLED",
+                Some("false"),
+            ),
+            (
                 "--job-output-buffer-limit-bytes",
                 "THREADLINE_JOB_OUTPUT_BUFFER_LIMIT_BYTES",
                 Some("32768"),
@@ -296,6 +301,44 @@ mod login_cli_tests {
                 );
             }
         }
+
+        let main_utility_scope = readme_section_containing(&readme, "The setting is Main-only.")
+            .expect("README should document persistent reasoning as Main-only");
+        assert!(
+            main_utility_scope.contains("Utility listener does not receive persistent reasoning"),
+            "README should exclude persistent reasoning from the Utility listener"
+        );
+        assert!(
+            main_utility_scope
+                .contains("standalone Utility process also has an effective value of `false`"),
+            "README should document the standalone Utility effective value"
+        );
+
+        let persistent_reasoning_scope = readme_section_containing(
+            &readme,
+            "The previous experimental unconditional injection is now default-off.",
+        )
+        .expect("README should document persistent reasoning eligibility");
+        assert!(
+            persistent_reasoning_scope.contains("reasoning.context=all_turns")
+                && persistent_reasoning_scope.contains("only to eligible Main requests"),
+            "README should describe persistent reasoning as eligible Main-only injection"
+        );
+        for advertised_main_alias in [
+            "threadline-main-gpt-5.6-sol",
+            "threadline-main-gpt-5.6-terra",
+            "threadline-main-gpt-5.6-luna",
+        ] {
+            assert!(
+                persistent_reasoning_scope.contains(advertised_main_alias),
+                "README should identify advertised Main alias {advertised_main_alias} as eligible"
+            );
+        }
+        assert!(
+            persistent_reasoning_scope.contains("raw compatibility ids")
+                && persistent_reasoning_scope.contains("not automatically eligible"),
+            "README should exclude raw compatibility ids from automatic eligibility"
+        );
 
         assert!(
             readme.contains("comma-separated"),

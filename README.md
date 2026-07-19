@@ -55,6 +55,7 @@ Threadline reads configuration from CLI flags or environment variables.
 | `--codex-client-version` | `THREADLINE_CODEX_CLIENT_VERSION` | `0.136.0` | Codex client version Threadline sends to the upstream backend for compatibility. |
 | `--retained-session-capacity` | `THREADLINE_RETAINED_SESSION_CAPACITY` | `64` | Maximum number of retained sessions kept available for response continuation. |
 | `--jobs-enabled` | `THREADLINE_JOBS_ENABLED` | `false` | Enables local job execution support for long-running work. |
+| `--persistent-reasoning-enabled` | `THREADLINE_PERSISTENT_REASONING_ENABLED` | `false` | Enables server-side persistent reasoning for eligible Main model requests. When enabled, eligible advertised Main aliases automatically receive `reasoning.context=all_turns`. |
 | `--job-output-buffer-limit-bytes` | `THREADLINE_JOB_OUTPUT_BUFFER_LIMIT_BYTES` | `32768` | Maximum in-memory buffered job output before older output is dropped. |
 | `--job-retention-ttl-secs` | `THREADLINE_JOB_RETENTION_TTL_SECS` | `300` | How long completed job metadata and buffered output remain available after completion. |
 | `--job-allowed-commands` | `THREADLINE_JOB_ALLOWED_COMMANDS` | None | comma-separated exact program names allowed for jobs. Threadline compares `command[0]` against each configured entry exactly, without normalizing wrappers, paths, or aliases. |
@@ -73,6 +74,20 @@ threadline --port 8100 --jobs-enabled --utility-port 8101
 This starts the default Main listener on port `8100` and a second stateless Utility listener in the same process on port `8101`.
 
 The Utility listener remains stateless because the Utility route profile always uses a fresh one-shot upstream connection and never registers or retains upstream session state.
+
+Persistent reasoning is opt-in for the Main listener. Enable it with the flag:
+
+```bash
+threadline --port 8100 --jobs-enabled --utility-port 8101 --persistent-reasoning-enabled
+```
+
+Or use the equivalent environment variable:
+
+```bash
+THREADLINE_PERSISTENT_REASONING_ENABLED=true threadline --port 8100 --jobs-enabled --utility-port 8101
+```
+
+The setting is Main-only. In dual-listener mode, the Utility listener does not receive persistent reasoning. A standalone Utility process also has an effective value of `false` even when `--persistent-reasoning-enabled` or `THREADLINE_PERSISTENT_REASONING_ENABLED=true` is configured.
 
 fallback/debug mode still supports two separate Threadline processes with profile-specific ports:
 
@@ -110,7 +125,11 @@ These visible ids are aliases for VS Code selection and routing. The upstream mo
 
 For Main compatibility, Threadline still accepts direct `gpt-*` ids on the Main profile even though `/v1/models` advertises only the `threadline-main-*` aliases.
 
-Persistent CoT with `reasoning.context=all_turns` does not currently support the raw compatibility ids `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, and `gpt-5.4`; revisit that later rather than enabling it now. For now, keep `github.copilot.chat.responsesApi.persistentCoT.enabled=false` in VS Code; the current default is already `false`. When supported all-turn reasoning is needed, use the advertised Threadline aliases rather than the raw compatibility ids.
+## Persistent Reasoning
+
+The previous experimental unconditional injection is now default-off. Users who need server-side automatic injection must opt in with `--persistent-reasoning-enabled` or `THREADLINE_PERSISTENT_REASONING_ENABLED=true`. With the setting enabled, Threadline automatically adds `reasoning.context=all_turns` only to eligible Main requests using the advertised aliases `threadline-main-gpt-5.6-sol`, `threadline-main-gpt-5.6-terra`, and `threadline-main-gpt-5.6-luna`. The advertised `threadline-main-gpt-5.5` and `threadline-main-gpt-5.4` aliases, raw compatibility ids, and Utility requests are not automatically eligible.
+
+Threadline's server-side setting is independent of VS Code's `github.copilot.chat.responsesApi.persistentCoT.enabled` setting. Threadline `false` does not remove a client-explicit `reasoning.context=all_turns`; Threadline `true` injects it for eligible Main requests even when the VS Code setting is `false`. Persistent CoT with `reasoning.context=all_turns` remains rejected for the raw compatibility ids `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, and `gpt-5.4`.
 
 ## VS Code Custom Endpoint Setup
 

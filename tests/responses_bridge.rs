@@ -153,6 +153,31 @@ async fn post_responses(app: axum::Router, payload: Value) -> Response<Body> {
     .expect("response")
 }
 
+async fn completed_response_create_payload(config: ThreadlineConfig, request: Value) -> Value {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(config, Arc::new(connector));
+
+    let response = post_responses(app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-test"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+
+    request_payload
+}
+
 async fn post_responses_with_headers(
     app: axum::Router,
     payload: Value,
@@ -823,6 +848,91 @@ async fn live_retained_upstream_continuation_forwards_previous_response_id_witho
 
     retained_server
         .send_text(&assistant_text_completed_event("response-2", "second completion").to_string())
+        .await;
+    let _ = to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .expect("second body");
+
+    let sessions = connector.recorded_sessions().await;
+    assert_eq!(sessions.len(), 1);
+}
+
+#[tokio::test]
+async fn retained_gpt_5_6_continuation_repeats_persistent_reasoning_context_without_reconnect() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&retained_server),
+        turn_state: Some("turn-state-persistent".to_string()),
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            persistent_reasoning_enabled: true,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let first_response = post_responses(
+        app.clone(),
+        json!({
+            "model":"threadline-main-gpt-5.6-terra",
+            "input":"first persistent turn"
+        }),
+    )
+    .await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    let first_payload: Value = serde_json::from_str(&message_text(
+        retained_server
+            .recv_client_message()
+            .await
+            .expect("first request message"),
+    ))
+    .expect("first request json");
+    assert_eq!(first_payload["type"], "response.create");
+    assert_eq!(first_payload["model"], "gpt-5.6-terra");
+    assert_eq!(first_payload["reasoning"], json!({"context":"all_turns"}));
+
+    retained_server
+        .send_text(
+            &assistant_text_completed_event("response-persistent-1", "first completion")
+                .to_string(),
+        )
+        .await;
+    let _ = to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+
+    let second_response = post_responses(
+        app,
+        json!({
+            "model":"threadline-main-gpt-5.6-terra",
+            "input":"second persistent turn",
+            "previous_response_id":"response-persistent-1"
+        }),
+    )
+    .await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+
+    let second_payload: Value = serde_json::from_str(&message_text(
+        retained_server
+            .recv_client_message()
+            .await
+            .expect("second request message"),
+    ))
+    .expect("second request json");
+    assert_eq!(second_payload["type"], "response.create");
+    assert_eq!(
+        second_payload["previous_response_id"],
+        "response-persistent-1"
+    );
+    assert_eq!(second_payload["reasoning"], json!({"context":"all_turns"}));
+
+    retained_server
+        .send_text(
+            &assistant_text_completed_event("response-persistent-2", "second completion")
+                .to_string(),
+        )
         .await;
     let _ = to_bytes(second_response.into_body(), usize::MAX)
         .await
@@ -4502,6 +4612,203 @@ async fn supported_request_fields_are_preserved_while_codex_unsupported_fields_a
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
+}
+
+#[tokio::test]
+async fn advertised_main_gpt_5_6_injects_persistent_reasoning_and_preserves_reasoning_fields() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            persistent_reasoning_enabled: true,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector),
+    );
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"threadline-main-gpt-5.6-terra",
+            "input":"persist reasoning across turns",
+            "reasoning":{"effort":"high","summary":"detailed"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("request message"),
+    ))
+    .expect("request json");
+    assert_eq!(request_payload["type"], "response.create");
+    assert_eq!(request_payload["model"], "gpt-5.6-terra");
+    assert_eq!(
+        request_payload["reasoning"],
+        json!({"context":"all_turns","effort":"high","summary":"detailed"})
+    );
+
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-persistent"}}"#)
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+}
+
+#[tokio::test]
+async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes() {
+    let enabled_main_config = ThreadlineConfig {
+        persistent_reasoning_enabled: true,
+        ..ThreadlineConfig::default()
+    };
+    let cases = vec![
+        (
+            "disabled",
+            ThreadlineConfig::default(),
+            json!({
+                "model":"threadline-main-gpt-5.6-terra",
+                "input":"disabled reasoning"
+            }),
+            None,
+        ),
+        (
+            "missing",
+            enabled_main_config.clone(),
+            json!({
+                "model":"threadline-main-gpt-5.6-terra",
+                "input":"missing reasoning"
+            }),
+            Some(json!({"context":"all_turns"})),
+        ),
+        (
+            "null",
+            enabled_main_config.clone(),
+            json!({
+                "model":"threadline-main-gpt-5.6-terra",
+                "input":"null reasoning",
+                "reasoning":null
+            }),
+            Some(json!({"context":"all_turns"})),
+        ),
+        (
+            "null context",
+            enabled_main_config.clone(),
+            json!({
+                "model":"threadline-main-gpt-5.6-terra",
+                "input":"null context",
+                "reasoning":{"context":null,"effort":"low"}
+            }),
+            Some(json!({"context":null,"effort":"low"})),
+        ),
+        (
+            "non-string context",
+            enabled_main_config.clone(),
+            json!({
+                "model":"threadline-main-gpt-5.6-terra",
+                "input":"non-string context",
+                "reasoning":{"context":["all_turns"],"effort":"medium"}
+            }),
+            Some(json!({"context":["all_turns"],"effort":"medium"})),
+        ),
+        (
+            "non-object reasoning",
+            enabled_main_config.clone(),
+            json!({
+                "model":"threadline-main-gpt-5.6-terra",
+                "input":"non-object reasoning",
+                "reasoning":"opaque"
+            }),
+            Some(json!("opaque")),
+        ),
+        (
+            "summary off",
+            enabled_main_config,
+            json!({
+                "model":"threadline-main-gpt-5.6-terra",
+                "input":"summary off",
+                "reasoning":{"summary":"off"}
+            }),
+            Some(json!({"context":"all_turns"})),
+        ),
+    ];
+
+    for (case_name, config, request, expected_reasoning) in cases {
+        let request_payload = completed_response_create_payload(config, request).await;
+        assert_eq!(
+            request_payload["type"], "response.create",
+            "case={case_name}"
+        );
+        assert_eq!(
+            request_payload.get("reasoning"),
+            expected_reasoning.as_ref(),
+            "case={case_name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn persistent_reasoning_does_not_auto_inject_for_ineligible_main_or_utility_models() {
+    let enabled_main_config = ThreadlineConfig {
+        persistent_reasoning_enabled: true,
+        ..ThreadlineConfig::default()
+    };
+    let enabled_utility_config = ThreadlineConfig {
+        profile: RouteProfile::Utility,
+        persistent_reasoning_enabled: true,
+        ..ThreadlineConfig::default()
+    };
+    let cases = [
+        (
+            "raw gpt-5.6-sol",
+            enabled_main_config.clone(),
+            "gpt-5.6-sol",
+        ),
+        (
+            "raw gpt-5.6-terra",
+            enabled_main_config.clone(),
+            "gpt-5.6-terra",
+        ),
+        (
+            "raw gpt-5.6-luna",
+            enabled_main_config.clone(),
+            "gpt-5.6-luna",
+        ),
+        (
+            "advertised gpt-5.5",
+            enabled_main_config.clone(),
+            "threadline-main-gpt-5.5",
+        ),
+        (
+            "advertised gpt-5.4",
+            enabled_main_config,
+            "threadline-main-gpt-5.4",
+        ),
+        (
+            "utility profile",
+            enabled_utility_config,
+            "threadline-utility-gpt-5.4-mini",
+        ),
+    ];
+
+    for (case_name, config, model) in cases {
+        let request_payload = completed_response_create_payload(
+            config,
+            json!({"model":model,"input":"ineligible persistent reasoning"}),
+        )
+        .await;
+        assert_eq!(
+            request_payload["type"], "response.create",
+            "case={case_name}"
+        );
+        assert!(
+            request_payload.get("reasoning").is_none(),
+            "case={case_name}: unexpected persistent reasoning injection"
+        );
+    }
 }
 
 #[tokio::test]
