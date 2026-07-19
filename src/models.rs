@@ -28,6 +28,7 @@ pub struct ModelAlias {
     pub upstream_model_id: &'static str,
     pub profile: RouteProfile,
     pub advertised: bool,
+    pub persistent_reasoning_eligible: bool,
     pub supports_reasoning_all_turns: bool,
 }
 
@@ -37,6 +38,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.6-sol",
         profile: RouteProfile::Main,
         advertised: true,
+        persistent_reasoning_eligible: true,
         supports_reasoning_all_turns: true,
     },
     ModelAlias {
@@ -44,6 +46,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.6-terra",
         profile: RouteProfile::Main,
         advertised: true,
+        persistent_reasoning_eligible: true,
         supports_reasoning_all_turns: true,
     },
     ModelAlias {
@@ -51,6 +54,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.6-luna",
         profile: RouteProfile::Main,
         advertised: true,
+        persistent_reasoning_eligible: true,
         supports_reasoning_all_turns: true,
     },
     ModelAlias {
@@ -58,6 +62,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.5",
         profile: RouteProfile::Main,
         advertised: true,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: true,
     },
     ModelAlias {
@@ -65,6 +70,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.4",
         profile: RouteProfile::Main,
         advertised: true,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: true,
     },
     ModelAlias {
@@ -72,6 +78,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.4-mini",
         profile: RouteProfile::Utility,
         advertised: true,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: true,
     },
     ModelAlias {
@@ -79,6 +86,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.3-codex-spark",
         profile: RouteProfile::Utility,
         advertised: true,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
     ModelAlias {
@@ -86,6 +94,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.6-sol",
         profile: RouteProfile::Main,
         advertised: false,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
     ModelAlias {
@@ -93,6 +102,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.6-terra",
         profile: RouteProfile::Main,
         advertised: false,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
     ModelAlias {
@@ -100,6 +110,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.6-luna",
         profile: RouteProfile::Main,
         advertised: false,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
     ModelAlias {
@@ -107,6 +118,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.5",
         profile: RouteProfile::Main,
         advertised: false,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
     ModelAlias {
@@ -114,6 +126,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.4",
         profile: RouteProfile::Main,
         advertised: false,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
     ModelAlias {
@@ -121,6 +134,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.4-mini",
         profile: RouteProfile::Main,
         advertised: false,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
     ModelAlias {
@@ -128,6 +142,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 14] = [
         upstream_model_id: "gpt-5.3-codex-spark",
         profile: RouteProfile::Main,
         advertised: false,
+        persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
 ];
@@ -282,6 +297,7 @@ mod tests {
             assert_eq!(main.upstream_model_id, upstream_model_id);
             assert_eq!(main.profile, RouteProfile::Main);
             assert!(main.advertised);
+            assert!(main.persistent_reasoning_eligible);
             assert!(main.supports_reasoning_all_turns);
         }
 
@@ -296,6 +312,7 @@ mod tests {
         assert_eq!(main.upstream_model_id, "gpt-5.5");
         assert_eq!(main.profile, RouteProfile::Main);
         assert!(main.advertised);
+        assert!(!main.persistent_reasoning_eligible);
         assert!(main.supports_reasoning_all_turns);
 
         let utility = resolve_request_model_for_profile(
@@ -309,6 +326,7 @@ mod tests {
         assert_eq!(utility.upstream_model_id, "gpt-5.4-mini");
         assert_eq!(utility.profile, RouteProfile::Utility);
         assert!(utility.advertised);
+        assert!(!utility.persistent_reasoning_eligible);
         assert!(utility.supports_reasoning_all_turns);
     }
 
@@ -375,6 +393,7 @@ mod tests {
             assert_eq!(compatibility.upstream_model_id, model_id);
             assert_eq!(compatibility.profile, RouteProfile::Main);
             assert!(!compatibility.advertised);
+            assert!(!compatibility.persistent_reasoning_eligible);
             assert!(!compatibility.supports_reasoning_all_turns);
 
             assert_eq!(
@@ -397,6 +416,7 @@ mod tests {
         assert_eq!(compatibility.upstream_model_id, "gpt-5.4-mini");
         assert_eq!(compatibility.profile, RouteProfile::Main);
         assert!(!compatibility.advertised);
+        assert!(!compatibility.persistent_reasoning_eligible);
         assert!(!compatibility.supports_reasoning_all_turns);
 
         assert_eq!(
@@ -486,6 +506,49 @@ mod tests {
         )
         .unwrap();
         assert!(!hidden_compatibility_quaternary.supports_reasoning_all_turns);
+    }
+
+    #[test]
+    fn resolve_request_model_for_profile_separates_persistent_reasoning_eligibility() {
+        for model_id in NEW_MAIN_VISIBLE_MODEL_IDS {
+            let alias = resolve_request_model_for_profile(
+                json!({ "model": model_id }).as_object().unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap();
+            assert!(alias.persistent_reasoning_eligible);
+        }
+
+        for model_id in [
+            "threadline-main-gpt-5.5",
+            "threadline-main-gpt-5.4",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex-spark",
+        ] {
+            let alias = resolve_request_model_for_profile(
+                json!({ "model": model_id }).as_object().unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap();
+            assert!(!alias.persistent_reasoning_eligible);
+        }
+
+        for model_id in [
+            "threadline-utility-gpt-5.4-mini",
+            "threadline-utility-gpt-5.3-codex-spark",
+        ] {
+            let alias = resolve_request_model_for_profile(
+                json!({ "model": model_id }).as_object().unwrap(),
+                RouteProfile::Utility,
+            )
+            .unwrap();
+            assert!(!alias.persistent_reasoning_eligible);
+        }
     }
 
     #[test]

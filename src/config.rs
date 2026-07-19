@@ -13,6 +13,7 @@ const DEFAULT_PROFILE: RouteProfile = RouteProfile::Main;
 const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.136.0";
 const DEFAULT_RETAINED_SESSION_CAPACITY: usize = 64;
 const DEFAULT_JOBS_ENABLED: bool = false;
+const DEFAULT_PERSISTENT_REASONING_ENABLED: bool = false;
 const DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES: usize = 32 * 1024;
 const DEFAULT_JOB_RETENTION_TTL_SECS: u64 = 300;
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -93,6 +94,15 @@ pub struct ThreadlineConfig {
 
     #[arg(
         long,
+        env = "THREADLINE_PERSISTENT_REASONING_ENABLED",
+        default_value_t = DEFAULT_PERSISTENT_REASONING_ENABLED,
+        help = "Enable persistent reasoning context for eligible main model aliases.",
+        long_help = "Enable persistent reasoning context for eligible Main-scope model aliases. When enabled, Threadline sets reasoning.context=all_turns only for eligible aliases in the Main scope."
+    )]
+    pub persistent_reasoning_enabled: bool,
+
+    #[arg(
+        long,
         env = "THREADLINE_JOB_OUTPUT_BUFFER_LIMIT_BYTES",
         default_value_t = DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,
         value_name = "BYTES",
@@ -141,6 +151,7 @@ impl Default for ThreadlineConfig {
             codex_client_version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
             retained_session_capacity: DEFAULT_RETAINED_SESSION_CAPACITY,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
+            persistent_reasoning_enabled: DEFAULT_PERSISTENT_REASONING_ENABLED,
             job_output_buffer_limit_bytes: DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,
             job_retention_ttl_secs: DEFAULT_JOB_RETENTION_TTL_SECS,
             job_allowed_commands: None,
@@ -161,6 +172,10 @@ impl ThreadlineConfig {
     pub fn bind_address(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         let host: IpAddr = self.host.parse()?;
         Ok(SocketAddr::from((host, self.port)))
+    }
+
+    pub fn persistent_reasoning_enabled_for_profile(&self) -> bool {
+        self.profile == RouteProfile::Main && self.persistent_reasoning_enabled
     }
 
     pub fn job_manager_config(&self) -> ThreadlineJobManagerConfig {
@@ -249,6 +264,7 @@ mod tests {
     use super::{DEFAULT_CODEX_CLIENT_VERSION, ThreadlineConfig};
 
     static THREADLINE_PROFILE_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static THREADLINE_PERSISTENT_REASONING_ENABLED_ENV_LOCK: Mutex<()> = Mutex::new(());
     static THREADLINE_UTILITY_PORT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct ProfileEnvGuard {
@@ -268,6 +284,29 @@ mod tests {
             match self.original.take() {
                 Some(value) => unsafe { std::env::set_var("THREADLINE_PROFILE", value) },
                 None => unsafe { std::env::remove_var("THREADLINE_PROFILE") },
+            }
+        }
+    }
+
+    struct PersistentReasoningEnabledEnvGuard {
+        original: Option<OsString>,
+    }
+
+    impl PersistentReasoningEnabledEnvGuard {
+        fn acquire() -> Self {
+            Self {
+                original: std::env::var_os("THREADLINE_PERSISTENT_REASONING_ENABLED"),
+            }
+        }
+    }
+
+    impl Drop for PersistentReasoningEnabledEnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("THREADLINE_PERSISTENT_REASONING_ENABLED", value)
+                },
+                None => unsafe { std::env::remove_var("THREADLINE_PERSISTENT_REASONING_ENABLED") },
             }
         }
     }
@@ -382,6 +421,17 @@ mod tests {
             ),
             ("jobs-enabled", &["job", "enable"][..]),
             (
+                "persistent-reasoning-enabled",
+                &[
+                    "persistent",
+                    "reasoning",
+                    "eligible",
+                    "main",
+                    "reasoning.context",
+                    "all_turns",
+                ][..],
+            ),
+            (
                 "job-output-buffer-limit-bytes",
                 &["job output", "bytes"][..],
             ),
@@ -447,6 +497,62 @@ mod tests {
         let config = ThreadlineCli::parse_from(["threadline"]).server;
 
         assert_eq!(config.profile, RouteProfile::Utility);
+    }
+
+    #[test]
+    fn persistent_reasoning_enabled_defaults_to_false() {
+        let _lock = THREADLINE_PERSISTENT_REASONING_ENABLED_ENV_LOCK
+            .lock()
+            .expect("persistent reasoning env lock");
+        let _guard = PersistentReasoningEnabledEnvGuard::acquire();
+        unsafe { std::env::remove_var("THREADLINE_PERSISTENT_REASONING_ENABLED") };
+
+        let config = ThreadlineCli::parse_from(["threadline"]).server;
+
+        assert!(!config.persistent_reasoning_enabled);
+    }
+
+    #[test]
+    fn persistent_reasoning_enabled_is_effective_only_for_main_profile() {
+        let main_config = ThreadlineConfig {
+            persistent_reasoning_enabled: true,
+            ..ThreadlineConfig::default()
+        };
+        let utility_config = ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            persistent_reasoning_enabled: true,
+            ..ThreadlineConfig::default()
+        };
+
+        assert!(main_config.persistent_reasoning_enabled_for_profile());
+        assert!(!utility_config.persistent_reasoning_enabled_for_profile());
+    }
+
+    #[test]
+    fn persistent_reasoning_enabled_accepts_cli_flag() {
+        let config =
+            ThreadlineCli::try_parse_from(["threadline", "--persistent-reasoning-enabled"])
+                .expect("threadline config should accept the persistent reasoning cli flag")
+                .server;
+
+        assert!(config.persistent_reasoning_enabled);
+    }
+
+    #[test]
+    fn persistent_reasoning_enabled_reads_true_and_false_env_values() {
+        let _lock = THREADLINE_PERSISTENT_REASONING_ENABLED_ENV_LOCK
+            .lock()
+            .expect("persistent reasoning env lock");
+        let _guard = PersistentReasoningEnabledEnvGuard::acquire();
+
+        unsafe { std::env::set_var("THREADLINE_PERSISTENT_REASONING_ENABLED", "true") };
+        let enabled = ThreadlineCli::parse_from(["threadline"]).server;
+
+        unsafe { std::env::set_var("THREADLINE_PERSISTENT_REASONING_ENABLED", "false") };
+        let disabled = ThreadlineCli::parse_from(["threadline"]).server;
+
+        assert!(enabled.persistent_reasoning_enabled);
+        assert!(!disabled.persistent_reasoning_enabled);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::auth::LoadedUpstreamAuth;
 use crate::errors::ThreadlineError;
-use crate::models::{RouteProfile, resolve_request_model_for_profile};
+use crate::models::{ModelAlias, RouteProfile, resolve_request_model_for_profile};
 use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
 use crate::tools::{inject_internal_tools, is_internal_tool_name};
 use crate::ws_pump::LiveUpstreamWebSocket;
@@ -42,6 +42,7 @@ pub const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 #[derive(Clone)]
 pub struct ResponsesRouteState {
     pub profile: RouteProfile,
+    pub persistent_reasoning_enabled: bool,
     pub registry: Arc<RetainedSessionRegistry>,
     pub services: ThreadlineServices,
 }
@@ -79,6 +80,11 @@ pub(crate) async fn responses_handler(
 ) -> Result<impl IntoResponse, ThreadlineError> {
     let mut request = parse_downstream_request_with_metadata(payload, request_metadata)?;
     let model_alias = resolve_request_model_for_profile(&request.payload, state.profile)?;
+    let persistent_reasoning_applied = normalize_persistent_reasoning_context(
+        &mut request.payload,
+        state.persistent_reasoning_enabled,
+        model_alias,
+    );
     if wants_reasoning_all_turns(&request.payload) && !model_alias.supports_reasoning_all_turns {
         return Err(ThreadlineError::UnsupportedReasoningContext);
     }
@@ -96,6 +102,8 @@ pub(crate) async fn responses_handler(
         interaction_type_compaction_hit = routing_diagnostics.interaction_type_compaction_hit,
         previous_response_id_present,
         context_management_present,
+        model_alias = model_alias.alias_id,
+        persistent_reasoning_applied,
         manual_summary_prompt_hit = routing_diagnostics.summary_hits.manual_summary_prompt_hit,
         manual_structure_instruction_hit = routing_diagnostics
             .summary_hits
@@ -388,6 +396,38 @@ fn strip_threadline_tools(payload: &mut serde_json::Map<String, Value>) {
     });
 }
 
+fn normalize_persistent_reasoning_context(
+    payload: &mut serde_json::Map<String, Value>,
+    persistent_reasoning_enabled: bool,
+    model_alias: &ModelAlias,
+) -> bool {
+    if !persistent_reasoning_enabled || !model_alias.persistent_reasoning_eligible {
+        return false;
+    }
+
+    match payload.get_mut("reasoning") {
+        None | Some(Value::Null) => {
+            payload.insert(
+                "reasoning".to_string(),
+                serde_json::json!({ "context": "all_turns" }),
+            );
+            true
+        }
+        Some(Value::Object(reasoning)) => {
+            if reasoning.contains_key("context") {
+                false
+            } else {
+                reasoning.insert(
+                    "context".to_string(),
+                    Value::String("all_turns".to_string()),
+                );
+                true
+            }
+        }
+        Some(_) => false,
+    }
+}
+
 fn strip_context_management_for_upstream(
     payload: &mut serde_json::Map<String, Value>,
     route_kind: &'static str,
@@ -621,8 +661,108 @@ fn maybe_inject_virtual_tool_summarizer_instruction(
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_stale_continuation_first_send_error;
+    use super::{
+        normalize_persistent_reasoning_context, rewrite_stale_continuation_first_send_error,
+    };
     use crate::errors::ThreadlineError;
+    use crate::models::{ModelAlias, RouteProfile, resolve_request_model_for_profile};
+    use serde_json::json;
+
+    fn persistent_reasoning_alias() -> &'static ModelAlias {
+        resolve_request_model_for_profile(
+            json!({ "model": "threadline-main-gpt-5.6-terra" })
+                .as_object()
+                .expect("model payload"),
+            RouteProfile::Main,
+        )
+        .expect("persistent reasoning alias")
+    }
+
+    fn ineligible_reasoning_alias() -> &'static ModelAlias {
+        resolve_request_model_for_profile(
+            json!({ "model": "threadline-main-gpt-5.5" })
+                .as_object()
+                .expect("model payload"),
+            RouteProfile::Main,
+        )
+        .expect("ineligible reasoning alias")
+    }
+
+    #[test]
+    fn persistent_reasoning_normalization_inserts_context_for_missing_or_null_reasoning() {
+        for mut payload in [json!({}), json!({ "reasoning": null })] {
+            let applied = normalize_persistent_reasoning_context(
+                payload.as_object_mut().expect("request object"),
+                true,
+                persistent_reasoning_alias(),
+            );
+
+            assert!(applied);
+            assert_eq!(payload["reasoning"], json!({ "context": "all_turns" }));
+        }
+    }
+
+    #[test]
+    fn persistent_reasoning_normalization_preserves_existing_reasoning_fields_and_context() {
+        let mut missing_context = json!({
+            "reasoning": {
+                "effort": "high",
+                "summary": "detailed"
+            }
+        });
+        let applied = normalize_persistent_reasoning_context(
+            missing_context.as_object_mut().expect("request object"),
+            true,
+            persistent_reasoning_alias(),
+        );
+        assert!(applied);
+        assert_eq!(
+            missing_context["reasoning"],
+            json!({
+                "context": "all_turns",
+                "effort": "high",
+                "summary": "detailed"
+            })
+        );
+
+        for mut explicit_context in [
+            json!({ "reasoning": { "context": "client_context" } }),
+            json!({ "reasoning": { "context": 12 } }),
+        ] {
+            let original = explicit_context.clone();
+            let applied = normalize_persistent_reasoning_context(
+                explicit_context.as_object_mut().expect("request object"),
+                true,
+                persistent_reasoning_alias(),
+            );
+
+            assert!(!applied);
+            assert_eq!(explicit_context, original);
+        }
+    }
+
+    #[test]
+    fn persistent_reasoning_normalization_is_noop_when_disabled_or_ineligible_or_non_object() {
+        for (enabled, alias, mut payload) in [
+            (false, persistent_reasoning_alias(), json!({})),
+            (true, ineligible_reasoning_alias(), json!({})),
+            (
+                true,
+                persistent_reasoning_alias(),
+                json!({ "reasoning": "manual" }),
+            ),
+        ] {
+            let original = payload.clone();
+            let applied = normalize_persistent_reasoning_context(
+                payload.as_object_mut().expect("request object"),
+                enabled,
+                alias,
+            );
+
+            assert!(!applied);
+            assert_eq!(payload, original);
+        }
+    }
 
     #[test]
     fn stale_continuation_first_send_rewrites_closed_upstream_to_previous_response_not_found() {

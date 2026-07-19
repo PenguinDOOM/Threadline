@@ -59,7 +59,7 @@ impl ThreadlineServices {
     }
 }
 
-pub(super) fn build_response_create_payload(request: Value) -> Result<Value, ThreadlineError> {
+pub(crate) fn build_response_create_payload(request: Value) -> Result<Value, ThreadlineError> {
     let mut payload = require_payload_object(request)?;
     payload.insert(
         "type".to_string(),
@@ -123,7 +123,7 @@ pub(super) fn normalize_system_input_roles_for_codex(payload: &mut Map<String, V
     }
 }
 
-pub(super) async fn send_response_create(
+pub(crate) async fn send_response_create(
     upstream: &LiveUpstreamWebSocket,
     request_payload: &Map<String, Value>,
 ) -> Result<(), ThreadlineError> {
@@ -135,7 +135,7 @@ pub(super) async fn send_response_create(
         .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)
 }
 
-pub(super) fn build_followup_tool_outputs_payload(
+pub(crate) fn build_followup_tool_outputs_payload(
     request: Value,
     previous_response_id: &str,
     input: Value,
@@ -149,7 +149,7 @@ pub(super) fn build_followup_tool_outputs_payload(
     build_response_create_payload(Value::Object(payload))
 }
 
-pub(super) async fn send_followup_tool_outputs(
+pub(crate) async fn send_followup_tool_outputs(
     upstream: &LiveUpstreamWebSocket,
     request_payload: &Map<String, Value>,
     previous_response_id: &str,

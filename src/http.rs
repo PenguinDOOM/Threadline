@@ -70,6 +70,7 @@ pub fn build_router_with_services(
 ) -> Router {
     let responses = ResponsesRouteState {
         profile: config.profile,
+        persistent_reasoning_enabled: config.persistent_reasoning_enabled_for_profile(),
         registry: Arc::new(RetainedSessionRegistry::new(
             config.retained_session_capacity,
         )),

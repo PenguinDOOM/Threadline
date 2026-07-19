@@ -66,12 +66,18 @@ async fn serve_config(config: ThreadlineConfig) -> Result<(), ThreadlineError> {
         .bind_address()
         .map_err(|_| ThreadlineError::InvalidBindHost(config.host.clone()))?;
     let profile = config.profile;
+    let persistent_reasoning_enabled = config.persistent_reasoning_enabled_for_profile();
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await
         .map_err(|_| ThreadlineError::InvalidBindHost(bind_address.ip().to_string()))?;
     let app = build_router(config);
 
-    info!(address = %bind_address, profile = %profile, "threadline_http_server_started");
+    info!(
+        address = %bind_address,
+        profile = %profile,
+        persistent_reasoning_enabled,
+        "threadline_http_server_started"
+    );
 
     axum::serve(listener, app)
         .await
@@ -99,6 +105,7 @@ fn split_main_and_utility_configs(
     utility_config.profile = RouteProfile::Utility;
     utility_config.retained_session_capacity = 0;
     utility_config.jobs_enabled = false;
+    utility_config.persistent_reasoning_enabled = false;
 
     Ok((main_config, utility_config))
 }
@@ -237,6 +244,7 @@ mod tests {
             utility_port: Some(8101),
             retained_session_capacity: 9,
             jobs_enabled: true,
+            persistent_reasoning_enabled: true,
             ..ThreadlineConfig::default()
         };
 
@@ -247,12 +255,14 @@ mod tests {
         assert_eq!(utility_config.port, 8101);
         assert_eq!(utility_config.retained_session_capacity, 0);
         assert!(!utility_config.jobs_enabled);
+        assert!(!utility_config.persistent_reasoning_enabled);
 
         let mut expected_utility = main_config;
         expected_utility.port = 8101;
         expected_utility.profile = RouteProfile::Utility;
         expected_utility.retained_session_capacity = 0;
         expected_utility.jobs_enabled = false;
+        expected_utility.persistent_reasoning_enabled = false;
 
         assert_eq!(utility_config, expected_utility);
     }
