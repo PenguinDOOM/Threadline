@@ -6,6 +6,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
@@ -36,13 +37,24 @@ enum OutboundCommand {
 }
 
 const OUTBOUND_CHANNEL_CAPACITY: usize = 32;
+const UPSTREAM_PING_INTERVAL: Duration = Duration::from_secs(30);
 
 impl LiveUpstreamWebSocket {
-    pub fn from_stream<S>(_stream: WebSocketStream<S>) -> Self
+    pub fn from_stream<S>(stream: WebSocketStream<S>) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (mut writer, mut reader) = _stream.split();
+        Self::from_stream_with_ping_interval(stream, UPSTREAM_PING_INTERVAL)
+    }
+
+    fn from_stream_with_ping_interval<S>(
+        stream: WebSocketStream<S>,
+        ping_interval: Duration,
+    ) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut writer, mut reader) = stream.split();
         let (outbound_tx, mut outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let close_metadata = Arc::new(Mutex::new(None));
@@ -51,12 +63,24 @@ impl LiveUpstreamWebSocket {
         let task_is_closed = Arc::clone(&is_closed);
 
         let task = tokio::spawn(async move {
+            let mut ping_timer =
+                tokio::time::interval_at(Instant::now() + ping_interval, ping_interval);
+            ping_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
             debug!(
                 outbound_capacity = OUTBOUND_CHANNEL_CAPACITY,
+                ping_interval_secs = ping_interval.as_secs_f64(),
                 "ws_pump_started"
             );
             loop {
                 tokio::select! {
+                    _ = ping_timer.tick() => {
+                        if let Err(error) = writer.send(Message::Ping(Vec::new())).await {
+                            record_error(&task_close_metadata, error.to_string()).await;
+                            break;
+                        }
+                        debug!("ws_pump_ping_sent");
+                    }
                     outbound = outbound_rx.recv() => match outbound {
                         Some(OutboundCommand::Text(text)) => {
                             if let Err(error) = writer.send(Message::Text(text)).await {
@@ -89,7 +113,9 @@ impl LiveUpstreamWebSocket {
                             }
                             debug!(payload_len, "ws_pump_pong_sent");
                         }
-                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Pong(payload))) => {
+                            debug!(payload_len = payload.len(), "ws_pump_pong_received");
+                        }
                         Some(Ok(Message::Close(frame))) => {
                             let metadata = UpstreamCloseMetadata {
                                 code: frame.as_ref().map(|frame| u16::from(frame.code)),
@@ -181,8 +207,8 @@ fn outbound_channel_closed_metadata() -> UpstreamCloseMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::connect_async;
@@ -206,6 +232,49 @@ mod tests {
 
         drop(accept_task);
         pump
+    }
+
+    #[tokio::test]
+    async fn websocket_pump_sends_active_ping_after_interval() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let (ping_seen_tx, ping_seen_rx) = oneshot::channel();
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let websocket = accept_async(stream).await.expect("accept websocket");
+            let (_writer, mut reader) = websocket.split();
+
+            while let Some(message) = reader.next().await {
+                match message.expect("read websocket message") {
+                    Message::Ping(payload) => {
+                        assert!(payload.is_empty());
+                        let _ = ping_seen_tx.send(());
+                        break;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let (stream, _) = connect_async(format!("ws://{address}"))
+            .await
+            .expect("connect websocket");
+        let pump = LiveUpstreamWebSocket::from_stream_with_ping_interval(
+            stream,
+            Duration::from_millis(20),
+        );
+
+        timeout(Duration::from_secs(2), ping_seen_rx)
+            .await
+            .expect("active ping should be sent")
+            .expect("server should report active ping");
+
+        drop(pump);
+        accept_task.await.expect("accept task");
     }
 
     #[tokio::test]
