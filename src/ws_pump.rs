@@ -63,10 +63,8 @@ impl LiveUpstreamWebSocket {
         let task_is_closed = Arc::clone(&is_closed);
 
         let task = tokio::spawn(async move {
-            let mut ping_timer = tokio::time::interval_at(
-                Instant::now() + ping_interval,
-                ping_interval,
-            );
+            let mut ping_timer =
+                tokio::time::interval_at(Instant::now() + ping_interval, ping_interval);
             ping_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             debug!(
