@@ -12,6 +12,7 @@ const UNSUPPORTED_RESPONSE_FIELDS: &[&str] = &[
     "max_output_tokens",
     "max_tokens",
     "max_completion_tokens",
+    "prompt_cache_options",
     "truncation",
 ];
 
@@ -188,6 +189,9 @@ mod tests {
             "max_output_tokens": 32,
             "max_tokens": 64,
             "max_completion_tokens": 96,
+            "prompt_cache_options": {
+                "retention": "in_memory"
+            },
             "truncation": "auto"
         }))
         .expect("response.create payload");
@@ -198,6 +202,7 @@ mod tests {
         assert!(payload.get("max_output_tokens").is_none());
         assert!(payload.get("max_tokens").is_none());
         assert!(payload.get("max_completion_tokens").is_none());
+        assert!(payload.get("prompt_cache_options").is_none());
         assert!(payload.get("truncation").is_none());
     }
 
@@ -409,6 +414,9 @@ mod tests {
             json!({
                 "model": "gpt-test",
                 "instructions": "keep",
+                "prompt_cache_options": {
+                    "retention": "in_memory"
+                },
                 "truncation": "auto"
             }),
             "resp_intermediate",
@@ -429,6 +437,7 @@ mod tests {
         assert_eq!(payload["input"][0]["type"], "function_call_output");
         assert_eq!(payload["input"][0]["call_id"], "call_123");
         assert_eq!(payload["input"][0]["output"], "done");
+        assert!(payload.get("prompt_cache_options").is_none());
         assert!(payload.get("truncation").is_none());
     }
 }
