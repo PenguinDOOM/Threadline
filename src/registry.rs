@@ -267,9 +267,7 @@ impl RetainedSessionLease {
         let mut state = self.registry.lock().expect("registry mutex poisoned");
         if let Some(entry) = state.entries.get_mut(&self.entry_id) {
             entry.window_generation += 1;
-            entry
-                .session
-                .set_window_generation(entry.window_generation);
+            entry.session.set_window_generation(entry.window_generation);
             self.session = entry.session.clone();
             entry.last_used = Instant::now();
         }

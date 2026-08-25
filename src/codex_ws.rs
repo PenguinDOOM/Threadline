@@ -232,10 +232,7 @@ mod tests {
         Uuid::parse_str(headers["session-id"].to_str().unwrap()).expect("session id uuid");
         let thread_id = headers["thread-id"].to_str().expect("thread id header");
         Uuid::parse_str(thread_id).expect("thread id uuid");
-        assert_eq!(
-            headers["x-codex-window-id"],
-            format!("{thread_id}:0")
-        );
+        assert_eq!(headers["x-codex-window-id"], format!("{thread_id}:0"));
         Uuid::parse_str(headers["x-client-request-id"].to_str().unwrap()).expect("request id uuid");
         assert!(headers.get("x-codex-turn-state").is_none());
     }

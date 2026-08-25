@@ -311,9 +311,11 @@ pub(crate) async fn responses_handler(
                             new_auto_user_history_hit =
                                 routing_diagnostics.summary_hits.new_auto_user_history_hit,
                             new_auto_user_final_summary_prompt_hit = routing_diagnostics
-                                .summary_hits.new_auto_user_final_summary_prompt_hit,
+                                .summary_hits
+                                .new_auto_user_final_summary_prompt_hit,
                             summary_instruction_like_hit = routing_diagnostics
-                                .summary_hits.summary_instruction_like_hit,
+                                .summary_hits
+                                .summary_instruction_like_hit,
                             fallback_summary_input_hit = reroute_reason == "fallback_summary_input",
                             tool_choice =
                                 routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
@@ -453,9 +455,7 @@ fn strip_context_management_for_upstream(
     stripped
 }
 
-fn thread_id_from_prompt_cache_key(
-    payload: &serde_json::Map<String, Value>,
-) -> Option<String> {
+fn thread_id_from_prompt_cache_key(payload: &serde_json::Map<String, Value>) -> Option<String> {
     let prompt_cache_key = payload.get("prompt_cache_key")?.as_str()?;
     let (conversation_id, _) = prompt_cache_key.rsplit_once(':')?;
     Uuid::parse_str(conversation_id.trim())
@@ -719,7 +719,8 @@ mod tests {
         });
 
         assert_eq!(
-            thread_id_from_prompt_cache_key(payload.as_object().expect("payload object")).as_deref(),
+            thread_id_from_prompt_cache_key(payload.as_object().expect("payload object"))
+                .as_deref(),
             Some("48a65359-981b-47c2-9612-e1c64ae07e22")
         );
     }
