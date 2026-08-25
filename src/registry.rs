@@ -5,7 +5,6 @@ use std::time::Instant;
 use crate::codex_ws::UpstreamSessionDescriptor;
 use crate::ws_pump::LiveUpstreamWebSocket;
 use tracing::debug;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryAcquireError {
@@ -69,6 +68,13 @@ impl RetainedSessionRegistry {
     }
 
     pub async fn acquire_new(&self) -> Result<RetainedSessionLease, RegistryAcquireError> {
+        self.acquire_new_with_thread_id(None).await
+    }
+
+    pub async fn acquire_new_with_thread_id(
+        &self,
+        thread_id: Option<String>,
+    ) -> Result<RetainedSessionLease, RegistryAcquireError> {
         let mut state = self.inner.lock().expect("registry mutex poisoned");
         if state.capacity == 0 {
             return Err(RegistryAcquireError::RetainedSessionCapacityExceeded);
@@ -90,12 +96,7 @@ impl RetainedSessionRegistry {
 
         let entry_id = state.next_entry_id;
         state.next_entry_id += 1;
-        let session = UpstreamSessionDescriptor {
-            session_id: new_id(),
-            thread_id: new_id(),
-            window_id: new_id(),
-            turn_state: None,
-        };
+        let session = UpstreamSessionDescriptor::new(thread_id);
         state.entries.insert(
             entry_id,
             RegistryEntry {
@@ -150,7 +151,6 @@ impl RetainedSessionRegistry {
         {
             entry.upstream = None;
             entry.recoverable = true;
-            refresh_entry_window(entry);
         }
 
         entry.in_use = true;
@@ -258,7 +258,18 @@ impl RetainedSessionLease {
         if let Some(entry) = state.entries.get_mut(&self.entry_id) {
             entry.upstream = None;
             entry.recoverable = true;
-            refresh_entry_window(entry);
+            self.session = entry.session.clone();
+            entry.last_used = Instant::now();
+        }
+    }
+
+    pub async fn advance_window_generation(&mut self) {
+        let mut state = self.registry.lock().expect("registry mutex poisoned");
+        if let Some(entry) = state.entries.get_mut(&self.entry_id) {
+            entry.window_generation += 1;
+            entry
+                .session
+                .set_window_generation(entry.window_generation);
             self.session = entry.session.clone();
             entry.last_used = Instant::now();
         }
@@ -279,11 +290,6 @@ impl Drop for RetainedSessionLease {
     }
 }
 
-fn refresh_entry_window(entry: &mut RegistryEntry) {
-    entry.window_generation += 1;
-    entry.session.refresh_window();
-}
-
 fn remove_entry(state: &mut RegistryState, entry_id: u64) {
     let Some(entry) = state.entries.remove(&entry_id) else {
         return;
@@ -293,10 +299,6 @@ fn remove_entry(state: &mut RegistryState, entry_id: u64) {
             state.markers.remove(&marker);
         }
     }
-}
-
-fn new_id() -> String {
-    Uuid::now_v7().to_string()
 }
 
 #[cfg(test)]
@@ -331,5 +333,44 @@ mod tests {
         };
 
         assert!(refreshed_last_used > initial_last_used);
+    }
+
+    #[tokio::test]
+    async fn new_session_can_use_downstream_thread_identity() {
+        let registry = RetainedSessionRegistry::new(1);
+        let thread_id = "48a65359-981b-47c2-9612-e1c64ae07e22".to_string();
+
+        let lease = registry
+            .acquire_new_with_thread_id(Some(thread_id.clone()))
+            .await
+            .expect("create session");
+
+        assert_eq!(lease.session().thread_id, thread_id);
+        assert_eq!(
+            lease.session().window_id,
+            format!("{}:0", lease.session().thread_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_close_preserves_window_generation() {
+        let registry = RetainedSessionRegistry::new(1);
+        let mut lease = registry.acquire_new().await.expect("create session");
+        let original_window_id = lease.session().window_id.clone();
+
+        lease.mark_upstream_recoverable().await;
+
+        assert_eq!(lease.session().window_id, original_window_id);
+    }
+
+    #[tokio::test]
+    async fn explicit_window_generation_advance_updates_window_id() {
+        let registry = RetainedSessionRegistry::new(1);
+        let mut lease = registry.acquire_new().await.expect("create session");
+        let thread_id = lease.session().thread_id.clone();
+
+        lease.advance_window_generation().await;
+
+        assert_eq!(lease.session().window_id, format!("{thread_id}:1"));
     }
 }

@@ -6,8 +6,10 @@ use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use serde_json::Value;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::auth::LoadedUpstreamAuth;
+use crate::codex_ws::apply_session_metadata;
 use crate::errors::ThreadlineError;
 use crate::models::{ModelAlias, RouteProfile, resolve_request_model_for_profile};
 use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
@@ -139,6 +141,7 @@ pub(crate) async fn responses_handler(
         "responses_request_routed"
     );
     let mut base_request = request.payload;
+    let downstream_thread_id = thread_id_from_prompt_cache_key(&base_request);
     let previous_response_id = request.previous_response_id;
     let is_continuation_request = previous_response_id.is_some();
     let prepared = if state.profile == RouteProfile::Utility {
@@ -157,7 +160,13 @@ pub(crate) async fn responses_handler(
     } else {
         match classification {
             DownstreamRequestClassification::Normal => {
-                match acquire_lease(&state.registry, previous_response_id.as_deref()).await {
+                match acquire_lease(
+                    &state.registry,
+                    previous_response_id.as_deref(),
+                    downstream_thread_id.as_deref(),
+                )
+                .await
+                {
                     Ok(mut lease) => {
                         let mut upstream_request = base_request.clone();
                         inject_internal_tools(&mut upstream_request);
@@ -166,6 +175,7 @@ pub(crate) async fn responses_handler(
                             "normal",
                             classification,
                         );
+                        apply_session_metadata(&mut upstream_request, lease.session());
                         let mut reconnect_attempted = false;
                         let upstream = if let Some(previous_response_id) = &previous_response_id {
                             if !lease.has_open_upstream() {
@@ -301,11 +311,9 @@ pub(crate) async fn responses_handler(
                             new_auto_user_history_hit =
                                 routing_diagnostics.summary_hits.new_auto_user_history_hit,
                             new_auto_user_final_summary_prompt_hit = routing_diagnostics
-                                .summary_hits
-                                .new_auto_user_final_summary_prompt_hit,
+                                .summary_hits.new_auto_user_final_summary_prompt_hit,
                             summary_instruction_like_hit = routing_diagnostics
-                                .summary_hits
-                                .summary_instruction_like_hit,
+                                .summary_hits.summary_instruction_like_hit,
                             fallback_summary_input_hit = reroute_reason == "fallback_summary_input",
                             tool_choice =
                                 routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
@@ -445,6 +453,16 @@ fn strip_context_management_for_upstream(
     stripped
 }
 
+fn thread_id_from_prompt_cache_key(
+    payload: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    let prompt_cache_key = payload.get("prompt_cache_key")?.as_str()?;
+    let (conversation_id, _) = prompt_cache_key.rsplit_once(':')?;
+    Uuid::parse_str(conversation_id.trim())
+        .ok()
+        .map(|id| id.to_string())
+}
+
 fn request_class_label(classification: DownstreamRequestClassification) -> &'static str {
     match classification {
         DownstreamRequestClassification::Normal => "normal",
@@ -534,13 +552,17 @@ async fn attempt_pre_first_event_reconnect(
 async fn acquire_lease(
     registry: &RetainedSessionRegistry,
     previous_response_id: Option<&str>,
+    downstream_thread_id: Option<&str>,
 ) -> Result<RetainedSessionLease, ThreadlineError> {
     match previous_response_id {
         Some(previous_response_id) => registry
             .acquire_previous(previous_response_id)
             .await
             .map_err(map_registry_error),
-        None => registry.acquire_new().await.map_err(map_registry_error),
+        None => registry
+            .acquire_new_with_thread_id(downstream_thread_id.map(ToOwned::to_owned))
+            .await
+            .map_err(map_registry_error),
     }
 }
 
@@ -557,6 +579,7 @@ async fn start_transient_route(
 
     let auth = services.auth_provider().load()?;
     let connected = services.connector().connect(auth, None).await?;
+    apply_session_metadata(&mut upstream_request, &connected.session);
     send_response_create(&connected.websocket, &upstream_request).await?;
 
     Ok(PreparedResponseRoute {
@@ -663,6 +686,7 @@ fn maybe_inject_virtual_tool_summarizer_instruction(
 mod tests {
     use super::{
         normalize_persistent_reasoning_context, rewrite_stale_continuation_first_send_error,
+        thread_id_from_prompt_cache_key,
     };
     use crate::errors::ThreadlineError;
     use crate::models::{ModelAlias, RouteProfile, resolve_request_model_for_profile};
@@ -686,6 +710,33 @@ mod tests {
             RouteProfile::Main,
         )
         .expect("ineligible reasoning alias")
+    }
+
+    #[test]
+    fn prompt_cache_key_exposes_vscode_conversation_as_thread_identity() {
+        let payload = json!({
+            "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-5.6-sol"
+        });
+
+        assert_eq!(
+            thread_id_from_prompt_cache_key(payload.as_object().expect("payload object")).as_deref(),
+            Some("48a65359-981b-47c2-9612-e1c64ae07e22")
+        );
+    }
+
+    #[test]
+    fn invalid_prompt_cache_key_does_not_supply_thread_identity() {
+        for payload in [
+            json!({}),
+            json!({ "prompt_cache_key": "not-a-uuid:gpt-5.6-sol" }),
+            json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22" }),
+            json!({ "prompt_cache_key": 12 }),
+        ] {
+            assert!(
+                thread_id_from_prompt_cache_key(payload.as_object().expect("payload object"))
+                    .is_none()
+            );
+        }
     }
 
     #[test]
