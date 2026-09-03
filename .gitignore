@@ -30,3 +30,7 @@ target
 *.log
 .env
 .env.*
+
+
+#Ignore insiders AI rules
+.github\instructions\codacy.instructions.md
