@@ -31,6 +31,12 @@ target
 .env
 .env.*
 
+# Local development files
+completes/
+guardrails/
+plans/
+requests/
+
 
 #Ignore insiders AI rules
-.github\instructions\codacy.instructions.md
+.github/instructions/codacy.instructions.md
