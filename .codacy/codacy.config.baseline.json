@@ -6,9 +6,10 @@
     "organization": "PenguinDOOM",
     "repositoryId": "894141",
     "repositoryName": "Threadline",
-    "createdAt": "2026-09-03T20:29:02.128Z",
-    "updatedAt": "2026-09-03T20:29:02.128Z",
+    "createdAt": "2026-09-04T04:07:43.556Z",
+    "updatedAt": "2026-09-04T04:07:43.556Z",
     "languages": [
+      "JSON",
       "Markdown",
       "Rust",
       "YAML"
@@ -35,237 +36,6 @@
         },
         {
           "patternId": "Trivy_secret"
-        }
-      ]
-    },
-    {
-      "toolId": "markdownlint",
-      "patterns": [
-        {
-          "patternId": "markdownlint_MD056"
-        },
-        {
-          "patternId": "markdownlint_MD055",
-          "parameters": {
-            "style": "consistent"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD054",
-          "parameters": {
-            "collapsed": "true",
-            "full": "true",
-            "inline": "true",
-            "autolink": "true",
-            "shortcut": "true",
-            "url_inline": "true"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD053",
-          "parameters": {
-            "ignored_definitions": "[\"//\"]"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD052",
-          "parameters": {
-            "ignored_labels": "[\"x\"]",
-            "shortcut_syntax": "false"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD051",
-          "parameters": {
-            "ignore_case": "false",
-            "ignored_pattern": ""
-          }
-        },
-        {
-          "patternId": "markdownlint_MD050",
-          "parameters": {
-            "style": "consistent"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD049",
-          "parameters": {
-            "style": "consistent"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD048",
-          "parameters": {
-            "style": "consistent"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD046",
-          "parameters": {
-            "style": "consistent"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD045"
-        },
-        {
-          "patternId": "markdownlint_MD044",
-          "parameters": {
-            "names": "[]",
-            "code_blocks": "true",
-            "html_elements": "true"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD042"
-        },
-        {
-          "patternId": "markdownlint_MD039"
-        },
-        {
-          "patternId": "markdownlint_MD038"
-        },
-        {
-          "patternId": "markdownlint_MD037"
-        },
-        {
-          "patternId": "markdownlint_MD036",
-          "parameters": {
-            "punctuation": ".,;:!?。，；：！？"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD035",
-          "parameters": {
-            "style": "consistent"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD034"
-        },
-        {
-          "patternId": "markdownlint_MD033",
-          "parameters": {
-            "allowed_elements": "[]",
-            "table_allowed_elements": "[]"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD032"
-        },
-        {
-          "patternId": "markdownlint_MD030",
-          "parameters": {
-            "ol_multi": "1",
-            "ul_multi": "1",
-            "ol_single": "1",
-            "ul_single": "1"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD029",
-          "parameters": {
-            "style": "one_or_ordered"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD028"
-        },
-        {
-          "patternId": "markdownlint_MD027",
-          "parameters": {
-            "list_items": "true"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD026",
-          "parameters": {
-            "punctuation": ".,;:!。，；：！"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD025",
-          "parameters": {
-            "level": "1",
-            "front_matter_title": "^\\s*title\\s*[:=]"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD024",
-          "parameters": {
-            "siblings_only": "false"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD023"
-        },
-        {
-          "patternId": "markdownlint_MD022",
-          "parameters": {
-            "lines_above": "1",
-            "lines_below": "1"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD021"
-        },
-        {
-          "patternId": "markdownlint_MD020"
-        },
-        {
-          "patternId": "markdownlint_MD019"
-        },
-        {
-          "patternId": "markdownlint_MD018"
-        },
-        {
-          "patternId": "markdownlint_MD014"
-        },
-        {
-          "patternId": "markdownlint_MD012",
-          "parameters": {
-            "maximum": "1"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD011"
-        },
-        {
-          "patternId": "markdownlint_MD010",
-          "parameters": {
-            "code_blocks": "true",
-            "spaces_per_tab": "1",
-            "ignore_code_languages": "[]"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD007",
-          "parameters": {
-            "indent": "2",
-            "start_indent": "2",
-            "start_indented": "false"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD005"
-        },
-        {
-          "patternId": "markdownlint_MD004",
-          "parameters": {
-            "style": "consistent"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD003",
-          "parameters": {
-            "style": "consistent"
-          }
-        },
-        {
-          "patternId": "markdownlint_MD001",
-          "parameters": {
-            "front_matter_title": "^\\s*title\\s*[:=]"
-          }
         }
       ]
     },
@@ -2621,6 +2391,248 @@
         },
         {
           "patternId": "Agentlinter_blueprint_constraints-defined"
+        }
+      ]
+    },
+    {
+      "toolId": "jackson",
+      "patterns": [
+        {
+          "patternId": "jackson_duplicate-keys"
+        },
+        {
+          "patternId": "jackson_parse-error"
+        }
+      ]
+    },
+    {
+      "toolId": "markdownlint",
+      "patterns": [
+        {
+          "patternId": "markdownlint_MD056"
+        },
+        {
+          "patternId": "markdownlint_MD055",
+          "parameters": {
+            "style": "consistent"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD054",
+          "parameters": {
+            "collapsed": "true",
+            "full": "true",
+            "inline": "true",
+            "autolink": "true",
+            "shortcut": "true",
+            "url_inline": "true"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD053",
+          "parameters": {
+            "ignored_definitions": "[\"//\"]"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD052",
+          "parameters": {
+            "ignored_labels": "[\"x\"]",
+            "shortcut_syntax": "false"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD051",
+          "parameters": {
+            "ignore_case": "false",
+            "ignored_pattern": ""
+          }
+        },
+        {
+          "patternId": "markdownlint_MD050",
+          "parameters": {
+            "style": "consistent"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD049",
+          "parameters": {
+            "style": "consistent"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD048",
+          "parameters": {
+            "style": "consistent"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD046",
+          "parameters": {
+            "style": "consistent"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD045"
+        },
+        {
+          "patternId": "markdownlint_MD044",
+          "parameters": {
+            "names": "[]",
+            "code_blocks": "true",
+            "html_elements": "true"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD042"
+        },
+        {
+          "patternId": "markdownlint_MD039"
+        },
+        {
+          "patternId": "markdownlint_MD038"
+        },
+        {
+          "patternId": "markdownlint_MD037"
+        },
+        {
+          "patternId": "markdownlint_MD036",
+          "parameters": {
+            "punctuation": ".,;:!?。，；：！？"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD035",
+          "parameters": {
+            "style": "consistent"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD034"
+        },
+        {
+          "patternId": "markdownlint_MD033",
+          "parameters": {
+            "allowed_elements": "[]",
+            "table_allowed_elements": "[]"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD032"
+        },
+        {
+          "patternId": "markdownlint_MD030",
+          "parameters": {
+            "ol_multi": "1",
+            "ul_multi": "1",
+            "ol_single": "1",
+            "ul_single": "1"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD029",
+          "parameters": {
+            "style": "one_or_ordered"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD028"
+        },
+        {
+          "patternId": "markdownlint_MD027",
+          "parameters": {
+            "list_items": "true"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD026",
+          "parameters": {
+            "punctuation": ".,;:!。，；：！"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD025",
+          "parameters": {
+            "level": "1",
+            "front_matter_title": "^\\s*title\\s*[:=]"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD024",
+          "parameters": {
+            "siblings_only": "false"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD023"
+        },
+        {
+          "patternId": "markdownlint_MD022",
+          "parameters": {
+            "lines_above": "1",
+            "lines_below": "1"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD021"
+        },
+        {
+          "patternId": "markdownlint_MD020"
+        },
+        {
+          "patternId": "markdownlint_MD019"
+        },
+        {
+          "patternId": "markdownlint_MD018"
+        },
+        {
+          "patternId": "markdownlint_MD014"
+        },
+        {
+          "patternId": "markdownlint_MD012",
+          "parameters": {
+            "maximum": "1"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD011"
+        },
+        {
+          "patternId": "markdownlint_MD010",
+          "parameters": {
+            "code_blocks": "true",
+            "spaces_per_tab": "1",
+            "ignore_code_languages": "[]"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD007",
+          "parameters": {
+            "indent": "2",
+            "start_indent": "2",
+            "start_indented": "false"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD005"
+        },
+        {
+          "patternId": "markdownlint_MD004",
+          "parameters": {
+            "style": "consistent"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD003",
+          "parameters": {
+            "style": "consistent"
+          }
+        },
+        {
+          "patternId": "markdownlint_MD001",
+          "parameters": {
+            "front_matter_title": "^\\s*title\\s*[:=]"
+          }
         }
       ]
     }
