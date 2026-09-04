@@ -235,11 +235,14 @@ mod tests {
     const NEW_MAIN_RAW_COMPATIBILITY_IDS: [&str; 3] =
         ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 
+    const ASTRA_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-6-astra", "gpt-6-astra"];
+
     #[test]
     fn supported_model_ids_match_main_public_contract() {
         assert_eq!(
             supported_model_ids(),
             &[
+                "threadline-main-gpt-6-astra",
                 "threadline-main-gpt-5.6-sol",
                 "threadline-main-gpt-5.6-terra",
                 "threadline-main-gpt-5.6-luna",
@@ -254,6 +257,7 @@ mod tests {
         assert_eq!(
             advertised_model_ids_for_profile(RouteProfile::Main),
             &[
+                "threadline-main-gpt-6-astra",
                 "threadline-main-gpt-5.6-sol",
                 "threadline-main-gpt-5.6-terra",
                 "threadline-main-gpt-5.6-luna",
@@ -282,6 +286,9 @@ mod tests {
         assert!(is_supported_model("threadline-utility-gpt-5.4-mini"));
         assert!(is_supported_model("threadline-utility-gpt-5.3-codex-spark"));
         for model_id in NEW_MAIN_RAW_COMPATIBILITY_IDS {
+            assert!(is_supported_model(model_id));
+        }
+        for model_id in ASTRA_MAIN_MODEL_IDS {
             assert!(is_supported_model(model_id));
         }
         assert!(is_supported_model("gpt-5.5"));
@@ -338,6 +345,36 @@ mod tests {
         assert!(utility.advertised);
         assert!(!utility.persistent_reasoning_eligible);
         assert!(utility.supports_reasoning_all_turns);
+    }
+
+    #[test]
+    fn astra_main_alias_and_raw_id_have_conservative_routing_contract() {
+        for (model_id, advertised) in [
+            ("threadline-main-gpt-6-astra", true),
+            ("gpt-6-astra", false),
+        ] {
+            assert!(is_supported_model(model_id));
+
+            let main = resolve_request_model_for_profile(
+                json!({ "model": model_id }).as_object().unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap();
+            assert_eq!(main.alias_id, model_id);
+            assert_eq!(main.upstream_model_id, "gpt-6-astra");
+            assert_eq!(main.profile, RouteProfile::Main);
+            assert_eq!(main.advertised, advertised);
+            assert!(!main.persistent_reasoning_eligible);
+            assert!(!main.supports_reasoning_all_turns);
+
+            assert!(
+                resolve_request_model_for_profile(
+                    json!({ "model": model_id }).as_object().unwrap(),
+                    RouteProfile::Utility,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

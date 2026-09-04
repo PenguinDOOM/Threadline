@@ -38,7 +38,8 @@ impl UpstreamConnector for UnusedConnector {
     }
 }
 
-const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 3] = [
+const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 4] = [
+    "threadline-main-gpt-6-astra",
     "threadline-main-gpt-5.6-sol",
     "threadline-main-gpt-5.6-terra",
     "threadline-main-gpt-5.6-luna",
@@ -47,7 +48,10 @@ const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 3] = [
 const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 3] =
     ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 
-const ADVERTISED_MAIN_MODEL_IDS: [&str; 5] = [
+const ASTRA_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-6-astra", "gpt-6-astra"];
+
+const ADVERTISED_MAIN_MODEL_IDS: [&str; 6] = [
+    "threadline-main-gpt-6-astra",
     "threadline-main-gpt-5.6-sol",
     "threadline-main-gpt-5.6-terra",
     "threadline-main-gpt-5.6-luna",
@@ -61,7 +65,8 @@ const ADVERTISED_UTILITY_MODEL_IDS: [&str; 3] = [
     "threadline-utility-gpt-5.3-codex-spark",
 ];
 
-const ACCEPTED_MAIN_MODEL_IDS: [&str; 12] = [
+const ACCEPTED_MAIN_MODEL_IDS: [&str; 14] = [
+    "threadline-main-gpt-6-astra",
     "threadline-main-gpt-5.6-sol",
     "threadline-main-gpt-5.6-terra",
     "threadline-main-gpt-5.6-luna",
@@ -70,6 +75,7 @@ const ACCEPTED_MAIN_MODEL_IDS: [&str; 12] = [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "gpt-6-astra",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -352,6 +358,27 @@ async fn responses_utility_profile_rejects_new_main_compatibility_ids_before_aut
 }
 
 #[tokio::test]
+async fn responses_utility_profile_rejects_astra_ids_before_auth_loading() {
+    for model_id in ASTRA_MAIN_MODEL_IDS {
+        let app = build_router_with_services(
+            utility_config(),
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(app, json!({ "model": model_id })).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "model_id={model_id}"
+        );
+
+        let payload = read_json_body(response).await;
+        assert_invalid_model_error(&payload);
+    }
+}
+
+#[tokio::test]
 async fn responses_endpoint_rejects_each_unsupported_model() {
     for model_id in UNSUPPORTED_MODEL_IDS {
         let app = build_router_with_services(
@@ -534,6 +561,37 @@ async fn responses_endpoint_allows_raw_gpt_5_6_main_compatibility_ids_for_reason
         assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
         assert_eq!(payload["error"]["type"], "configuration_error");
         assert_ne!(payload["error"]["code"], "unsupported_reasoning_context");
+    }
+}
+
+#[tokio::test]
+async fn responses_endpoint_rejects_astra_reasoning_all_turns_before_auth_or_upstream() {
+    for model_id in ASTRA_MAIN_MODEL_IDS {
+        let app = build_router_with_services(
+            ThreadlineConfig::default(),
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+
+        let response = post_responses_json(
+            app,
+            json!({
+                "model": model_id,
+                "input": "astra-all-turns",
+                "reasoning": {
+                    "context": "all_turns"
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "model_id={model_id}"
+        );
+
+        let payload = read_json_body(response).await;
+        assert_unsupported_reasoning_context_error(&payload);
     }
 }
 

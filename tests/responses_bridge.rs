@@ -943,6 +943,33 @@ async fn retained_gpt_5_6_continuation_repeats_persistent_reasoning_context_with
 }
 
 #[tokio::test]
+async fn astra_visible_and_raw_ids_emit_expected_upstream_payload_without_persistent_reasoning() {
+    for model_id in ["threadline-main-gpt-6-astra", "gpt-6-astra"] {
+        let request_payload = completed_response_create_payload(
+            ThreadlineConfig {
+                persistent_reasoning_enabled: true,
+                ..ThreadlineConfig::default()
+            },
+            json!({
+                "model": model_id,
+                "input": "astra reasoning contract",
+                "reasoning": {
+                    "effort": "high",
+                    "summary": "detailed"
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(request_payload["type"], "response.create");
+        assert_eq!(request_payload["model"], "gpt-6-astra");
+        assert_eq!(request_payload["reasoning"]["effort"], "high");
+        assert_eq!(request_payload["reasoning"]["summary"], "detailed");
+        assert!(request_payload["reasoning"].get("context").is_none());
+    }
+}
+
+#[tokio::test]
 async fn context_management_compaction_does_not_override_stale_marker_semantics() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let second_server = Arc::new(ScriptedWebSocketServer::start().await);
