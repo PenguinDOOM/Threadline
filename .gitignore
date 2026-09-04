@@ -37,6 +37,9 @@ guardrails/
 plans/
 requests/
 
+# Codacy
+.codacy/
+
 
 #Ignore insiders AI rules
 .github/instructions/codacy.instructions.md
