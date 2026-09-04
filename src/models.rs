@@ -32,7 +32,15 @@ pub struct ModelAlias {
     pub supports_reasoning_all_turns: bool,
 }
 
-const MODEL_ALIAS_CATALOG: [ModelAlias; 15] = [
+const MODEL_ALIAS_CATALOG: [ModelAlias; 17] = [
+    ModelAlias {
+        alias_id: "threadline-main-gpt-6-astra",
+        upstream_model_id: "gpt-6-astra",
+        profile: RouteProfile::Main,
+        advertised: true,
+        persistent_reasoning_eligible: false,
+        supports_reasoning_all_turns: false,
+    },
     ModelAlias {
         alias_id: "threadline-main-gpt-5.6-sol",
         upstream_model_id: "gpt-5.6-sol",
@@ -94,6 +102,14 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 15] = [
         upstream_model_id: "gpt-5.3-codex-spark",
         profile: RouteProfile::Utility,
         advertised: true,
+        persistent_reasoning_eligible: false,
+        supports_reasoning_all_turns: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-6-astra",
+        upstream_model_id: "gpt-6-astra",
+        profile: RouteProfile::Main,
+        advertised: false,
         persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
     },
