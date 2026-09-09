@@ -38,8 +38,8 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 17] = [
         upstream_model_id: "gpt-6-astra",
         profile: RouteProfile::Main,
         advertised: true,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "threadline-main-gpt-5.6-sol",
@@ -110,8 +110,8 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 17] = [
         upstream_model_id: "gpt-6-astra",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "gpt-5.6-sol",
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn astra_main_alias_and_raw_id_have_conservative_routing_contract() {
+    fn astra_main_alias_and_raw_id_support_persistent_reasoning() {
         for (model_id, advertised) in [
             ("threadline-main-gpt-6-astra", true),
             ("gpt-6-astra", false),
@@ -380,8 +380,8 @@ mod tests {
             assert_eq!(main.upstream_model_id, "gpt-6-astra");
             assert_eq!(main.profile, RouteProfile::Main);
             assert_eq!(main.advertised, advertised);
-            assert!(!main.persistent_reasoning_eligible);
-            assert!(!main.supports_reasoning_all_turns);
+            assert!(main.persistent_reasoning_eligible);
+            assert!(main.supports_reasoning_all_turns);
 
             assert!(
                 resolve_request_model_for_profile(
