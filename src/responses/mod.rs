@@ -1,0 +1,840 @@
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderValue, Response, StatusCode, header};
+use axum::response::IntoResponse;
+use serde_json::Value;
+use tracing::debug;
+use uuid::Uuid;
+
+use crate::auth::LoadedUpstreamAuth;
+use crate::codex_ws::apply_session_metadata;
+use crate::errors::ThreadlineError;
+use crate::models::{ModelAlias, RouteProfile, resolve_request_model_for_profile};
+use crate::registry::{RegistryAcquireError, RetainedSessionLease, RetainedSessionRegistry};
+use crate::tools::{inject_internal_tools, is_internal_tool_name};
+use crate::ws_pump::LiveUpstreamWebSocket;
+
+mod downstream;
+mod translation;
+mod upstream;
+mod virtual_tools;
+
+use self::downstream::{
+    DownstreamRequestClassification, looks_like_auxiliary_summary_conflict_fallback,
+    parse_downstream_request_with_metadata, wants_reasoning_all_turns,
+};
+use self::translation::{ResponseStreamLease, ResponseStreamState, response_stream};
+use self::upstream::send_response_create;
+use self::virtual_tools::{
+    detect_virtual_tool_summarizer_request, inject_virtual_tool_summarizer_instruction,
+};
+
+#[cfg(test)]
+pub(crate) use self::downstream::DownstreamInteractionType;
+pub(crate) use self::downstream::DownstreamRequestMetadata;
+
+pub use self::upstream::{
+    ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
+};
+
+pub const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+
+#[derive(Clone)]
+pub struct ResponsesRouteState {
+    pub profile: RouteProfile,
+    pub persistent_reasoning_enabled: bool,
+    pub registry: Arc<RetainedSessionRegistry>,
+    pub services: ThreadlineServices,
+}
+
+struct PreparedResponseRoute {
+    upstream: Arc<LiveUpstreamWebSocket>,
+    lease: ResponseStreamLease,
+    previous_response_id: Option<String>,
+    replay_stale_marker_on_pre_first_event_close: bool,
+    reconnect_attempted: bool,
+    upstream_request: serde_json::Map<String, Value>,
+    execute_internal_tools: bool,
+    apply_no_observable_output_failure: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TransientRouteKind {
+    AuxiliarySummary,
+    Utility,
+}
+
+impl TransientRouteKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AuxiliarySummary => "auxiliary_summary",
+            Self::Utility => "utility",
+        }
+    }
+}
+
+pub(crate) async fn responses_handler(
+    State(state): State<ResponsesRouteState>,
+    axum::Json(payload): axum::Json<Value>,
+    request_metadata: DownstreamRequestMetadata,
+) -> Result<impl IntoResponse, ThreadlineError> {
+    let mut request = parse_downstream_request_with_metadata(payload, request_metadata)?;
+    let model_alias = resolve_request_model_for_profile(&request.payload, state.profile)?;
+    let persistent_reasoning_applied = normalize_persistent_reasoning_context(
+        &mut request.payload,
+        state.persistent_reasoning_enabled,
+        model_alias,
+    );
+    if wants_reasoning_all_turns(&request.payload) && !model_alias.supports_reasoning_all_turns {
+        return Err(ThreadlineError::UnsupportedReasoningContext);
+    }
+    request.payload.insert(
+        "model".to_string(),
+        Value::String(model_alias.upstream_model_id.to_string()),
+    );
+    let classification = request.classification;
+    let routing_diagnostics = request.routing_diagnostics().clone();
+    let previous_response_id_present = request.previous_response_id.is_some();
+    let context_management_present = request.payload.contains_key("context_management");
+    debug!(
+        request_class = request_class_label(classification),
+        interaction_type = routing_diagnostics.interaction_type.label(),
+        interaction_type_compaction_hit = routing_diagnostics.interaction_type_compaction_hit,
+        previous_response_id_present,
+        context_management_present,
+        model_alias = model_alias.alias_id,
+        persistent_reasoning_applied,
+        manual_summary_prompt_hit = routing_diagnostics.summary_hits.manual_summary_prompt_hit,
+        manual_structure_instruction_hit = routing_diagnostics
+            .summary_hits
+            .manual_structure_instruction_hit,
+        manual_tool_results_instruction_hit = routing_diagnostics
+            .summary_hits
+            .manual_tool_results_instruction_hit,
+        auto_context_too_large_hit = routing_diagnostics.summary_hits.auto_context_too_large_hit,
+        auto_summary_tags_hit = routing_diagnostics.summary_hits.auto_summary_tags_hit,
+        auto_only_task_hit = routing_diagnostics.summary_hits.auto_only_task_hit,
+        simple_history_context_hit = routing_diagnostics.summary_hits.simple_history_context_hit,
+        new_auto_detailed_summary_hit = routing_diagnostics
+            .summary_hits
+            .new_auto_detailed_summary_hit,
+        new_auto_user_history_hit = routing_diagnostics.summary_hits.new_auto_user_history_hit,
+        new_auto_user_final_summary_prompt_hit = routing_diagnostics
+            .summary_hits
+            .new_auto_user_final_summary_prompt_hit,
+        summary_instruction_like_hit = routing_diagnostics
+            .summary_hits
+            .summary_instruction_like_hit,
+        tool_choice = routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
+        tools_count = routing_diagnostics.tools_count,
+        input_item_count = routing_diagnostics.input_item_count,
+        last_input_role = routing_diagnostics
+            .last_input_role
+            .as_deref()
+            .unwrap_or("none"),
+        last_input_type = routing_diagnostics
+            .last_input_type
+            .as_deref()
+            .unwrap_or("none"),
+        "responses_request_routed"
+    );
+    let mut base_request = request.payload;
+    let downstream_thread_id = thread_id_from_prompt_cache_key(&base_request);
+    let previous_response_id = request.previous_response_id;
+    let is_continuation_request = previous_response_id.is_some();
+    let prepared = if state.profile == RouteProfile::Utility {
+        maybe_inject_virtual_tool_summarizer_instruction(
+            model_alias.upstream_model_id,
+            &routing_diagnostics,
+            &mut base_request,
+        );
+        start_transient_route(
+            &state.services,
+            base_request,
+            classification,
+            TransientRouteKind::Utility,
+        )
+        .await?
+    } else {
+        match classification {
+            DownstreamRequestClassification::Normal => {
+                match acquire_lease(
+                    &state.registry,
+                    previous_response_id.as_deref(),
+                    downstream_thread_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(mut lease) => {
+                        let mut upstream_request = base_request.clone();
+                        inject_internal_tools(&mut upstream_request);
+                        strip_context_management_for_upstream(
+                            &mut upstream_request,
+                            "normal",
+                            classification,
+                        );
+                        apply_session_metadata(&mut upstream_request, lease.session());
+                        let mut reconnect_attempted = false;
+                        let upstream = if let Some(previous_response_id) = &previous_response_id {
+                            if !lease.has_open_upstream() {
+                                debug!(
+                                    previous_response_id,
+                                    session_id = %lease.session().session_id,
+                                    thread_id = %lease.session().thread_id,
+                                    window_id = %lease.session().window_id,
+                                    stale_reason = "missing_or_closed_upstream",
+                                    "stale_previous_response_requires_client_replay"
+                                );
+                                lease.release();
+                                return Err(ThreadlineError::PreviousResponseNotFound);
+                            }
+
+                            upstream_request.insert(
+                                "previous_response_id".to_string(),
+                                Value::String(previous_response_id.clone()),
+                            );
+
+                            let upstream = lease.upstream().expect(
+                                "open retained upstream must exist for continuation preflight",
+                            );
+                            if let Err(error) =
+                                send_response_create(&upstream, &upstream_request).await
+                            {
+                                let error = rewrite_stale_continuation_first_send_error(error);
+                                if matches!(error, ThreadlineError::PreviousResponseNotFound) {
+                                    debug!(
+                                        previous_response_id,
+                                        session_id = %lease.session().session_id,
+                                        thread_id = %lease.session().thread_id,
+                                        window_id = %lease.session().window_id,
+                                        stale_reason = "first_send_closed",
+                                        "stale_previous_response_requires_client_replay"
+                                    );
+                                    lease.release();
+                                    return Err(ThreadlineError::PreviousResponseNotFound);
+                                }
+
+                                return Err(error);
+                            }
+
+                            tokio::task::yield_now().await;
+                            if upstream.is_closed() {
+                                debug!(
+                                    previous_response_id,
+                                    session_id = %lease.session().session_id,
+                                    thread_id = %lease.session().thread_id,
+                                    window_id = %lease.session().window_id,
+                                    stale_reason = "first_send_closed_after_enqueue",
+                                    "stale_previous_response_requires_client_replay"
+                                );
+                                lease.release();
+                                return Err(ThreadlineError::PreviousResponseNotFound);
+                            }
+
+                            upstream
+                        } else {
+                            let auth = state.services.auth_provider().load()?;
+                            let mut upstream =
+                                ensure_upstream(&state.services, &mut lease, auth).await?;
+                            if let Err(error) =
+                                send_response_create(&upstream, &upstream_request).await
+                            {
+                                if let Some(reconnected) = attempt_pre_first_event_reconnect(
+                                    &state.services,
+                                    &mut lease,
+                                    &upstream_request,
+                                    previous_response_id.as_deref(),
+                                    false,
+                                    &mut reconnect_attempted,
+                                )
+                                .await?
+                                {
+                                    upstream = reconnected;
+                                } else {
+                                    return Err(error);
+                                }
+                            }
+
+                            upstream
+                        };
+
+                        PreparedResponseRoute {
+                            upstream,
+                            lease: ResponseStreamLease::Retained(lease),
+                            previous_response_id,
+                            replay_stale_marker_on_pre_first_event_close: is_continuation_request,
+                            reconnect_attempted,
+                            upstream_request,
+                            execute_internal_tools: true,
+                            apply_no_observable_output_failure: true,
+                        }
+                    }
+                    Err(ThreadlineError::RetainedSessionConflict) => {
+                        let reroute_reason = retained_session_conflict_reroute_reason(
+                            &routing_diagnostics,
+                            &base_request,
+                        );
+                        if reroute_reason.is_none() {
+                            return Err(ThreadlineError::RetainedSessionConflict);
+                        }
+                        let reroute_reason = reroute_reason.expect("reroute reason present");
+
+                        debug!(
+                            reroute_reason,
+                            request_class = request_class_label(classification),
+                            interaction_type = routing_diagnostics.interaction_type.label(),
+                            interaction_type_compaction_hit =
+                                routing_diagnostics.interaction_type_compaction_hit,
+                            previous_response_id_present,
+                            context_management_present,
+                            manual_summary_prompt_hit =
+                                routing_diagnostics.summary_hits.manual_summary_prompt_hit,
+                            manual_structure_instruction_hit = routing_diagnostics
+                                .summary_hits
+                                .manual_structure_instruction_hit,
+                            manual_tool_results_instruction_hit = routing_diagnostics
+                                .summary_hits
+                                .manual_tool_results_instruction_hit,
+                            auto_context_too_large_hit =
+                                routing_diagnostics.summary_hits.auto_context_too_large_hit,
+                            auto_summary_tags_hit =
+                                routing_diagnostics.summary_hits.auto_summary_tags_hit,
+                            auto_only_task_hit =
+                                routing_diagnostics.summary_hits.auto_only_task_hit,
+                            simple_history_context_hit =
+                                routing_diagnostics.summary_hits.simple_history_context_hit,
+                            new_auto_detailed_summary_hit = routing_diagnostics
+                                .summary_hits
+                                .new_auto_detailed_summary_hit,
+                            new_auto_user_history_hit =
+                                routing_diagnostics.summary_hits.new_auto_user_history_hit,
+                            new_auto_user_final_summary_prompt_hit = routing_diagnostics
+                                .summary_hits
+                                .new_auto_user_final_summary_prompt_hit,
+                            summary_instruction_like_hit = routing_diagnostics
+                                .summary_hits
+                                .summary_instruction_like_hit,
+                            fallback_summary_input_hit = reroute_reason == "fallback_summary_input",
+                            tool_choice =
+                                routing_diagnostics.tool_choice.as_deref().unwrap_or("none"),
+                            tools_count = routing_diagnostics.tools_count,
+                            input_item_count = routing_diagnostics.input_item_count,
+                            last_input_role = routing_diagnostics
+                                .last_input_role
+                                .as_deref()
+                                .unwrap_or("none"),
+                            last_input_type = routing_diagnostics
+                                .last_input_type
+                                .as_deref()
+                                .unwrap_or("none"),
+                            "retained_session_conflict_rerouted"
+                        );
+
+                        start_transient_route(
+                            &state.services,
+                            base_request,
+                            classification,
+                            TransientRouteKind::AuxiliarySummary,
+                        )
+                        .await?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            DownstreamRequestClassification::AuxiliarySummary => {
+                start_transient_route(
+                    &state.services,
+                    base_request,
+                    classification,
+                    TransientRouteKind::AuxiliarySummary,
+                )
+                .await?
+            }
+        }
+    };
+
+    let stream = response_stream(ResponseStreamState {
+        services: state.services.clone(),
+        upstream: prepared.upstream,
+        lease: prepared.lease,
+        base_request: prepared.upstream_request,
+        pending_internal_outputs: Vec::new(),
+        previous_response_id: prepared.previous_response_id,
+        execute_internal_tools: prepared.execute_internal_tools,
+        suppressed_internal_output_indexes: std::collections::HashSet::new(),
+        upstream_event_seen: false,
+        replay_stale_marker_on_pre_first_event_close: prepared
+            .replay_stale_marker_on_pre_first_event_close,
+        reconnect_attempted: prepared.reconnect_attempted,
+        observable_output: Default::default(),
+        downstream_visible_text_sources: std::collections::HashSet::new(),
+        downstream_visible_text_delta_count: 0,
+        visible_assistant_text: Vec::new(),
+        last_unidentified_visible_text: None,
+        queued_synthetic_output_text_deltas: std::collections::VecDeque::new(),
+        queued_forwarded_event: None,
+        queued_final_completed: None,
+        final_done_pending: false,
+        apply_no_observable_output_failure: prepared.apply_no_observable_output_failure,
+        done: false,
+    });
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
+        .body(Body::from_stream(stream))
+        .expect("build sse response");
+    Ok(response)
+}
+
+fn strip_threadline_tools(payload: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Array(tools)) = payload.get_mut("tools") else {
+        return;
+    };
+
+    tools.retain(|tool| {
+        !tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(is_internal_tool_name)
+    });
+}
+
+fn normalize_persistent_reasoning_context(
+    payload: &mut serde_json::Map<String, Value>,
+    persistent_reasoning_enabled: bool,
+    model_alias: &ModelAlias,
+) -> bool {
+    if !persistent_reasoning_enabled || !model_alias.persistent_reasoning_eligible {
+        return false;
+    }
+
+    match payload.get_mut("reasoning") {
+        None | Some(Value::Null) => {
+            payload.insert(
+                "reasoning".to_string(),
+                serde_json::json!({ "context": "all_turns" }),
+            );
+            true
+        }
+        Some(Value::Object(reasoning)) => {
+            if reasoning.contains_key("context") {
+                false
+            } else {
+                reasoning.insert(
+                    "context".to_string(),
+                    Value::String("all_turns".to_string()),
+                );
+                true
+            }
+        }
+        Some(_) => false,
+    }
+}
+
+fn strip_context_management_for_upstream(
+    payload: &mut serde_json::Map<String, Value>,
+    route_kind: &'static str,
+    classification: DownstreamRequestClassification,
+) -> bool {
+    let stripped = payload.remove("context_management").is_some();
+    if stripped {
+        debug!(
+            route_kind,
+            request_class = request_class_label(classification),
+            client_compaction_only = true,
+            "context_management_stripped"
+        );
+    }
+    stripped
+}
+
+fn thread_id_from_prompt_cache_key(payload: &serde_json::Map<String, Value>) -> Option<String> {
+    let prompt_cache_key = payload.get("prompt_cache_key")?.as_str()?;
+    let (conversation_id, _) = prompt_cache_key.rsplit_once(':')?;
+    Uuid::parse_str(conversation_id.trim())
+        .ok()
+        .map(|id| id.to_string())
+}
+
+fn request_class_label(classification: DownstreamRequestClassification) -> &'static str {
+    match classification {
+        DownstreamRequestClassification::Normal => "normal",
+        DownstreamRequestClassification::AuxiliarySummary => "auxiliary_summary",
+    }
+}
+
+fn retained_session_conflict_reroute_reason(
+    routing_diagnostics: &self::downstream::DownstreamRequestRoutingDiagnostics,
+    payload: &serde_json::Map<String, Value>,
+) -> Option<&'static str> {
+    if routing_diagnostics.interaction_type_compaction_hit {
+        return Some("interaction_type_compaction");
+    }
+
+    if routing_diagnostics.summary_hits.matches_auxiliary_summary() {
+        return Some("summary_fingerprint");
+    }
+
+    if looks_like_auxiliary_summary_conflict_fallback(payload) {
+        return Some("fallback_summary_input");
+    }
+
+    None
+}
+
+fn rewrite_stale_continuation_first_send_error(error: ThreadlineError) -> ThreadlineError {
+    match error {
+        ThreadlineError::UpstreamWebSocketClosed => ThreadlineError::PreviousResponseNotFound,
+        other => other,
+    }
+}
+
+async fn attempt_pre_first_event_reconnect(
+    services: &ThreadlineServices,
+    lease: &mut RetainedSessionLease,
+    request_payload: &serde_json::Map<String, Value>,
+    previous_response_id: Option<&str>,
+    upstream_event_seen: bool,
+    reconnect_attempted: &mut bool,
+) -> Result<Option<Arc<LiveUpstreamWebSocket>>, ThreadlineError> {
+    let Some(previous_response_id) = previous_response_id else {
+        return Ok(None);
+    };
+
+    if upstream_event_seen || *reconnect_attempted {
+        return Ok(None);
+    }
+
+    *reconnect_attempted = true;
+    lease.mark_upstream_recoverable().await;
+    debug!(
+        previous_response_id,
+        session_id = %lease.session().session_id,
+        thread_id = %lease.session().thread_id,
+        window_id = %lease.session().window_id,
+        "reconnect_continuation_attempt"
+    );
+
+    let auth = services.auth_provider().load()?;
+    let upstream = match ensure_upstream(services, lease, auth).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            debug!(
+                previous_response_id,
+                session_id = %lease.session().session_id,
+                thread_id = %lease.session().thread_id,
+                "reconnect_continuation_failed"
+            );
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = send_response_create(&upstream, request_payload).await {
+        debug!(
+            previous_response_id,
+            session_id = %lease.session().session_id,
+            thread_id = %lease.session().thread_id,
+            "reconnect_continuation_failed"
+        );
+        return Err(error);
+    }
+
+    Ok(Some(upstream))
+}
+
+async fn acquire_lease(
+    registry: &RetainedSessionRegistry,
+    previous_response_id: Option<&str>,
+    downstream_thread_id: Option<&str>,
+) -> Result<RetainedSessionLease, ThreadlineError> {
+    match previous_response_id {
+        Some(previous_response_id) => registry
+            .acquire_previous(previous_response_id)
+            .await
+            .map_err(map_registry_error),
+        None => registry
+            .acquire_new_with_thread_id(downstream_thread_id.map(ToOwned::to_owned))
+            .await
+            .map_err(map_registry_error),
+    }
+}
+
+async fn start_transient_route(
+    services: &ThreadlineServices,
+    mut upstream_request: serde_json::Map<String, Value>,
+    classification: DownstreamRequestClassification,
+    kind: TransientRouteKind,
+) -> Result<PreparedResponseRoute, ThreadlineError> {
+    strip_threadline_tools(&mut upstream_request);
+    strip_context_management_for_upstream(&mut upstream_request, kind.label(), classification);
+
+    upstream_request.remove("previous_response_id");
+
+    let auth = services.auth_provider().load()?;
+    let connected = services.connector().connect(auth, None).await?;
+    apply_session_metadata(&mut upstream_request, &connected.session);
+    send_response_create(&connected.websocket, &upstream_request).await?;
+
+    Ok(PreparedResponseRoute {
+        upstream: connected.websocket,
+        lease: ResponseStreamLease::TransientAuxiliary,
+        previous_response_id: None,
+        replay_stale_marker_on_pre_first_event_close: false,
+        reconnect_attempted: false,
+        upstream_request,
+        execute_internal_tools: false,
+        apply_no_observable_output_failure: false,
+    })
+}
+
+async fn ensure_upstream(
+    services: &ThreadlineServices,
+    lease: &mut RetainedSessionLease,
+    auth: LoadedUpstreamAuth,
+) -> Result<Arc<LiveUpstreamWebSocket>, ThreadlineError> {
+    if let Some(upstream) = lease.upstream() {
+        if !upstream.is_closed() {
+            return Ok(upstream);
+        }
+
+        lease.mark_upstream_recoverable().await;
+    }
+
+    let connected = services
+        .connector()
+        .connect(auth, Some(lease.session().clone()))
+        .await?;
+    let turn_state = connected
+        .turn_state
+        .clone()
+        .or_else(|| lease.session().turn_state.clone());
+    lease.update_turn_state(turn_state).await;
+    lease
+        .replace_upstream(Some(Arc::clone(&connected.websocket)))
+        .await;
+    Ok(connected.websocket)
+}
+
+fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError {
+    match error {
+        RegistryAcquireError::PreviousResponseNotFound => ThreadlineError::PreviousResponseNotFound,
+        RegistryAcquireError::RetainedSessionConflict => ThreadlineError::RetainedSessionConflict,
+        RegistryAcquireError::RetainedSessionCapacityExceeded => {
+            ThreadlineError::RetainedSessionCapacityExceeded
+        }
+    }
+}
+
+fn maybe_inject_virtual_tool_summarizer_instruction(
+    model: &str,
+    routing_diagnostics: &downstream::DownstreamRequestRoutingDiagnostics,
+    request: &mut serde_json::Map<String, Value>,
+) {
+    let detection = detect_virtual_tool_summarizer_request(request);
+    if !detection.is_match() {
+        return;
+    }
+
+    let instructions_existed = request.contains_key("instructions");
+    debug!(
+        profile = "utility",
+        model,
+        input_item_count = routing_diagnostics.input_item_count,
+        tools_count = routing_diagnostics.tools_count,
+        instructions_existed,
+        semantic_similarity_hit = detection.semantic_similarity_hit,
+        group_index_tag_hit = detection.group_index_tag_hit,
+        group_index_field_hit = detection.group_index_field_hit,
+        group_name_field_hit = detection.group_name_field_hit,
+        summary_field_hit = detection.summary_field_hit,
+        required_hit_count = detection.required_hit_count(),
+        "virtual_tools_summarizer_request_detected"
+    );
+
+    let mutation = inject_virtual_tool_summarizer_instruction(request);
+    if mutation.injected() {
+        debug!(
+            profile = "utility",
+            model,
+            instructions_existed,
+            mutation = mutation.outcome_label(),
+            "virtual_tools_summarizer_instruction_injected"
+        );
+        return;
+    }
+
+    if let Some(skip_reason) = mutation.skip_reason() {
+        debug!(
+            profile = "utility",
+            model,
+            instructions_existed,
+            skip_reason,
+            mutation = mutation.outcome_label(),
+            "virtual_tools_summarizer_instruction_skipped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_persistent_reasoning_context, rewrite_stale_continuation_first_send_error,
+        thread_id_from_prompt_cache_key,
+    };
+    use crate::errors::ThreadlineError;
+    use crate::models::{ModelAlias, RouteProfile, resolve_request_model_for_profile};
+    use serde_json::json;
+
+    fn persistent_reasoning_alias() -> &'static ModelAlias {
+        resolve_request_model_for_profile(
+            json!({ "model": "threadline-main-gpt-5.6-terra" })
+                .as_object()
+                .expect("model payload"),
+            RouteProfile::Main,
+        )
+        .expect("persistent reasoning alias")
+    }
+
+    fn ineligible_reasoning_alias() -> &'static ModelAlias {
+        resolve_request_model_for_profile(
+            json!({ "model": "threadline-main-gpt-5.5" })
+                .as_object()
+                .expect("model payload"),
+            RouteProfile::Main,
+        )
+        .expect("ineligible reasoning alias")
+    }
+
+    #[test]
+    fn prompt_cache_key_exposes_vscode_conversation_as_thread_identity() {
+        let payload = json!({
+            "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-5.6-sol"
+        });
+
+        assert_eq!(
+            thread_id_from_prompt_cache_key(payload.as_object().expect("payload object"))
+                .as_deref(),
+            Some("48a65359-981b-47c2-9612-e1c64ae07e22")
+        );
+    }
+
+    #[test]
+    fn invalid_prompt_cache_key_does_not_supply_thread_identity() {
+        for payload in [
+            json!({}),
+            json!({ "prompt_cache_key": "not-a-uuid:gpt-5.6-sol" }),
+            json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22" }),
+            json!({ "prompt_cache_key": 12 }),
+        ] {
+            assert!(
+                thread_id_from_prompt_cache_key(payload.as_object().expect("payload object"))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_reasoning_normalization_inserts_context_for_missing_or_null_reasoning() {
+        for mut payload in [json!({}), json!({ "reasoning": null })] {
+            let applied = normalize_persistent_reasoning_context(
+                payload.as_object_mut().expect("request object"),
+                true,
+                persistent_reasoning_alias(),
+            );
+
+            assert!(applied);
+            assert_eq!(payload["reasoning"], json!({ "context": "all_turns" }));
+        }
+    }
+
+    #[test]
+    fn persistent_reasoning_normalization_preserves_existing_reasoning_fields_and_context() {
+        let mut missing_context = json!({
+            "reasoning": {
+                "effort": "high",
+                "summary": "detailed"
+            }
+        });
+        let applied = normalize_persistent_reasoning_context(
+            missing_context.as_object_mut().expect("request object"),
+            true,
+            persistent_reasoning_alias(),
+        );
+        assert!(applied);
+        assert_eq!(
+            missing_context["reasoning"],
+            json!({
+                "context": "all_turns",
+                "effort": "high",
+                "summary": "detailed"
+            })
+        );
+
+        for mut explicit_context in [
+            json!({ "reasoning": { "context": "client_context" } }),
+            json!({ "reasoning": { "context": 12 } }),
+        ] {
+            let original = explicit_context.clone();
+            let applied = normalize_persistent_reasoning_context(
+                explicit_context.as_object_mut().expect("request object"),
+                true,
+                persistent_reasoning_alias(),
+            );
+
+            assert!(!applied);
+            assert_eq!(explicit_context, original);
+        }
+    }
+
+    #[test]
+    fn persistent_reasoning_normalization_is_noop_when_disabled_or_ineligible_or_non_object() {
+        for (enabled, alias, mut payload) in [
+            (false, persistent_reasoning_alias(), json!({})),
+            (true, ineligible_reasoning_alias(), json!({})),
+            (
+                true,
+                persistent_reasoning_alias(),
+                json!({ "reasoning": "manual" }),
+            ),
+        ] {
+            let original = payload.clone();
+            let applied = normalize_persistent_reasoning_context(
+                payload.as_object_mut().expect("request object"),
+                enabled,
+                alias,
+            );
+
+            assert!(!applied);
+            assert_eq!(payload, original);
+        }
+    }
+
+    #[test]
+    fn stale_continuation_first_send_rewrites_closed_upstream_to_previous_response_not_found() {
+        let rewritten =
+            rewrite_stale_continuation_first_send_error(ThreadlineError::UpstreamWebSocketClosed);
+
+        assert!(matches!(
+            rewritten,
+            ThreadlineError::PreviousResponseNotFound
+        ));
+    }
+
+    #[test]
+    fn stale_continuation_first_send_preserves_non_transport_errors() {
+        let preserved =
+            rewrite_stale_continuation_first_send_error(ThreadlineError::InvalidResponsesRequest);
+
+        assert!(matches!(
+            preserved,
+            ThreadlineError::InvalidResponsesRequest
+        ));
+    }
+}
