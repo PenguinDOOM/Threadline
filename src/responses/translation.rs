@@ -63,15 +63,21 @@ impl ResponseStreamLease {
         }
     }
 
-    async fn record_completed_marker(&mut self, response_marker: &str) {
+    fn record_completed_marker_and_disarm(&mut self, response_marker: &str) {
         if let Self::Retained(lease) = self {
-            lease.record_completed_marker(response_marker).await;
+            lease.record_completed_marker_and_disarm(response_marker);
         }
     }
 
-    async fn mark_upstream_recoverable(&mut self) {
+    fn disarm_active_turn(&mut self) {
         if let Self::Retained(lease) = self {
-            lease.mark_upstream_recoverable().await;
+            lease.disarm_active_turn();
+        }
+    }
+
+    fn finalize_recoverable_turn(&mut self) {
+        if let Self::Retained(lease) = self {
+            lease.finalize_recoverable_turn();
         }
     }
 
@@ -1025,7 +1031,7 @@ pub(super) struct QueuedForwardedEvent {
 
 pub(super) struct ResponseStreamState {
     pub(super) services: ThreadlineServices,
-    pub(super) upstream: Arc<LiveUpstreamWebSocket>,
+    pub(super) upstream: Option<Arc<LiveUpstreamWebSocket>>,
     pub(super) lease: ResponseStreamLease,
     pub(super) base_request: serde_json::Map<String, Value>,
     pub(super) pending_internal_outputs: Vec<PendingInternalToolOutput>,
@@ -1105,9 +1111,6 @@ pub(super) fn response_stream(
 
             if let Some(completed) = state.queued_final_completed.take() {
                 let response_id = response_id_from_event(&completed.payload);
-                if let Some(response_id) = response_id {
-                    state.lease.record_completed_marker(response_id).await;
-                }
                 let trace_diagnostics = DownstreamTraceDiagnostics {
                     response_id: response_id.map(ToString::to_string),
                     visible_text_delta_count: Some(state.downstream_visible_text_delta_count),
@@ -1157,11 +1160,15 @@ pub(super) fn response_stream(
                 return None;
             }
 
-            let next = match state.upstream.recv_text().await {
+            let upstream_result = match state.upstream.as_ref() {
+                Some(upstream) => upstream.recv_text().await,
+                None => Ok(None),
+            };
+            let next = match upstream_result {
                 Ok(Some(text)) => text,
                 Ok(None) | Err(_) => match try_reconnect_or_terminal_error(&mut state).await {
                     Ok(Some(reconnected)) => {
-                        state.upstream = reconnected;
+                        state.upstream = Some(reconnected);
                         continue;
                     }
                     Ok(None) => {
@@ -1175,7 +1182,8 @@ pub(super) fn response_stream(
                             DownstreamTraceAction::Terminal,
                             None,
                         ));
-                        state.lease.mark_upstream_recoverable().await;
+                        state.upstream = None;
+                        state.lease.finalize_recoverable_turn();
                         state.lease.release();
                         state.final_done_pending = true;
                         return Some((
@@ -1192,6 +1200,7 @@ pub(super) fn response_stream(
                             DownstreamTraceAction::Terminal,
                             None,
                         ));
+                        state.upstream = None;
                         state.lease.mark_upstream_terminal().await;
                         state.lease.release();
                         state.final_done_pending = true;
@@ -1219,6 +1228,7 @@ pub(super) fn response_stream(
                     DownstreamTraceAction::Terminal,
                     None,
                 ));
+                state.upstream = None;
                 state.lease.mark_upstream_terminal().await;
                 state.lease.release();
                 state.final_done_pending = true;
@@ -1231,6 +1241,7 @@ pub(super) fn response_stream(
             let parsed = match serde_json::from_str::<Value>(&next) {
                 Ok(parsed) => parsed,
                 Err(_) => {
+                    state.upstream = None;
                     state.lease.mark_upstream_terminal().await;
                     state.done = true;
                     return Some((
@@ -1261,6 +1272,7 @@ pub(super) fn response_stream(
                             response_id_from_event(&parsed),
                             &error,
                         );
+                        state.upstream = None;
                         state.lease.mark_upstream_terminal().await;
                         state.lease.release();
                         state.final_done_pending = true;
@@ -1291,6 +1303,7 @@ pub(super) fn response_stream(
                                     DownstreamTraceAction::Terminal,
                                     None,
                                 ));
+                                state.upstream = None;
                                 state.lease.mark_upstream_terminal().await;
                                 state.lease.release();
                                 state.final_done_pending = true;
@@ -1321,6 +1334,7 @@ pub(super) fn response_stream(
                                 response_id_from_event(&parsed),
                                 &error,
                             );
+                            state.upstream = None;
                             state.lease.mark_upstream_terminal().await;
                             state.lease.release();
                             state.final_done_pending = true;
@@ -1397,6 +1411,7 @@ pub(super) fn response_stream(
                                 response_id_from_event(&parsed),
                                 &error,
                             );
+                            state.upstream = None;
                             state.lease.mark_upstream_terminal().await;
                             state.lease.release();
                             state.final_done_pending = true;
@@ -1417,8 +1432,23 @@ pub(super) fn response_stream(
                         );
                         state.suppressed_internal_output_indexes.clear();
                         let followup_input = build_followup_input(outputs);
+                        let Some(upstream) = state.upstream.as_ref() else {
+                            let failed_payload = terminal_failed_payload_from_error(
+                                parsed.get("response"),
+                                Some(response_id),
+                                &ThreadlineError::UpstreamWebSocketClosed,
+                            );
+                            state.lease.mark_upstream_terminal().await;
+                            state.final_done_pending = true;
+                            return Some((
+                                Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                    &failed_payload,
+                                )),
+                                state,
+                            ));
+                        };
                         if let Err(error) = send_followup_tool_outputs(
-                            &state.upstream,
+                            upstream,
                             &state.base_request,
                             response_id,
                             followup_input,
@@ -1435,6 +1465,7 @@ pub(super) fn response_stream(
                                 DownstreamTraceAction::Terminal,
                                 None,
                             ));
+                            state.upstream = None;
                             state.lease.mark_upstream_terminal().await;
                             state.lease.release();
                             state.final_done_pending = true;
@@ -1493,6 +1524,7 @@ pub(super) fn response_stream(
                             DownstreamTraceAction::Terminal,
                             None,
                         ));
+                        state.upstream = None;
                         state.lease.mark_upstream_terminal().await;
                         state.lease.release();
                         state.final_done_pending = true;
@@ -1507,6 +1539,12 @@ pub(super) fn response_stream(
                         ));
                     }
 
+                    if let Some(response_id) = response_id.as_deref() {
+                        state.lease.record_completed_marker_and_disarm(response_id);
+                    } else {
+                        state.lease.disarm_active_turn();
+                    }
+                    state.upstream = None;
                     state.queued_final_completed = Some(QueuedCompletedEvent {
                         payload: sanitized_completed,
                         diagnostics,
@@ -1519,7 +1557,8 @@ pub(super) fn response_stream(
                         DownstreamTraceAction::Terminal,
                         None,
                     ));
-                    state.lease.mark_upstream_recoverable().await;
+                    state.upstream = None;
+                    state.lease.finalize_recoverable_turn();
                     state.lease.release();
                     state.final_done_pending = true;
                     debug!(event_type, "terminal_response_forwarded");
@@ -1535,6 +1574,7 @@ pub(super) fn response_stream(
                         DownstreamTraceAction::Terminal,
                         None,
                     ));
+                    state.upstream = None;
                     state.lease.mark_upstream_terminal().await;
                     state.lease.release();
                     state.final_done_pending = true;
@@ -1593,8 +1633,10 @@ pub(super) fn response_stream(
                         },
                     );
                     if is_previous_response_not_found {
-                        state.lease.mark_upstream_recoverable().await;
+                        state.upstream = None;
+                        state.lease.finalize_recoverable_turn();
                     } else {
+                        state.upstream = None;
                         state.lease.mark_upstream_terminal().await;
                     }
                     state.lease.release();

@@ -167,11 +167,11 @@ mod login_cli_tests {
         let utility_aliases_section =
             readme_section_containing(&readme, "Utility profile aliases:")
                 .expect("README should document the supported Utility model alias list");
-        let unreleased_caveat = readme_section_containing(
+        let gpt_5_6_support = readme_section_containing(
             &readme,
-            "The `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` entries are next models.",
+            "The `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` models are supported for live upstream use.",
         )
-        .expect("README should document the GPT-5.6 unreleased caveat");
+        .expect("README should document GPT-5.6 live upstream support");
         let raw_upstream_ids_section =
             readme_section_containing(&readme, "The upstream model ids sent to Codex remain")
                 .expect("README should explain raw upstream model ids");
@@ -274,16 +274,12 @@ mod login_cli_tests {
             "README raw upstream-id explanation should explicitly list the raw gpt-5.6 ids"
         );
         assert!(
-            unreleased_caveat.contains("Threadline currently covers local advertisement, validation, and `model`-field rewriting for those ids."),
-            "README should describe the GPT-5.6 entries as local-only coverage"
+            gpt_5_6_support.contains("Threadline covers advertisement, validation, `model`-field rewriting, and the existing reasoning policy for those ids."),
+            "README should describe the supported GPT-5.6 coverage"
         );
         assert!(
-            unreleased_caveat.contains("Live upstream behavior remains unverified until upstream release makes direct testing possible."),
-            "README should keep the GPT-5.6 caveat explicitly unverified upstream"
-        );
-        assert!(
-            !unreleased_caveat.contains("live upstream verification"),
-            "README should not claim live upstream verification for unreleased GPT-5.6 ids"
+            gpt_5_6_support.contains("supported for live upstream use"),
+            "README should state that GPT-5.6 models support live upstream use"
         );
 
         for raw_model_id in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
@@ -378,7 +374,7 @@ mod login_cli_tests {
         .expect("README should document persistent reasoning eligibility");
         assert!(
             persistent_reasoning_scope.contains("reasoning.context=all_turns")
-                && persistent_reasoning_scope.contains("only to eligible Main requests"),
+                && persistent_reasoning_scope.contains("eligible Main requests using"),
             "README should describe persistent reasoning as eligible Main-only injection"
         );
         for advertised_main_alias in [
@@ -397,10 +393,18 @@ mod login_cli_tests {
                 "README should identify raw Main compatibility id {raw_main_compatibility_id} as eligible"
             );
         }
+        for astra_main_model_id in ["threadline-main-gpt-6-astra", "gpt-6-astra"] {
+            assert!(
+                persistent_reasoning_scope.contains(astra_main_model_id),
+                "README should identify Astra Main id {astra_main_model_id} as eligible"
+            );
+        }
         assert!(
-            persistent_reasoning_scope.contains("support that client-explicit value on Main")
+            persistent_reasoning_scope.contains(
+                "eligible GPT-5.6 and Astra Main aliases and raw compatibility ids support that client-explicit value",
+            )
                 && persistent_reasoning_scope.contains("also eligible for server-side injection"),
-            "README should document explicit and automatic persistent reasoning for raw GPT-5.6 Main compatibility ids"
+            "README should document explicit and automatic persistent reasoning for eligible GPT-5.6 and Astra Main ids"
         );
         assert!(
             persistent_reasoning_scope.contains("raw compatibility ids `gpt-5.5` and `gpt-5.4`")

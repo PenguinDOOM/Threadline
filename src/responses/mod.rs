@@ -199,6 +199,7 @@ pub(crate) async fn responses_handler(
                             let upstream = lease.upstream().expect(
                                 "open retained upstream must exist for continuation preflight",
                             );
+                            lease.arm_active_turn();
                             if let Err(error) =
                                 send_response_create(&upstream, &upstream_request).await
                             {
@@ -238,6 +239,7 @@ pub(crate) async fn responses_handler(
                             let auth = state.services.auth_provider().load()?;
                             let mut upstream =
                                 ensure_upstream(&state.services, &mut lease, auth).await?;
+                            lease.arm_active_turn();
                             if let Err(error) =
                                 send_response_create(&upstream, &upstream_request).await
                             {
@@ -357,7 +359,7 @@ pub(crate) async fn responses_handler(
 
     let stream = response_stream(ResponseStreamState {
         services: state.services.clone(),
-        upstream: prepared.upstream,
+        upstream: Some(prepared.upstream),
         lease: prepared.lease,
         base_request: prepared.upstream_request,
         pending_internal_outputs: Vec::new(),
@@ -513,7 +515,7 @@ async fn attempt_pre_first_event_reconnect(
     }
 
     *reconnect_attempted = true;
-    lease.mark_upstream_recoverable().await;
+    lease.detach_upstream_recoverably();
     debug!(
         previous_response_id,
         session_id = %lease.session().session_id,
@@ -604,7 +606,7 @@ async fn ensure_upstream(
             return Ok(upstream);
         }
 
-        lease.mark_upstream_recoverable().await;
+        lease.detach_upstream_recoverably();
     }
 
     let connected = services

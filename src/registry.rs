@@ -22,6 +22,7 @@ pub struct RetainedSessionLease {
     registry: Arc<Mutex<RegistryState>>,
     session: UpstreamSessionDescriptor,
     upstream: Option<Arc<LiveUpstreamWebSocket>>,
+    armed: bool,
     removed: bool,
     released: bool,
 }
@@ -32,6 +33,7 @@ impl std::fmt::Debug for RetainedSessionLease {
             .field("entry_id", &self.entry_id)
             .field("session", &self.session)
             .field("has_live_upstream", &self.upstream.is_some())
+            .field("armed", &self.armed)
             .field("removed", &self.removed)
             .field("released", &self.released)
             .finish()
@@ -122,6 +124,7 @@ impl RetainedSessionRegistry {
             registry: Arc::clone(&self.inner),
             session,
             upstream: None,
+            armed: false,
             removed: false,
             released: false,
         })
@@ -169,6 +172,7 @@ impl RetainedSessionRegistry {
             registry: Arc::clone(&self.inner),
             session: entry.session.clone(),
             upstream: entry.upstream.clone(),
+            armed: false,
             removed: false,
             released: false,
         })
@@ -194,12 +198,69 @@ impl RetainedSessionLease {
         self.upstream.clone()
     }
 
+    pub fn arm_active_turn(&mut self) {
+        if !self.removed && !self.released {
+            self.armed = true;
+        }
+    }
+
+    pub fn disarm_active_turn(&mut self) {
+        if !self.removed {
+            self.armed = false;
+        }
+    }
+
+    pub fn record_completed_marker_and_disarm(&mut self, response_marker: impl Into<String>) {
+        let response_marker = response_marker.into();
+        let mut state = match self.registry.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let Some(entry) = state.entries.get_mut(&self.entry_id) else {
+            return;
+        };
+
+        if !entry
+            .markers
+            .iter()
+            .any(|marker| marker == &response_marker)
+        {
+            entry.markers.push(response_marker.clone());
+        }
+        entry.last_used = Instant::now();
+        state.markers.insert(response_marker, self.entry_id);
+        self.armed = false;
+    }
+
+    pub fn finalize_recoverable_turn(&mut self) {
+        self.detach_upstream_recoverably();
+        self.disarm_active_turn();
+    }
+
+    pub fn detach_upstream_recoverably(&mut self) {
+        self.upstream = None;
+        if let Ok(mut state) = self.registry.lock()
+            && let Some(entry) = state.entries.get_mut(&self.entry_id)
+        {
+            entry.upstream = None;
+            entry.recoverable = true;
+            self.session = entry.session.clone();
+            entry.last_used = Instant::now();
+        }
+    }
+
     pub fn release(&mut self) {
         if self.removed || self.released {
             return;
         }
 
+        if self.armed {
+            self.remove_entry();
+            return;
+        }
+
         self.released = true;
+        self.upstream = None;
 
         if let Ok(mut state) = self.registry.lock()
             && let Some(entry) = state.entries.get_mut(&self.entry_id)
@@ -216,21 +277,7 @@ impl RetainedSessionLease {
     }
 
     pub async fn record_completed_marker(&mut self, response_marker: impl Into<String>) {
-        let response_marker = response_marker.into();
-        let mut state = self.registry.lock().expect("registry mutex poisoned");
-        let Some(entry) = state.entries.get_mut(&self.entry_id) else {
-            return;
-        };
-
-        if !entry
-            .markers
-            .iter()
-            .any(|marker| marker == &response_marker)
-        {
-            entry.markers.push(response_marker.clone());
-        }
-        entry.last_used = Instant::now();
-        state.markers.insert(response_marker, self.entry_id);
+        self.record_completed_marker_and_disarm(response_marker);
     }
 
     pub async fn update_turn_state(&mut self, turn_state: Option<String>) {
@@ -253,14 +300,7 @@ impl RetainedSessionLease {
     }
 
     pub async fn mark_upstream_recoverable(&mut self) {
-        self.upstream = None;
-        let mut state = self.registry.lock().expect("registry mutex poisoned");
-        if let Some(entry) = state.entries.get_mut(&self.entry_id) {
-            entry.upstream = None;
-            entry.recoverable = true;
-            self.session = entry.session.clone();
-            entry.last_used = Instant::now();
-        }
+        self.finalize_recoverable_turn();
     }
 
     pub async fn advance_window_generation(&mut self) {
@@ -274,9 +314,19 @@ impl RetainedSessionLease {
     }
 
     pub async fn mark_upstream_terminal(&mut self) {
-        let mut state = self.registry.lock().expect("registry mutex poisoned");
-        remove_entry(&mut state, self.entry_id);
+        self.remove_entry();
+    }
+
+    fn remove_entry(&mut self) {
+        if self.removed {
+            return;
+        }
+
+        if let Ok(mut state) = self.registry.lock() {
+            remove_entry(&mut state, self.entry_id);
+        }
         self.upstream = None;
+        self.armed = false;
         self.removed = true;
         self.released = true;
     }

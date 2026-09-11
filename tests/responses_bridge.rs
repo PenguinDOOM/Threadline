@@ -3,13 +3,14 @@ use std::io::{self, Write};
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, Response, StatusCode};
-use futures_util::{StreamExt, future::BoxFuture, stream};
+use futures_util::{Stream, StreamExt, future::BoxFuture, stream};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -943,7 +944,7 @@ async fn retained_gpt_5_6_continuation_repeats_persistent_reasoning_context_with
 }
 
 #[tokio::test]
-async fn astra_visible_and_raw_ids_emit_expected_upstream_payload_without_persistent_reasoning() {
+async fn astra_visible_and_raw_ids_emit_expected_upstream_payload_with_persistent_reasoning() {
     for model_id in ["threadline-main-gpt-6-astra", "gpt-6-astra"] {
         let request_payload = completed_response_create_payload(
             ThreadlineConfig {
@@ -965,7 +966,7 @@ async fn astra_visible_and_raw_ids_emit_expected_upstream_payload_without_persis
         assert_eq!(request_payload["model"], "gpt-6-astra");
         assert_eq!(request_payload["reasoning"]["effort"], "high");
         assert_eq!(request_payload["reasoning"]["summary"], "detailed");
-        assert!(request_payload["reasoning"].get("context").is_none());
+        assert_eq!(request_payload["reasoning"]["context"], "all_turns");
     }
 }
 
@@ -2459,13 +2460,13 @@ async fn transient_summary_request_terminal_paths_close_pump_or_upstream_handle(
 }
 
 #[tokio::test]
-async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_lease() {
+async fn active_continuation_drop_invalidates_marker_without_another_upstream_create() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
         turn_state: None,
     }]);
-    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
     let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
@@ -2503,7 +2504,6 @@ async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_l
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
 
     drop(active);
-    sleep(Duration::from_millis(50)).await;
 
     let retried = post_responses(
         app,
@@ -2514,7 +2514,320 @@ async fn concurrent_marker_reuse_returns_conflict_and_client_drop_releases_the_l
         }),
     )
     .await;
-    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(retried.status(), StatusCode::BAD_REQUEST);
+    let retried_body = to_bytes(retried.into_body(), usize::MAX)
+        .await
+        .expect("replayed continuation error body");
+    let retried_payload: Value =
+        serde_json::from_slice(&retried_body).expect("replayed continuation error json");
+    assert_eq!(
+        retried_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        !matches!(
+            timeout(Duration::from_millis(100), server.recv_client_message()).await,
+            Ok(Some(_))
+        ),
+        "dropped continuation must not send another upstream response.create"
+    );
+}
+
+#[tokio::test]
+async fn polled_continuation_drop_before_first_event_requires_replay() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"followup","previous_response_id":"response-1"}),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("followup request");
+    let (pending_tx, pending_rx) = oneshot::channel();
+    let poll_task = tokio::spawn(async move {
+        let mut active_body = active.into_body().into_data_stream();
+        let mut pending_tx = Some(pending_tx);
+        futures_util::future::poll_fn(|context| {
+            let result = std::pin::Pin::new(&mut active_body).poll_next(context);
+            if matches!(result, Poll::Pending)
+                && let Some(pending_tx) = pending_tx.take()
+            {
+                let _ = pending_tx.send(());
+            }
+            result
+        })
+        .await
+    });
+    timeout(Duration::from_secs(1), pending_rx)
+        .await
+        .expect("body polling must wait for the first upstream event")
+        .expect("polling task must report pending");
+    poll_task.abort();
+    assert!(
+        poll_task
+            .await
+            .expect_err("cancelled polling task")
+            .is_cancelled()
+    );
+
+    let replay = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"replay","previous_response_id":"response-1"}),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let replay_body = to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .expect("replay error body");
+    let replay_payload: Value = serde_json::from_slice(&replay_body).expect("replay error json");
+    assert_eq!(
+        replay_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        !matches!(
+            timeout(Duration::from_millis(100), server.recv_client_message()).await,
+            Ok(Some(_))
+        ),
+        "cancelled continuation must not send another upstream response.create"
+    );
+}
+
+#[tokio::test]
+async fn visible_continuation_output_drop_invalidates_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"followup","previous_response_id":"response-1"}),
+    )
+    .await;
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("followup request");
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"visible"}"#)
+        .await;
+    let mut active_body = active.into_body().into_data_stream();
+    let visible_chunk = next_body_chunk(&mut active_body).await;
+    assert!(String::from_utf8_lossy(&visible_chunk).contains("visible"));
+    drop(active_body);
+
+    let replay = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"replay","previous_response_id":"response-1"}),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let replay_body = to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .expect("replay error body");
+    let replay_payload: Value = serde_json::from_slice(&replay_body).expect("replay error json");
+    assert_eq!(
+        replay_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        !matches!(
+            timeout(Duration::from_millis(100), server.recv_client_message()).await,
+            Ok(Some(_))
+        ),
+        "dropped visible continuation must not send another upstream response.create"
+    );
+}
+
+#[tokio::test]
+async fn dropped_fresh_active_request_releases_retained_capacity() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let second_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&second_server),
+            turn_state: None,
+        },
+    ]);
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let active = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = first_server
+        .recv_client_message()
+        .await
+        .expect("first request");
+    drop(active);
+    assert!(
+        connector.recorded_websockets().await[0].upgrade().is_none(),
+        "dropped fresh request must release its upstream handle"
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(1), first_server.recv_client_message()).await,
+        Ok(None)
+    ));
+
+    let replacement = post_responses(app, json!({"model":"gpt-5.4","input":"second"})).await;
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let _ = second_server
+        .recv_client_message()
+        .await
+        .expect("replacement request");
+    assert_eq!(connector.recorded_sessions().await.len(), 2);
+    drop(replacement);
+}
+
+#[tokio::test]
+async fn completed_without_response_id_disarms_active_turn_and_preserves_prior_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"followup","previous_response_id":"response-1"}),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("followup request");
+    server
+        .send_text(
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "completed without id"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let mut active_body = active.into_body().into_data_stream();
+    let synthetic_delta = next_body_chunk(&mut active_body).await;
+    assert!(String::from_utf8_lossy(&synthetic_delta).contains("completed without id"));
+    drop(active_body);
+
+    let resumed = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"resume","previous_response_id":"response-1"}),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("resumed request"),
+    ))
+    .expect("resumed request json");
+    assert_eq!(resumed_payload["previous_response_id"], "response-1");
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    drop(resumed);
+}
+
+#[tokio::test]
+async fn abandoning_newer_turn_releases_upstream_while_completed_predecessor_body_is_retained() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let first = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("first request");
+    server
+        .send_text(&assistant_text_completed_event("response-a", "first completion").to_string())
+        .await;
+    let mut first_body = first.into_body().into_data_stream();
+    let _ = next_body_chunk(&mut first_body).await;
+    let completed_chunk = next_body_chunk(&mut first_body).await;
+    assert!(String::from_utf8_lossy(&completed_chunk).contains("response.completed"));
+
+    let second = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"second","previous_response_id":"response-a"}),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("second request");
+    drop(second);
+
+    let replay = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"replay","previous_response_id":"response-a"}),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        connector.recorded_websockets().await[0].upgrade().is_none(),
+        "retained completed body must not own the abandoned upstream"
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(1), server.recv_client_message()).await,
+        Ok(None)
+    ));
+
+    drop(first_body);
 }
 
 #[tokio::test]
@@ -3235,7 +3548,7 @@ async fn downstream_completed_and_done_are_separate_body_chunks_before_eof() {
 }
 
 #[tokio::test]
-async fn completed_marker_can_be_reused_after_completed_chunk_before_done_or_eof() {
+async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -3306,15 +3619,95 @@ async fn completed_marker_can_be_reused_after_completed_chunk_before_done_or_eof
     .expect("resumed request json");
     assert_eq!(resumed_payload["previous_response_id"], "response-2");
 
-    let done_chunk = next_body_chunk(&mut active_body).await;
-    assert_eq!(done_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
-    assert!(
-        active_body.next().await.is_none(),
-        "expected EOF after DONE"
-    );
+    drop(active_body);
+
+    let overlapping = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"conflict while resumed turn is active",
+            "previous_response_id":"response-2"
+        }),
+    )
+    .await;
+    assert_eq!(overlapping.status(), StatusCode::CONFLICT);
 
     server
         .send_text(&assistant_text_completed_event("response-3", "resume completion").to_string())
+        .await;
+    let _ = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("resumed body");
+}
+
+#[tokio::test]
+async fn completed_marker_remains_reusable_when_synthetic_tail_body_is_dropped() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let completed = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"completed synthetic tail",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(completed.status(), StatusCode::OK);
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("completed request");
+    server
+        .send_text(&assistant_text_completed_event("response-2", "completed text").to_string())
+        .await;
+
+    let mut completed_body = completed.into_body().into_data_stream();
+    let synthetic_delta = next_body_chunk(&mut completed_body).await;
+    let (event, data) = sse_event_and_data(
+        std::str::from_utf8(&synthetic_delta)
+            .expect("synthetic delta utf8")
+            .trim_end(),
+    );
+    let payload: Value = serde_json::from_str(data).expect("synthetic delta json");
+    assert_eq!(event, "response.output_text.delta");
+    assert_eq!(payload["delta"], "completed text");
+    drop(completed_body);
+
+    let resumed = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume after synthetic tail drop",
+            "previous_response_id":"response-2"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_payload: Value = serde_json::from_str(&message_text(
+        server.recv_client_message().await.expect("resumed request"),
+    ))
+    .expect("resumed request json");
+    assert_eq!(resumed_payload["previous_response_id"], "response-2");
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+
+    server
+        .send_text(&assistant_text_completed_event("response-3", "resumed completion").to_string())
         .await;
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
@@ -3394,6 +3787,106 @@ async fn internal_tool_followup_strips_context_management_from_initial_and_follo
         )
         .await;
     let _ = response_body_task.await.expect("response body task");
+}
+
+#[tokio::test]
+async fn dropping_pending_internal_followup_invalidates_all_continuation_markers() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"internal followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("active request");
+    let polling_task = tokio::spawn(async move { to_bytes(active.into_body(), usize::MAX).await });
+
+    server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-intermediate"}}"#)
+        .await;
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup_payload: Value = serde_json::from_str(&message_text(
+        timeout(Duration::from_secs(2), server.recv_client_message())
+            .await
+            .expect("followup request timeout")
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(
+        followup_payload["previous_response_id"],
+        "response-intermediate"
+    );
+    assert_eq!(followup_payload["input"][0]["type"], "function_call_output");
+    assert_eq!(followup_payload["input"][0]["call_id"], "call-1");
+
+    polling_task.abort();
+    assert!(
+        polling_task
+            .await
+            .expect_err("polling task must be cancelled")
+            .is_cancelled()
+    );
+
+    for marker in ["response-1", "response-intermediate"] {
+        let replay = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"replay",
+                "previous_response_id":marker
+            }),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST, "marker {marker}");
+        let replay_body = to_bytes(replay.into_body(), usize::MAX)
+            .await
+            .expect("replay body");
+        let replay_payload: Value = serde_json::from_slice(&replay_body).expect("replay json");
+        assert_eq!(
+            replay_payload["error"]["code"],
+            "previous_response_not_found"
+        );
+    }
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        connector.recorded_websockets().await[0].upgrade().is_none(),
+        "abandoned internal followup must release its live upstream"
+    );
+    assert!(
+        !matches!(
+            timeout(Duration::from_millis(100), server.recv_client_message()).await,
+            Ok(Some(_))
+        ),
+        "abandoned internal followup must not send another upstream response.create"
+    );
 }
 
 #[tokio::test]
@@ -3767,13 +4260,13 @@ async fn terminal_failed_and_incomplete_payloads_preserve_vscode_terminal_fields
 }
 
 #[tokio::test]
-async fn upstream_incomplete_emits_terminal_response_incomplete_without_marker() {
+async fn dropping_incomplete_terminal_body_before_done_removes_marker() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
         turn_state: None,
     }]);
-    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
     let response = post_responses(
         app.clone(),
@@ -3792,26 +4285,20 @@ async fn upstream_incomplete_emits_terminal_response_incomplete_without_marker()
         .await;
     server.send_close(1000, "incomplete").await;
 
-    let body = timeout(
-        Duration::from_secs(2),
-        to_bytes(response.into_body(), usize::MAX),
-    )
-    .await
-    .expect("incomplete body timeout")
-    .expect("incomplete body");
-    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let frames = split_sse_frames(&body_text);
-    let (event, data) = sse_event_and_data(frames.first().expect("incomplete frame"));
+    let mut body = response.into_body().into_data_stream();
+    let terminal_chunk = next_body_chunk(&mut body).await;
+    let terminal_text =
+        String::from_utf8(terminal_chunk.to_vec()).expect("incomplete terminal utf8");
+    let (event, data) = sse_event_and_data(terminal_text.trim_end());
     let payload: Value = serde_json::from_str(data).expect("incomplete json");
 
-    assert_eq!(frames.len(), 2);
     assert_eq!(event, "response.incomplete");
     assert_eq!(payload["response"]["id"], "response-incomplete");
     assert_eq!(
         payload["response"]["incomplete_details"]["reason"],
         "max_output_tokens"
     );
-    assert_done_frame(frames[1]);
+    drop(body);
 
     let rejected = post_responses(
         app,
@@ -3832,6 +4319,7 @@ async fn upstream_incomplete_emits_terminal_response_incomplete_without_marker()
         rejected_payload["error"]["code"],
         "previous_response_not_found"
     );
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
 }
 
 #[tokio::test]
@@ -3920,7 +4408,7 @@ async fn response_failed_releases_prior_completed_marker_after_recoverable_close
 }
 
 #[tokio::test]
-async fn failed_turn_releases_prior_marker_before_body_drop_and_blocks_resume() {
+async fn dropping_failed_terminal_body_before_done_blocks_resume() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
@@ -3933,7 +4421,7 @@ async fn failed_turn_releases_prior_marker_before_body_drop_and_blocks_resume() 
             turn_state: None,
         },
     ]);
-    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
     let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
@@ -3977,6 +4465,7 @@ async fn failed_turn_releases_prior_marker_before_body_drop_and_blocks_resume() 
     let failed_event: Value = serde_json::from_str(data).expect("failed event json");
     assert_eq!(event, "response.failed");
     assert_eq!(failed_event["response"]["id"], "response-failed");
+    drop(failed_body);
 
     let resumed = post_responses(
         app.clone(),
@@ -4004,11 +4493,9 @@ async fn failed_turn_releases_prior_marker_before_body_drop_and_blocks_resume() 
     .await;
     assert!(no_resume_connect.is_err());
 
-    let done_chunk = next_body_chunk(&mut failed_body).await;
-    assert_eq!(done_chunk, Bytes::from_static(b"data: [DONE]\n\n"));
     assert!(
-        failed_body.next().await.is_none(),
-        "expected EOF after DONE"
+        connector.recorded_websockets().await[0].upgrade().is_none(),
+        "failed terminal body drop must not retain a live upstream"
     );
 }
 

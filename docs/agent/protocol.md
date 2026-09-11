@@ -39,6 +39,9 @@ These invariants should remain true across refactors:
 * Classified auxiliary summary requests are a narrow exception to retained continuation markers and must stay outside retained session registry semantics.
 * Public errors are stable and safe to expose.
 * Secrets are never logged.
+* A retained lease is unarmed when acquired and becomes protected only immediately before its initial upstream `response.create` send.
+* An armed unfinished turn is never made reusable: release or drop synchronously removes its entry and every marker alias before any later acquire can observe reusable state.
+* Accepted final completion and explicit recoverable terminal outcomes finalize the turn deliberately; transport detachment alone does not finalize it.
 
 ## `/v1/responses` handling
 
@@ -97,6 +100,18 @@ Classify this request type by its summary-only auxiliary behavior, not by `conte
 When a request is classified as an auxiliary summary request, do not acquire a retained marker, do not forward its downstream `previous_response_id` upstream, do not consume retained registry capacity, and do not register the completed summary response id as a continuation marker.
 
 After terminal completion, failure, or cancellation of an auxiliary summary request, clean up any transient auxiliary state associated with that request.
+
+## Retained turn abandonment and ownership
+
+Acquisition alone does not indicate that upstream work has begun. The handler arms the retained lease immediately before the initial upstream send, after stale-marker and open-transport checks. An unarmed lease keeps the existing normal release behavior for paths that never attempt an upstream send.
+
+After arming, any release or drop before an accepted final completion is an abandonment. Invalidation is synchronous under the registry mutex: remove the entry, remove every marker alias, mark the lease inert, and clear its lease-owned upstream reference before exposing reusable registry state. A later request using an abandoned marker receives the existing `previous_response_not_found` error. There is no cancellation message, graceful-close requirement, silent reconnect, or replay of the abandoned request.
+
+The lease remains armed through internal `threadline_*` tool execution, the intermediate completion, and every `function_call_output` follow-up. An intermediate completion is not a downstream completion and does not register its response ID. Only after internal-tool handling and the no-observable-output check succeed may an accepted `response.completed` record its marker and disarm protection. That transition occurs before queued synthetic text or the terminal SSE chunk is yielded, while the existing in-use lease continues to protect the entry until its normal completed-chunk release or body drop.
+
+Terminal safety and transport ownership are separate. For a known recoverable failure or close, the live upstream is detached from the lease and registry, prior completed marker metadata remains recoverable, and normal release may proceed. For incomplete, malformed, premature `[DONE]`, nonrecoverable, or internal-tool/no-output failure, the existing terminal invalidation applies. Clearing the stream and released-lease upstream references is sufficient to release production ownership; the pump may finish shutting down on a later scheduler turn, and registry safety does not wait for that physical shutdown.
+
+An older completed response body is inert after its lease has released. It must not retain a strong upstream reference that can keep a later abandoned turn alive, and dropping it must not invalidate or unlock a newer active lease. Conversely, an idle upstream close observed after successful completion does not invalidate the old response marker.
 
 ## WebSocket pump ownership
 
@@ -185,6 +200,8 @@ If a later upstream turn ends with a recoverable `response.failed`, preserve any
 If the socket is closed but recoverable metadata exists, attempt recovery or reconnect according to the current protocol implementation for recoverable metadata cases other than ordinary downstream `previous_response_id` continuation where that marker no longer has an open retained upstream.
 
 If the first upstream send for that continued turn fails before any upstream event is observed, or if the retained upstream closes before the first upstream event arrives, surface the stable downstream `previous_response_not_found` replay signal instead of reconnecting and resending the same marker.
+
+If a continued turn was abandoned after its initial send began, its entry and aliases have already been removed synchronously. A subsequent ordinary request therefore receives `previous_response_not_found` without reconnecting or sending another upstream `response.create`.
 
 If recovery fails, return a stable error and keep enough diagnostic information for logs.
 

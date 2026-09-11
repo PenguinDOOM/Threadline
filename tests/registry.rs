@@ -62,6 +62,88 @@ async fn active_lease_still_conflicts() {
 }
 
 #[tokio::test]
+async fn armed_lease_drop_invalidates_all_markers_and_releases_capacity() {
+    let registry = RetainedSessionRegistry::new(1);
+    let mut lease = registry.acquire_new().await.expect("create session");
+    lease.record_completed_marker("response-1").await;
+    lease.record_completed_marker("response-2").await;
+    lease.arm_active_turn();
+
+    drop(lease);
+
+    for marker in ["response-1", "response-2"] {
+        let error = registry
+            .acquire_previous(marker)
+            .await
+            .expect_err("abandoned marker must be removed");
+        assert_eq!(error, RegistryAcquireError::PreviousResponseNotFound);
+    }
+    registry
+        .acquire_new()
+        .await
+        .expect("abandoned entry must release capacity");
+}
+
+#[tokio::test]
+async fn armed_lease_release_invalidates_all_markers_and_later_drop_is_inert() {
+    let registry = RetainedSessionRegistry::new(1);
+    let mut lease = registry.acquire_new().await.expect("create session");
+    lease.record_completed_marker("response-1").await;
+    lease.record_completed_marker("response-2").await;
+    lease.arm_active_turn();
+    lease.release();
+
+    for marker in ["response-1", "response-2"] {
+        assert_eq!(
+            registry
+                .acquire_previous(marker)
+                .await
+                .expect_err("abandoned marker must be removed"),
+            RegistryAcquireError::PreviousResponseNotFound
+        );
+    }
+
+    let replacement = registry.acquire_new().await.expect("capacity released");
+    drop(lease);
+    drop(replacement);
+}
+
+#[tokio::test]
+async fn armed_lease_detach_then_drop_still_invalidates_markers() {
+    let registry = RetainedSessionRegistry::new(1);
+    let mut lease = registry.acquire_new().await.expect("create session");
+    lease.record_completed_marker("response-1").await;
+    lease.arm_active_turn();
+    lease.detach_upstream_recoverably();
+
+    drop(lease);
+
+    assert_eq!(
+        registry
+            .acquire_previous("response-1")
+            .await
+            .expect_err("detached active turn must remain non-reusable"),
+        RegistryAcquireError::PreviousResponseNotFound
+    );
+}
+
+#[tokio::test]
+async fn finalized_recoverable_turn_preserves_marker_without_a_live_upstream() {
+    let registry = RetainedSessionRegistry::new(1);
+    let mut lease = registry.acquire_new().await.expect("create session");
+    lease.record_completed_marker("response-1").await;
+    lease.arm_active_turn();
+    lease.finalize_recoverable_turn();
+    lease.release();
+
+    let recovered = registry
+        .acquire_previous("response-1")
+        .await
+        .expect("known terminal failure must preserve the prior marker");
+    assert!(!recovered.has_live_upstream());
+}
+
+#[tokio::test]
 async fn missing_previous_response_marker_returns_not_found() {
     let registry = RetainedSessionRegistry::new(2);
 

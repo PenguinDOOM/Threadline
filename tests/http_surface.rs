@@ -565,7 +565,7 @@ async fn responses_endpoint_allows_raw_gpt_5_6_main_compatibility_ids_for_reason
 }
 
 #[tokio::test]
-async fn responses_endpoint_rejects_astra_reasoning_all_turns_before_auth_or_upstream() {
+async fn responses_endpoint_allows_astra_main_reasoning_all_turns_to_reach_existing_auth_path() {
     for model_id in ASTRA_MAIN_MODEL_IDS {
         let app = build_router_with_services(
             ThreadlineConfig::default(),
@@ -586,12 +586,14 @@ async fn responses_endpoint_rejects_astra_reasoning_all_turns_before_auth_or_ups
 
         assert_eq!(
             response.status(),
-            StatusCode::BAD_REQUEST,
+            StatusCode::INTERNAL_SERVER_ERROR,
             "model_id={model_id}"
         );
 
         let payload = read_json_body(response).await;
-        assert_unsupported_reasoning_context_error(&payload);
+        assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
+        assert_eq!(payload["error"]["type"], "configuration_error");
+        assert_ne!(payload["error"]["code"], "unsupported_reasoning_context");
     }
 }
 
