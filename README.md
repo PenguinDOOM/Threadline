@@ -54,6 +54,8 @@ Threadline reads configuration from CLI flags or environment variables.
 | `--profile` | `THREADLINE_PROFILE` | `main` | Route profile for this listener. Use `main` for retained-session routes and `utility` for stateless utility-only model aliases. |
 | `--codex-client-version` | `THREADLINE_CODEX_CLIENT_VERSION` | `0.136.0` | Codex client version Threadline sends to the upstream backend for compatibility. |
 | `--retained-session-capacity` | `THREADLINE_RETAINED_SESSION_CAPACITY` | `64` | Maximum number of retained sessions kept available for response continuation. |
+| `--upstream-inbound-max-messages` | `THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES` | `256` | Maximum number of queued upstream Text/Binary messages per connection. Accepted range: `1..=65536`. |
+| `--upstream-inbound-max-bytes` | `THREADLINE_UPSTREAM_INBOUND_MAX_BYTES` | `16777216` | Maximum queued upstream payload bytes per connection after UTF-8 conversion. Accepted range: `1..=67108864`. |
 | `--jobs-enabled` | `THREADLINE_JOBS_ENABLED` | `false` | Enables local job execution support for long-running work. |
 | `--persistent-reasoning-enabled` | `THREADLINE_PERSISTENT_REASONING_ENABLED` | `false` | Enables server-side persistent reasoning for eligible Main model requests. When enabled, eligible Main requests automatically receive `reasoning.context=all_turns`. |
 | `--job-output-buffer-limit-bytes` | `THREADLINE_JOB_OUTPUT_BUFFER_LIMIT_BYTES` | `32768` | Maximum in-memory buffered job output before older output is dropped. |
@@ -62,6 +64,12 @@ Threadline reads configuration from CLI flags or environment variables.
 | `--log-level` | `THREADLINE_LOG_LEVEL` | `info` | Threadline log verbosity. Supported Rust tracing levels include `error`, `warn`, `info`, `debug`, and `trace`. |
 
 Threadline does not accept an arbitrary model override through CLI flags or environment variables.
+
+The upstream inbound limits are applied independently to each upstream WebSocket connection. They are immutable for the lifetime of that connection. Values are validated at startup; zero, negative, non-numeric, and out-of-range values are rejected rather than clamped or treated as unlimited. The defaults are finite policy defaults, not performance benchmarks. Very small values can reject otherwise ordinary upstream output, so tune them deliberately within the supported ranges.
+
+These limits bound queued upstream message count and converted UTF-8 payload bytes. They are not a process-wide memory or RSS limit, and they do not bound the downstream SSE stream, outbound queue, payload allocation and conversion working space, or allocator and transport overhead. Binary payloads use lossy UTF-8 conversion for queue accounting. The production connector also applies the byte limit to WebSocket message size and uses a frame limit of `max(bytes, 125)`; callers that provide an already-created stream remain responsible for its transport configuration.
+
+If the next data message cannot fit either limit, Threadline records a sticky terminal overflow and stops the upstream pump without waiting for a graceful close handshake or a downstream consumer. It does not discard older events, reconnect, or replay the request to continue. While the queue is exactly full, a Ping can still be processed; overflow occurs on the first non-fitting data message. The public failure is HTTP 502 with `type=server_error`, code `upstream_inbound_buffer_overflow`, and the fixed message `The upstream websocket inbound buffer overflowed.`. Before SSE headers this is a JSON error; after streaming begins it is emitted as one `response.failed` followed by one `[DONE]` when the downstream observes the terminal state. The error does not include payload contents or size diagnostics.
 
 ## Main And Utility Startup
 

@@ -31,7 +31,7 @@ use threadline::models::RouteProfile;
 use threadline::responses::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
 };
-use threadline::ws_pump::LiveUpstreamWebSocket;
+use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits};
 
 #[derive(Clone)]
 struct StaticAuthProvider;
@@ -57,6 +57,7 @@ struct RecordingConnector {
     sessions: Arc<Mutex<Vec<UpstreamSessionDescriptor>>>,
     requested_sessions: Arc<Mutex<Vec<Option<UpstreamSessionDescriptor>>>>,
     websockets: Arc<Mutex<Vec<Weak<LiveUpstreamWebSocket>>>>,
+    inbound_limits: UpstreamInboundLimits,
 }
 
 impl RecordingConnector {
@@ -66,6 +67,17 @@ impl RecordingConnector {
             sessions: Arc::new(Mutex::new(Vec::new())),
             requested_sessions: Arc::new(Mutex::new(Vec::new())),
             websockets: Arc::new(Mutex::new(Vec::new())),
+            inbound_limits: UpstreamInboundLimits::DEFAULT,
+        }
+    }
+
+    fn with_inbound_limits(
+        plans: Vec<PlannedConnection>,
+        inbound_limits: UpstreamInboundLimits,
+    ) -> Self {
+        Self {
+            inbound_limits,
+            ..Self::new(plans)
         }
     }
 
@@ -92,6 +104,7 @@ impl UpstreamConnector for RecordingConnector {
         let sessions = Arc::clone(&self.sessions);
         let requested_sessions = Arc::clone(&self.requested_sessions);
         let websockets = Arc::clone(&self.websockets);
+        let inbound_limits = self.inbound_limits;
         Box::pin(async move {
             requested_sessions.lock().await.push(session.clone());
             let session = session.unwrap_or_else(new_session_descriptor);
@@ -106,13 +119,76 @@ impl UpstreamConnector for RecordingConnector {
                 .await
                 .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
 
-            let websocket = Arc::new(LiveUpstreamWebSocket::from_stream(stream));
+            let websocket = Arc::new(LiveUpstreamWebSocket::from_stream_with_limits(
+                stream,
+                inbound_limits,
+            ));
             websockets.lock().await.push(Arc::downgrade(&websocket));
 
             Ok(ConnectedUpstream {
                 websocket,
                 session,
                 turn_state: plan.turn_state,
+            })
+        })
+    }
+}
+
+#[derive(Clone)]
+struct OverflowBeforeFirstSendConnector {
+    server: Arc<ScriptedWebSocketServer>,
+    sessions: Arc<Mutex<Vec<UpstreamSessionDescriptor>>>,
+    inbound_limits: UpstreamInboundLimits,
+}
+
+impl OverflowBeforeFirstSendConnector {
+    fn new(server: Arc<ScriptedWebSocketServer>, inbound_limits: UpstreamInboundLimits) -> Self {
+        Self {
+            server,
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            inbound_limits,
+        }
+    }
+
+    async fn recorded_sessions(&self) -> Vec<UpstreamSessionDescriptor> {
+        self.sessions.lock().await.clone()
+    }
+}
+
+impl UpstreamConnector for OverflowBeforeFirstSendConnector {
+    fn connect(
+        &self,
+        _auth: LoadedUpstreamAuth,
+        session: Option<UpstreamSessionDescriptor>,
+    ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+        let server = Arc::clone(&self.server);
+        let sessions = Arc::clone(&self.sessions);
+        let inbound_limits = self.inbound_limits;
+        Box::pin(async move {
+            let session = session.unwrap_or_else(new_session_descriptor);
+            sessions.lock().await.push(session.clone());
+            let (stream, _) = connect_async(server.url())
+                .await
+                .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
+            let websocket = Arc::new(LiveUpstreamWebSocket::from_stream_with_limits(
+                stream,
+                inbound_limits,
+            ));
+
+            server
+                .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+                .await;
+            server
+                .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+                .await;
+            timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+                .await
+                .expect("overflow should close the pump before connector return");
+
+            Ok(ConnectedUpstream {
+                websocket,
+                session,
+                turn_state: None,
             })
         })
     }
@@ -7275,6 +7351,892 @@ async fn completed_only_assistant_output_text_is_synthesized_as_delta() {
     assert_eq!(capture.downstream_events[1].event, "response.completed");
     assert_eq!(capture.downstream_events[1].payload, completed_event);
     assert_eq!(capture.done_frame, "data: [DONE]");
+}
+
+#[tokio::test]
+async fn stalled_fresh_body_overflow_closes_pump_before_failure_is_polled() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"overflow"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("response.create");
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("overflow should close the upstream pump without polling the body");
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read stalled body after overflow");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert!(body_text.contains("event: response.failed"));
+    assert!(body_text.contains("upstream_inbound_buffer_overflow"));
+    assert!(body_text.contains("data: [DONE]"));
+    assert!(!body_text.contains("event: response.completed"));
+    assert!(!body_text.contains("first"));
+}
+
+#[tokio::test]
+async fn stalled_continued_body_overflow_closes_pump_before_first_event_is_polled() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let continued = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"continued overflow",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(continued.status(), StatusCode::OK);
+    let continued_request: Value = serde_json::from_str(&message_text(
+        server
+            .recv_client_message()
+            .await
+            .expect("continued request"),
+    ))
+    .expect("continued request json");
+    assert_eq!(continued_request["previous_response_id"], "response-1");
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("overflow should close the continued pump before polling its body");
+
+    let body = to_bytes(continued.into_body(), usize::MAX)
+        .await
+        .expect("read continued body after overflow");
+    let body_text = String::from_utf8(body.to_vec()).expect("continued body utf8");
+    assert_eq!(body_text.matches("event: response.failed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(body_text.contains("upstream_inbound_buffer_overflow"));
+    assert!(!body_text.contains("event: response.completed"));
+    assert!(!body_text.contains("first"));
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+}
+
+#[tokio::test]
+async fn dropping_stalled_active_body_after_overflow_invalidates_marker_without_resume() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"active overflow",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("active request");
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("overflow should close the active pump before body drop");
+
+    drop(active);
+
+    let rejected = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"replay",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body = to_bytes(rejected.into_body(), usize::MAX)
+        .await
+        .expect("dropped marker body");
+    let rejected_payload: Value =
+        serde_json::from_slice(&rejected_body).expect("dropped marker json");
+    assert_eq!(
+        rejected_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
+async fn overflow_before_final_completion_acceptance_fails_and_invalidates_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("response.create");
+    server
+        .send_text(&assistant_text_completed_event("response-final", "final answer").to_string())
+        .await;
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"overflow"}"#)
+        .await;
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("overflow should close the pump before completion acceptance");
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("overflow body");
+    let body_text = String::from_utf8(body.to_vec()).expect("overflow body utf8");
+    assert_eq!(body_text.matches("event: response.failed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(body_text.contains("upstream_inbound_buffer_overflow"));
+    assert!(!body_text.contains("event: response.completed"));
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-final"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("invalidated marker body");
+    let resumed_payload: Value =
+        serde_json::from_slice(&resumed_body).expect("invalidated marker json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
+async fn overflow_after_synthetic_delta_discards_queued_forwarded_event_before_failure() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"queued output"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("response.create");
+    server
+        .send_text(
+            r#"{"type":"response.output_text.done","text":"old queued output","response_id":"response-queued"}"#,
+        )
+        .await;
+
+    let mut body = response.into_body().into_data_stream();
+    let synthetic_delta = next_body_chunk(&mut body).await;
+    let synthetic_delta_text = String::from_utf8(synthetic_delta.to_vec()).expect("delta utf8");
+    assert!(synthetic_delta_text.contains("event: response.output_text.delta"));
+
+    server
+        .send_text_burst(&[
+            r#"{"type":"response.output_text.delta","delta":"first"}"#,
+            r#"{"type":"response.output_text.delta","delta":"overflow"}"#,
+        ])
+        .await;
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("overflow should close the pump before queued output is forwarded");
+
+    let failed = next_body_chunk(&mut body).await;
+    let failed_text = String::from_utf8(failed.to_vec()).expect("failure utf8");
+    assert!(failed_text.contains("event: response.failed"));
+    assert!(failed_text.contains("upstream_inbound_buffer_overflow"));
+    assert!(!failed_text.contains("response.output_text.done"));
+    let done = next_body_chunk(&mut body).await;
+    assert_eq!(
+        String::from_utf8(done.to_vec()).expect("done utf8"),
+        "data: [DONE]\n\n"
+    );
+    assert!(body.next().await.is_none());
+}
+
+#[tokio::test]
+async fn overflow_after_final_completion_acceptance_preserves_single_success_then_rejects_reuse() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("response.create");
+    server
+        .send_text(&assistant_text_completed_event("response-final", "final answer").to_string())
+        .await;
+
+    let mut body = response.into_body().into_data_stream();
+    let synthetic_delta = next_body_chunk(&mut body).await;
+    assert!(
+        String::from_utf8(synthetic_delta.to_vec())
+            .expect("synthetic delta utf8")
+            .contains("response.output_text.delta")
+    );
+
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("overflow should close the accepted final pump");
+
+    let completed = next_body_chunk(&mut body).await;
+    let completed_text = String::from_utf8(completed.to_vec()).expect("completed chunk utf8");
+    assert!(completed_text.contains("event: response.completed"));
+    let done = next_body_chunk(&mut body).await;
+    assert_eq!(
+        String::from_utf8(done.to_vec()).expect("done chunk utf8"),
+        "data: [DONE]\n\n"
+    );
+    assert!(body.next().await.is_none());
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-final"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::BAD_GATEWAY);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("overflow marker body");
+    let resumed_payload: Value =
+        serde_json::from_slice(&resumed_body).expect("overflow marker json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "upstream_inbound_buffer_overflow"
+    );
+}
+
+#[tokio::test]
+async fn queued_final_completion_survives_normal_close_before_body_polling() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("response.create");
+    server
+        .send_text(&assistant_text_completed_event("response-final", "final answer").to_string())
+        .await;
+    server.send_close(1000, "complete").await;
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("normal close should be observed before body polling");
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("completed body after normal close");
+    let body_text = String::from_utf8(body.to_vec()).expect("completed body utf8");
+    assert_eq!(body_text.matches("event: response.completed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(!body_text.contains("event: response.failed"));
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-final"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("normal close marker body");
+    let resumed_payload: Value =
+        serde_json::from_slice(&resumed_body).expect("normal close marker json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
+async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry_capacity() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let replacement_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&retained_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&replacement_server),
+                turn_state: None,
+            },
+        ],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    for (previous_response_id, response_id) in
+        [(None, "response-1"), (Some("response-1"), "response-2")]
+    {
+        let mut payload = json!({"model":"gpt-5.4","input":"completed turn"});
+        if let Some(previous_response_id) = previous_response_id {
+            payload["previous_response_id"] = Value::String(previous_response_id.to_string());
+        }
+        let response = post_responses(app.clone(), payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = retained_server
+            .recv_client_message()
+            .await
+            .expect("completed turn request");
+        retained_server
+            .send_text(&assistant_text_completed_event(response_id, "completed turn").to_string())
+            .await;
+        let _ = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("completed turn body");
+    }
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"overflow active turn",
+            "previous_response_id":"response-2"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("active request");
+    retained_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    retained_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+    timeout(
+        Duration::from_secs(1),
+        retained_server.wait_for_client_disconnect(),
+    )
+    .await
+    .expect("overflow should close the retained pump");
+
+    let conflict = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"conflicting overflow acquire",
+            "previous_response_id":"response-2"
+        }),
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict_body = to_bytes(conflict.into_body(), usize::MAX)
+        .await
+        .expect("conflict body");
+    let conflict_payload: Value = serde_json::from_slice(&conflict_body).expect("conflict json");
+    assert_eq!(
+        conflict_payload["error"]["code"],
+        "retained_session_conflict"
+    );
+
+    let active_body = to_bytes(active.into_body(), usize::MAX)
+        .await
+        .expect("active overflow body");
+    assert!(
+        String::from_utf8(active_body.to_vec())
+            .expect("utf8 body")
+            .contains("upstream_inbound_buffer_overflow")
+    );
+
+    for marker in ["response-1", "response-2"] {
+        let rejected = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"rejected alias",
+                "previous_response_id": marker
+            }),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .expect("rejected alias body");
+        let payload: Value = serde_json::from_slice(&body).expect("rejected alias json");
+        assert_eq!(payload["error"]["code"], "previous_response_not_found");
+    }
+
+    let replacement = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"replacement session"}),
+    )
+    .await;
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let _ = replacement_server
+        .recv_client_message()
+        .await
+        .expect("replacement request");
+    drop(replacement);
+    assert_eq!(connector.recorded_sessions().await.len(), 2);
+}
+
+#[tokio::test]
+async fn fresh_first_send_overflow_returns_fixed_error_without_a_retry() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = OverflowBeforeFirstSendConnector::new(
+        Arc::clone(&server),
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"fresh overflow"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("fresh overflow body");
+    let payload: Value = serde_json::from_slice(&body).expect("fresh overflow json");
+    assert_eq!(payload["error"]["code"], "upstream_inbound_buffer_overflow");
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn continued_preflight_overflow_returns_fixed_error_without_reconnect_or_replay() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&retained_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&unexpected_reconnect_server),
+                turn_state: None,
+            },
+        ],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed request");
+    retained_server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    retained_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    retained_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+    timeout(
+        Duration::from_secs(1),
+        retained_server.wait_for_client_disconnect(),
+    )
+    .await
+    .expect("idle overflow should close the retained pump");
+
+    let response = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"continued overflow",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("continued overflow body");
+    let payload: Value = serde_json::from_slice(&body).expect("continued overflow json");
+    assert_eq!(payload["error"]["code"], "upstream_inbound_buffer_overflow");
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        timeout(
+            Duration::from_millis(100),
+            unexpected_reconnect_server.recv_client_message(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        retained_server
+            .take_pending_client_messages()
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn idle_overflow_repeats_for_all_aliases_detaches_live_handle_and_evicts_normally() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let replacement_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&retained_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&replacement_server),
+                turn_state: None,
+            },
+        ],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    for (previous_response_id, response_id) in
+        [(None, "response-1"), (Some("response-1"), "response-2")]
+    {
+        let mut payload = json!({"model":"gpt-5.4","input":"completed turn"});
+        if let Some(previous_response_id) = previous_response_id {
+            payload["previous_response_id"] = Value::String(previous_response_id.to_string());
+        }
+        let response = post_responses(app.clone(), payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = retained_server
+            .recv_client_message()
+            .await
+            .expect("completed turn request");
+        retained_server
+            .send_text(&assistant_text_completed_event(response_id, "completed turn").to_string())
+            .await;
+        let _ = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("completed turn body");
+    }
+    let retained_handle = connector.recorded_websockets().await.remove(0);
+
+    retained_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    retained_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+    timeout(
+        Duration::from_secs(1),
+        retained_server.wait_for_client_disconnect(),
+    )
+    .await
+    .expect("idle overflow should close the retained pump");
+
+    for marker in ["response-1", "response-2", "response-1", "response-2"] {
+        let rejected = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"idle overflow alias",
+                "previous_response_id": marker
+            }),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .expect("idle overflow body");
+        let payload: Value = serde_json::from_slice(&body).expect("idle overflow json");
+        assert_eq!(payload["error"]["code"], "upstream_inbound_buffer_overflow");
+    }
+    assert!(retained_handle.upgrade().is_none());
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        retained_server
+            .take_pending_client_messages()
+            .await
+            .is_empty()
+    );
+
+    let replacement = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"replacement session"}),
+    )
+    .await;
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let _ = replacement_server
+        .recv_client_message()
+        .await
+        .expect("replacement request");
+    drop(replacement);
+    assert_eq!(connector.recorded_sessions().await.len(), 2);
+
+    for marker in ["response-1", "response-2"] {
+        let evicted = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"evicted alias",
+                "previous_response_id": marker
+            }),
+        )
+        .await;
+        assert_eq!(evicted.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(evicted.into_body(), usize::MAX)
+            .await
+            .expect("evicted alias body");
+        let payload: Value = serde_json::from_slice(&body).expect("evicted alias json");
+        assert_eq!(payload["error"]["code"], "previous_response_not_found");
+    }
+}
+
+#[tokio::test]
+async fn auxiliary_summary_overflow_is_transient_and_leaves_retained_capacity_available() {
+    let summary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let ordinary_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&summary_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&ordinary_server),
+                turn_state: None,
+            },
+        ],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let summary = post_responses(app.clone(), auxiliary_summary_request(None)).await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let _ = summary_server
+        .recv_client_message()
+        .await
+        .expect("summary request");
+    summary_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    summary_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+    timeout(
+        Duration::from_secs(1),
+        summary_server.wait_for_client_disconnect(),
+    )
+    .await
+    .expect("summary overflow should close the transient pump");
+
+    let body = to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .expect("summary overflow body");
+    let body_text = String::from_utf8(body.to_vec()).expect("summary utf8 body");
+    assert!(body_text.contains("event: response.failed"));
+    assert!(body_text.contains("upstream_inbound_buffer_overflow"));
+    assert!(!body_text.contains("event: response.completed"));
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        summary_server
+            .take_pending_client_messages()
+            .await
+            .is_empty()
+    );
+
+    let ordinary = post_responses(app, json!({"model":"gpt-5.4","input":"ordinary"})).await;
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    let _ = ordinary_server
+        .recv_client_message()
+        .await
+        .expect("ordinary request");
+    drop(ordinary);
+    assert_eq!(connector.recorded_sessions().await.len(), 2);
+}
+
+#[tokio::test]
+async fn utility_overflow_is_transient_and_does_not_retry_the_connection() {
+    let utility_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let next_utility_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&utility_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&next_utility_server),
+                turn_state: None,
+            },
+        ],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let response = post_responses(
+        app.clone(),
+        json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = utility_server
+        .recv_client_message()
+        .await
+        .expect("utility request");
+    utility_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
+        .await;
+    utility_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .await;
+    timeout(
+        Duration::from_secs(1),
+        utility_server.wait_for_client_disconnect(),
+    )
+    .await
+    .expect("utility overflow should close the transient pump");
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("utility overflow body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utility utf8 body");
+    assert!(body_text.contains("event: response.failed"));
+    assert!(body_text.contains("upstream_inbound_buffer_overflow"));
+    assert!(!body_text.contains("event: response.completed"));
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        utility_server
+            .take_pending_client_messages()
+            .await
+            .is_empty()
+    );
+
+    let next = post_responses(
+        app,
+        json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility retry"}),
+    )
+    .await;
+    assert_eq!(next.status(), StatusCode::OK);
+    let _ = next_utility_server
+        .recv_client_message()
+        .await
+        .expect("next utility request");
+    drop(next);
+    assert_eq!(connector.recorded_sessions().await.len(), 2);
 }
 
 #[tokio::test]

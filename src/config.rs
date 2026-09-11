@@ -6,6 +6,10 @@ use clap::{Args, Parser};
 
 use crate::jobs::ThreadlineJobManagerConfig;
 use crate::models::RouteProfile;
+use crate::ws_pump::{
+    DEFAULT_UPSTREAM_INBOUND_MAX_BYTES, DEFAULT_UPSTREAM_INBOUND_MAX_MESSAGES,
+    MAX_UPSTREAM_INBOUND_MAX_BYTES, MAX_UPSTREAM_INBOUND_MAX_MESSAGES, UpstreamInboundLimits,
+};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8100;
@@ -84,6 +88,28 @@ pub struct ThreadlineConfig {
 
     #[arg(
         long,
+        env = "THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES",
+        default_value_t = DEFAULT_UPSTREAM_INBOUND_MAX_MESSAGES,
+        value_parser = parse_upstream_inbound_max_messages,
+        value_name = "COUNT",
+        help = "Maximum queued upstream inbound messages per connection.",
+        long_help = "Maximum queued upstream inbound messages per connection. Reaching this limit rejects the next inbound data message; very small values can reject ordinary responses."
+    )]
+    pub upstream_inbound_max_messages: usize,
+
+    #[arg(
+        long,
+        env = "THREADLINE_UPSTREAM_INBOUND_MAX_BYTES",
+        default_value_t = DEFAULT_UPSTREAM_INBOUND_MAX_BYTES,
+        value_parser = parse_upstream_inbound_max_bytes,
+        value_name = "BYTES",
+        help = "Maximum queued upstream inbound UTF-8 payload bytes per connection.",
+        long_help = "Maximum queued upstream inbound UTF-8 payload bytes per connection. Reaching this limit rejects the next inbound data message; very small values can reject ordinary responses."
+    )]
+    pub upstream_inbound_max_bytes: usize,
+
+    #[arg(
+        long,
         env = "THREADLINE_JOBS_ENABLED",
         default_value_t = DEFAULT_JOBS_ENABLED,
         value_name = "BOOL",
@@ -150,6 +176,8 @@ impl Default for ThreadlineConfig {
             profile: DEFAULT_PROFILE,
             codex_client_version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
             retained_session_capacity: DEFAULT_RETAINED_SESSION_CAPACITY,
+            upstream_inbound_max_messages: DEFAULT_UPSTREAM_INBOUND_MAX_MESSAGES,
+            upstream_inbound_max_bytes: DEFAULT_UPSTREAM_INBOUND_MAX_BYTES,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
             persistent_reasoning_enabled: DEFAULT_PERSISTENT_REASONING_ENABLED,
             job_output_buffer_limit_bytes: DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,
@@ -176,6 +204,13 @@ impl ThreadlineConfig {
 
     pub fn persistent_reasoning_enabled_for_profile(&self) -> bool {
         self.profile == RouteProfile::Main && self.persistent_reasoning_enabled
+    }
+
+    pub fn upstream_inbound_limits(&self) -> Result<UpstreamInboundLimits, &'static str> {
+        UpstreamInboundLimits::new(
+            self.upstream_inbound_max_messages,
+            self.upstream_inbound_max_bytes,
+        )
     }
 
     pub fn job_manager_config(&self) -> ThreadlineJobManagerConfig {
@@ -235,6 +270,25 @@ fn read_u64_env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn parse_upstream_inbound_max_messages(value: &str) -> Result<usize, String> {
+    parse_bounded_usize(value, 1, MAX_UPSTREAM_INBOUND_MAX_MESSAGES)
+}
+
+fn parse_upstream_inbound_max_bytes(value: &str) -> Result<usize, String> {
+    parse_bounded_usize(value, 1, MAX_UPSTREAM_INBOUND_MAX_BYTES)
+}
+
+fn parse_bounded_usize(value: &str, minimum: usize, maximum: usize) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("must be an integer between {minimum} and {maximum}"))?;
+    if (minimum..=maximum).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(format!("must be between {minimum} and {maximum}"))
+    }
+}
+
 fn split_allowed_commands(value: Option<&str>) -> Vec<String> {
     value
         .into_iter()
@@ -261,11 +315,12 @@ mod tests {
     use crate::cli::ThreadlineCli;
     use crate::models::RouteProfile;
 
-    use super::{DEFAULT_CODEX_CLIENT_VERSION, ThreadlineConfig};
+    use super::{DEFAULT_CODEX_CLIENT_VERSION, ThreadlineConfig, UpstreamInboundLimits};
 
     static THREADLINE_PROFILE_ENV_LOCK: Mutex<()> = Mutex::new(());
     static THREADLINE_PERSISTENT_REASONING_ENABLED_ENV_LOCK: Mutex<()> = Mutex::new(());
     static THREADLINE_UTILITY_PORT_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static THREADLINE_UPSTREAM_INBOUND_LIMITS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct ProfileEnvGuard {
         original: Option<OsString>,
@@ -329,6 +384,37 @@ mod tests {
                 Some(value) => unsafe { std::env::set_var("THREADLINE_UTILITY_PORT", value) },
                 None => unsafe { std::env::remove_var("THREADLINE_UTILITY_PORT") },
             }
+        }
+    }
+
+    struct UpstreamInboundLimitsEnvGuard {
+        messages: Option<OsString>,
+        bytes: Option<OsString>,
+    }
+
+    impl UpstreamInboundLimitsEnvGuard {
+        fn acquire() -> Self {
+            Self {
+                messages: std::env::var_os("THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES"),
+                bytes: std::env::var_os("THREADLINE_UPSTREAM_INBOUND_MAX_BYTES"),
+            }
+        }
+    }
+
+    impl Drop for UpstreamInboundLimitsEnvGuard {
+        fn drop(&mut self) {
+            restore_env_var(
+                "THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES",
+                self.messages.take(),
+            );
+            restore_env_var("THREADLINE_UPSTREAM_INBOUND_MAX_BYTES", self.bytes.take());
+        }
+    }
+
+    fn restore_env_var(name: &str, value: Option<OsString>) {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
         }
     }
 
@@ -406,6 +492,74 @@ mod tests {
     }
 
     #[test]
+    fn upstream_inbound_limits_default_override_and_reject_invalid_ranges() {
+        let _lock = THREADLINE_UPSTREAM_INBOUND_LIMITS_ENV_LOCK
+            .lock()
+            .expect("inbound limits env lock");
+        let default_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(default_config.upstream_inbound_max_messages, 256);
+        assert_eq!(default_config.upstream_inbound_max_bytes, 16 * 1024 * 1024);
+
+        let override_config = ThreadlineCli::try_parse_from([
+            "threadline",
+            "--upstream-inbound-max-messages",
+            "2",
+            "--upstream-inbound-max-bytes",
+            "3",
+        ])
+        .expect("valid override")
+        .server;
+        assert_eq!(
+            override_config.upstream_inbound_limits(),
+            Ok(UpstreamInboundLimits::new(2, 3).unwrap())
+        );
+
+        assert!(
+            ThreadlineCli::try_parse_from(["threadline", "--upstream-inbound-max-messages", "0",])
+                .is_err()
+        );
+        assert!(
+            ThreadlineCli::try_parse_from([
+                "threadline",
+                "--upstream-inbound-max-bytes",
+                "67108865",
+            ])
+            .is_err()
+        );
+        assert!(
+            ThreadlineCli::try_parse_from([
+                "threadline",
+                "--upstream-inbound-max-messages",
+                "not-a-number",
+            ])
+            .is_err()
+        );
+        assert!(
+            ThreadlineCli::try_parse_from(["threadline", "--upstream-inbound-max-bytes", "-1",])
+                .is_err()
+        );
+        assert!(UpstreamInboundLimits::new(0, 1).is_err());
+        assert!(UpstreamInboundLimits::new(1, 0).is_err());
+    }
+
+    #[test]
+    fn upstream_inbound_limits_read_environment_overrides() {
+        let _lock = THREADLINE_UPSTREAM_INBOUND_LIMITS_ENV_LOCK
+            .lock()
+            .expect("inbound limits env lock");
+        let _guard = UpstreamInboundLimitsEnvGuard::acquire();
+        unsafe {
+            std::env::set_var("THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES", "7");
+            std::env::set_var("THREADLINE_UPSTREAM_INBOUND_MAX_BYTES", "11");
+        }
+
+        let config = ThreadlineCli::parse_from(["threadline"]).server;
+
+        assert_eq!(config.upstream_inbound_max_messages, 7);
+        assert_eq!(config.upstream_inbound_max_bytes, 11);
+    }
+
+    #[test]
     fn cli_flag_help_describes_supported_configuration() {
         let command = ThreadlineCli::command();
 
@@ -418,6 +572,14 @@ mod tests {
             (
                 "retained-session-capacity",
                 &["retained session", "capacity"][..],
+            ),
+            (
+                "upstream-inbound-max-messages",
+                &["upstream", "inbound", "messages"][..],
+            ),
+            (
+                "upstream-inbound-max-bytes",
+                &["upstream", "inbound", "bytes"][..],
             ),
             ("jobs-enabled", &["job", "enable"][..]),
             (

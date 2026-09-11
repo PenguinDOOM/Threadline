@@ -7,8 +7,9 @@ use axum::{Json, Router};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::Value;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::warn;
 
 use crate::auth::{AuthDiscoveryOptions, load_upstream_auth};
@@ -21,7 +22,7 @@ use crate::responses::{
     ConnectedUpstream, DownstreamRequestMetadata, ResponsesRouteState, ThreadlineServices,
     responses_handler,
 };
-use crate::ws_pump::LiveUpstreamWebSocket;
+use crate::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits};
 
 const MODEL_CREATED_UNSPECIFIED: u64 = 0;
 const DEFAULT_UPSTREAM_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
@@ -56,6 +57,9 @@ struct ModelEntry {
 pub fn build_router(config: ThreadlineConfig) -> Router {
     let connector = DefaultUpstreamConnector {
         codex_client_version: config.codex_client_version.clone(),
+        inbound_limits: config
+            .upstream_inbound_limits()
+            .expect("clap validates upstream inbound limits"),
     };
 
     build_router_with_services(
@@ -142,6 +146,7 @@ impl crate::responses::UpstreamAuthProvider for DefaultAuthProvider {
 #[derive(Clone)]
 struct DefaultUpstreamConnector {
     codex_client_version: String,
+    inbound_limits: UpstreamInboundLimits,
 }
 
 impl DefaultUpstreamConnector {
@@ -190,6 +195,14 @@ fn map_upstream_connect_error(error: TungsteniteError) -> ThreadlineError {
     }
 }
 
+fn upstream_websocket_config(inbound_limits: UpstreamInboundLimits) -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(inbound_limits.max_bytes()),
+        max_frame_size: Some(inbound_limits.max_bytes().max(125)),
+        ..WebSocketConfig::default()
+    }
+}
+
 impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
     fn connect(
         &self,
@@ -197,15 +210,18 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
         session: Option<crate::codex_ws::UpstreamSessionDescriptor>,
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
         let codex_client_version = self.codex_client_version.clone();
+        let inbound_limits = self.inbound_limits;
 
         Box::pin(async move {
             let upstream_url = Self::upstream_url();
             let handshake =
                 build_handshake_request(&upstream_url, &auth, &codex_client_version, session)
                     .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
-            let (stream, response) = connect_async(handshake.request)
-                .await
-                .map_err(map_upstream_connect_error)?;
+            let transport_config = upstream_websocket_config(inbound_limits);
+            let (stream, response) =
+                connect_async_with_config(handshake.request, Some(transport_config), false)
+                    .await
+                    .map_err(map_upstream_connect_error)?;
             let turn_state = response
                 .headers()
                 .get(crate::responses::TURN_STATE_HEADER)
@@ -213,7 +229,10 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
                 .map(ToString::to_string);
 
             Ok(ConnectedUpstream {
-                websocket: Arc::new(LiveUpstreamWebSocket::from_stream(stream)),
+                websocket: Arc::new(LiveUpstreamWebSocket::from_stream_with_limits(
+                    stream,
+                    inbound_limits,
+                )),
                 session: handshake.session,
                 turn_state,
             })
@@ -232,6 +251,21 @@ mod tests {
     use crate::responses::DownstreamInteractionType;
 
     static UPSTREAM_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn upstream_websocket_config_sets_message_limit_and_control_frame_floor() {
+        let small = upstream_websocket_config(
+            UpstreamInboundLimits::new(1, 3).expect("valid small limits"),
+        );
+        assert_eq!(small.max_message_size, Some(3));
+        assert_eq!(small.max_frame_size, Some(125));
+
+        let ordinary = upstream_websocket_config(
+            UpstreamInboundLimits::new(2, 512).expect("valid ordinary limits"),
+        );
+        assert_eq!(ordinary.max_message_size, Some(512));
+        assert_eq!(ordinary.max_frame_size, Some(512));
+    }
 
     struct UpstreamUrlEnvGuard {
         original: Option<OsString>,

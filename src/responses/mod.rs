@@ -36,7 +36,8 @@ pub(crate) use self::downstream::DownstreamInteractionType;
 pub(crate) use self::downstream::DownstreamRequestMetadata;
 
 pub use self::upstream::{
-    ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
+    ConnectedUpstream, InternalToolExecutor, ThreadlineServices, UpstreamAuthProvider,
+    UpstreamConnector,
 };
 
 pub const TURN_STATE_HEADER: &str = "x-codex-turn-state";
@@ -178,7 +179,7 @@ pub(crate) async fn responses_handler(
                         apply_session_metadata(&mut upstream_request, lease.session());
                         let mut reconnect_attempted = false;
                         let upstream = if let Some(previous_response_id) = &previous_response_id {
-                            if !lease.has_open_upstream() {
+                            let Some(upstream) = lease.upstream() else {
                                 debug!(
                                     previous_response_id,
                                     session_id = %lease.session().session_id,
@@ -189,6 +190,23 @@ pub(crate) async fn responses_handler(
                                 );
                                 lease.release();
                                 return Err(ThreadlineError::PreviousResponseNotFound);
+                            };
+                            if let Some(error) =
+                                continuation_terminal_error(upstream.terminal_state())
+                            {
+                                if matches!(error, ThreadlineError::UpstreamInboundBufferOverflow) {
+                                    return Err(error);
+                                }
+                                debug!(
+                                    previous_response_id,
+                                    session_id = %lease.session().session_id,
+                                    thread_id = %lease.session().thread_id,
+                                    window_id = %lease.session().window_id,
+                                    stale_reason = "missing_or_closed_upstream",
+                                    "stale_previous_response_requires_client_replay"
+                                );
+                                lease.release();
+                                return Err(error);
                             }
 
                             upstream_request.insert(
@@ -196,9 +214,6 @@ pub(crate) async fn responses_handler(
                                 Value::String(previous_response_id.clone()),
                             );
 
-                            let upstream = lease.upstream().expect(
-                                "open retained upstream must exist for continuation preflight",
-                            );
                             lease.arm_active_turn();
                             if let Err(error) =
                                 send_response_create(&upstream, &upstream_request).await
@@ -221,7 +236,12 @@ pub(crate) async fn responses_handler(
                             }
 
                             tokio::task::yield_now().await;
-                            if upstream.is_closed() {
+                            if let Some(error) =
+                                continuation_terminal_error(upstream.terminal_state())
+                            {
+                                if matches!(error, ThreadlineError::UpstreamInboundBufferOverflow) {
+                                    return Err(error);
+                                }
                                 debug!(
                                     previous_response_id,
                                     session_id = %lease.session().session_id,
@@ -231,7 +251,7 @@ pub(crate) async fn responses_handler(
                                     "stale_previous_response_requires_client_replay"
                                 );
                                 lease.release();
-                                return Err(ThreadlineError::PreviousResponseNotFound);
+                                return Err(error);
                             }
 
                             upstream
@@ -498,6 +518,20 @@ fn rewrite_stale_continuation_first_send_error(error: ThreadlineError) -> Thread
     }
 }
 
+fn continuation_terminal_error(
+    terminal_state: crate::ws_pump::UpstreamTerminalState,
+) -> Option<ThreadlineError> {
+    match terminal_state {
+        crate::ws_pump::UpstreamTerminalState::Open => None,
+        crate::ws_pump::UpstreamTerminalState::Closed(_) => {
+            Some(ThreadlineError::PreviousResponseNotFound)
+        }
+        crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
+            Some(ThreadlineError::UpstreamInboundBufferOverflow)
+        }
+    }
+}
+
 async fn attempt_pre_first_event_reconnect(
     services: &ThreadlineServices,
     lease: &mut RetainedSessionLease,
@@ -602,11 +636,15 @@ async fn ensure_upstream(
     auth: LoadedUpstreamAuth,
 ) -> Result<Arc<LiveUpstreamWebSocket>, ThreadlineError> {
     if let Some(upstream) = lease.upstream() {
-        if !upstream.is_closed() {
-            return Ok(upstream);
+        match upstream.terminal_state() {
+            crate::ws_pump::UpstreamTerminalState::Open => return Ok(upstream),
+            crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
+                return Err(ThreadlineError::UpstreamInboundBufferOverflow);
+            }
+            crate::ws_pump::UpstreamTerminalState::Closed(_) => {
+                lease.detach_upstream_recoverably();
+            }
         }
-
-        lease.detach_upstream_recoverably();
     }
 
     let connected = services
@@ -630,6 +668,9 @@ fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError {
         RegistryAcquireError::RetainedSessionConflict => ThreadlineError::RetainedSessionConflict,
         RegistryAcquireError::RetainedSessionCapacityExceeded => {
             ThreadlineError::RetainedSessionCapacityExceeded
+        }
+        RegistryAcquireError::UpstreamInboundBufferOverflow => {
+            ThreadlineError::UpstreamInboundBufferOverflow
         }
     }
 }
@@ -687,11 +728,14 @@ fn maybe_inject_virtual_tool_summarizer_instruction(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_persistent_reasoning_context, rewrite_stale_continuation_first_send_error,
-        thread_id_from_prompt_cache_key,
+        continuation_terminal_error, normalize_persistent_reasoning_context,
+        rewrite_stale_continuation_first_send_error, thread_id_from_prompt_cache_key,
     };
     use crate::errors::ThreadlineError;
     use crate::models::{ModelAlias, RouteProfile, resolve_request_model_for_profile};
+    use crate::ws_pump::{
+        InboundBufferOverflow, InboundBufferOverflowCause, UpstreamTerminalState,
+    };
     use serde_json::json;
 
     fn persistent_reasoning_alias() -> &'static ModelAlias {
@@ -837,6 +881,23 @@ mod tests {
         assert!(matches!(
             preserved,
             ThreadlineError::InvalidResponsesRequest
+        ));
+    }
+
+    #[test]
+    fn continuation_terminal_snapshot_preserves_overflow_over_closed_stale_mapping() {
+        let overflow = UpstreamTerminalState::InboundBufferOverflow(InboundBufferOverflow {
+            cause: InboundBufferOverflowCause::MessageCount,
+            queued_messages: 1,
+            queued_bytes: 1,
+            incoming_bytes: 1,
+            max_messages: 1,
+            max_bytes: 1,
+        });
+
+        assert!(matches!(
+            continuation_terminal_error(overflow),
+            Some(ThreadlineError::UpstreamInboundBufferOverflow)
         ));
     }
 }

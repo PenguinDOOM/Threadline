@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::codex_ws::UpstreamSessionDescriptor;
-use crate::ws_pump::LiveUpstreamWebSocket;
+use crate::ws_pump::{LiveUpstreamWebSocket, UpstreamTerminalState};
 use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +11,7 @@ pub enum RegistryAcquireError {
     PreviousResponseNotFound,
     RetainedSessionConflict,
     RetainedSessionCapacityExceeded,
+    UpstreamInboundBufferOverflow,
 }
 
 pub struct RetainedSessionRegistry {
@@ -147,13 +148,23 @@ impl RetainedSessionRegistry {
             return Err(RegistryAcquireError::RetainedSessionConflict);
         }
 
-        if entry
-            .upstream
-            .as_ref()
-            .is_some_and(|upstream| upstream.is_closed())
-        {
-            entry.upstream = None;
-            entry.recoverable = true;
+        if !entry.recoverable {
+            return Err(RegistryAcquireError::UpstreamInboundBufferOverflow);
+        }
+
+        if let Some(upstream) = entry.upstream.as_ref() {
+            match upstream.terminal_state() {
+                UpstreamTerminalState::InboundBufferOverflow(_) => {
+                    entry.upstream = None;
+                    entry.recoverable = false;
+                    return Err(RegistryAcquireError::UpstreamInboundBufferOverflow);
+                }
+                UpstreamTerminalState::Closed(_) => {
+                    entry.upstream = None;
+                    entry.recoverable = true;
+                }
+                UpstreamTerminalState::Open => {}
+            }
         }
 
         entry.in_use = true;
@@ -420,5 +431,34 @@ mod tests {
         lease.advance_window_generation().await;
 
         assert_eq!(lease.session().window_id, format!("{thread_id}:1"));
+    }
+
+    #[tokio::test]
+    async fn detached_nonrecoverable_entry_repeats_inbound_overflow_for_its_marker() {
+        let registry = RetainedSessionRegistry::new(1);
+        let mut lease = registry.acquire_new().await.expect("create session");
+        lease.record_completed_marker("response-overflow").await;
+        lease.release();
+
+        {
+            let mut state = registry.inner.lock().expect("registry mutex poisoned");
+            let entry_id = *state
+                .markers
+                .get("response-overflow")
+                .expect("marker should exist");
+            let entry = state
+                .entries
+                .get_mut(&entry_id)
+                .expect("entry should exist");
+            entry.upstream = None;
+            entry.recoverable = false;
+        }
+
+        for _ in 0..2 {
+            assert!(matches!(
+                registry.acquire_previous("response-overflow").await,
+                Err(RegistryAcquireError::UpstreamInboundBufferOverflow)
+            ));
+        }
     }
 }

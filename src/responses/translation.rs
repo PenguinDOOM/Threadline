@@ -95,6 +95,23 @@ impl ResponseStreamLease {
     }
 }
 
+fn discard_unaccepted_queued_output(state: &mut ResponseStreamState) {
+    state.queued_synthetic_output_text_deltas.clear();
+    state.queued_forwarded_event = None;
+}
+
+fn final_completion_acceptance_error(
+    terminal_state: crate::ws_pump::UpstreamTerminalState,
+) -> Option<ThreadlineError> {
+    match terminal_state {
+        crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
+            Some(ThreadlineError::UpstreamInboundBufferOverflow)
+        }
+        crate::ws_pump::UpstreamTerminalState::Open
+        | crate::ws_pump::UpstreamTerminalState::Closed(_) => None,
+    }
+}
+
 const RESPONSES_TRANSLATION_UPSTREAM_EVENT: &str = "responses_translation_upstream_event";
 const RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT: &str =
     "responses_translation_downstream_sse_event";
@@ -1059,6 +1076,32 @@ pub(super) fn response_stream(
 ) -> impl futures_util::Stream<Item = Result<Bytes, Infallible>> {
     stream::unfold(state, |mut state| async move {
         loop {
+            if state.queued_final_completed.is_none()
+                && state.upstream.as_ref().is_some_and(|upstream| {
+                    matches!(
+                        upstream.terminal_state(),
+                        crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_)
+                    )
+                })
+            {
+                let error = ThreadlineError::UpstreamInboundBufferOverflow;
+                let failed_payload = terminal_failed_payload_from_error(None, None, &error);
+                trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                    &failed_payload,
+                    DownstreamTraceAction::Terminal,
+                    None,
+                ));
+                discard_unaccepted_queued_output(&mut state);
+                state.upstream = None;
+                state.lease.mark_upstream_terminal().await;
+                state.lease.release();
+                state.final_done_pending = true;
+                return Some((
+                    Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(&failed_payload)),
+                    state,
+                ));
+            }
+
             if let Some(synthetic_delta) = state.queued_synthetic_output_text_deltas.pop_front() {
                 let event_type = synthetic_delta
                     .payload
@@ -1166,52 +1209,75 @@ pub(super) fn response_stream(
             };
             let next = match upstream_result {
                 Ok(Some(text)) => text,
-                Ok(None) | Err(_) => match try_reconnect_or_terminal_error(&mut state).await {
-                    Ok(Some(reconnected)) => {
-                        state.upstream = Some(reconnected);
-                        continue;
-                    }
-                    Ok(None) => {
-                        let failed_payload = terminal_failed_payload_from_error(
-                            None,
-                            None,
-                            &ThreadlineError::UpstreamWebSocketClosed,
-                        );
-                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                Err(crate::ws_pump::UpstreamWebSocketError::InboundBufferOverflow) => {
+                    let error = ThreadlineError::UpstreamInboundBufferOverflow;
+                    let failed_payload = terminal_failed_payload_from_error(None, None, &error);
+                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                        &failed_payload,
+                        DownstreamTraceAction::Terminal,
+                        None,
+                    ));
+                    discard_unaccepted_queued_output(&mut state);
+                    state.upstream = None;
+                    state.lease.mark_upstream_terminal().await;
+                    state.lease.release();
+                    state.final_done_pending = true;
+                    return Some((
+                        Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
                             &failed_payload,
-                            DownstreamTraceAction::Terminal,
-                            None,
-                        ));
-                        state.upstream = None;
-                        state.lease.finalize_recoverable_turn();
-                        state.lease.release();
-                        state.final_done_pending = true;
-                        return Some((
-                            Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                        )),
+                        state,
+                    ));
+                }
+                Ok(None) | Err(crate::ws_pump::UpstreamWebSocketError::OutboundQueueClosed) => {
+                    match try_reconnect_or_terminal_error(&mut state).await {
+                        Ok(Some(reconnected)) => {
+                            state.upstream = Some(reconnected);
+                            continue;
+                        }
+                        Ok(None) => {
+                            let failed_payload = terminal_failed_payload_from_error(
+                                None,
+                                None,
+                                &ThreadlineError::UpstreamWebSocketClosed,
+                            );
+                            trace_downstream_sse_event(&downstream_sse_trace_metadata(
                                 &failed_payload,
-                            )),
-                            state,
-                        ));
-                    }
-                    Err(error) => {
-                        let failed_payload = terminal_failed_payload_from_error(None, None, &error);
-                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
-                            &failed_payload,
-                            DownstreamTraceAction::Terminal,
-                            None,
-                        ));
-                        state.upstream = None;
-                        state.lease.mark_upstream_terminal().await;
-                        state.lease.release();
-                        state.final_done_pending = true;
-                        return Some((
-                            Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                DownstreamTraceAction::Terminal,
+                                None,
+                            ));
+                            state.upstream = None;
+                            state.lease.finalize_recoverable_turn();
+                            state.lease.release();
+                            state.final_done_pending = true;
+                            return Some((
+                                Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                    &failed_payload,
+                                )),
+                                state,
+                            ));
+                        }
+                        Err(error) => {
+                            let failed_payload =
+                                terminal_failed_payload_from_error(None, None, &error);
+                            trace_downstream_sse_event(&downstream_sse_trace_metadata(
                                 &failed_payload,
-                            )),
-                            state,
-                        ));
+                                DownstreamTraceAction::Terminal,
+                                None,
+                            ));
+                            state.upstream = None;
+                            state.lease.mark_upstream_terminal().await;
+                            state.lease.release();
+                            state.final_done_pending = true;
+                            return Some((
+                                Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                    &failed_payload,
+                                )),
+                                state,
+                            ));
+                        }
                     }
-                },
+                }
             };
 
             state.upstream_event_seen = true;
@@ -1286,7 +1352,7 @@ pub(super) fn response_stream(
                 };
 
                 if let Some(call) = internal_tool_call {
-                    match call.execute() {
+                    match state.services.execute_internal_tool(call).await {
                         Ok(output) => {
                             if state
                                 .pending_internal_outputs
@@ -1539,6 +1605,27 @@ pub(super) fn response_stream(
                         ));
                     }
 
+                    if let Some(error) = state.upstream.as_ref().and_then(|upstream| {
+                        final_completion_acceptance_error(upstream.terminal_state())
+                    }) {
+                        let failed_payload = terminal_failed_payload_from_error(
+                            parsed.get("response"),
+                            response_id.as_deref(),
+                            &error,
+                        );
+                        discard_unaccepted_queued_output(&mut state);
+                        state.upstream = None;
+                        state.lease.mark_upstream_terminal().await;
+                        state.lease.release();
+                        state.final_done_pending = true;
+                        return Some((
+                            Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                &failed_payload,
+                            )),
+                            state,
+                        ));
+                    }
+
                     if let Some(response_id) = response_id.as_deref() {
                         state.lease.record_completed_marker_and_disarm(response_id);
                     } else {
@@ -1744,7 +1831,13 @@ mod tests {
         RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT, RESPONSES_TRANSLATION_EVENT_SUPPRESSED,
         RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD, RESPONSES_TRANSLATION_UPSTREAM_EVENT,
         UpstreamEventTraceMetadata, VisibleAssistantText, VisibleTextSourceKey,
-        downstream_sse_trace_metadata, sanitized_completed_event_with_diagnostics,
+        downstream_sse_trace_metadata, final_completion_acceptance_error,
+        sanitized_completed_event_with_diagnostics,
+    };
+    use crate::errors::ThreadlineError;
+    use crate::ws_pump::{
+        InboundBufferOverflow, InboundBufferOverflowCause, UpstreamCloseMetadata,
+        UpstreamTerminalState,
     };
 
     #[test]
@@ -1771,6 +1864,33 @@ mod tests {
         assert_eq!(metadata.arguments_length, Some(arguments.len()));
         assert_eq!(metadata.output_index, Some(2));
         assert_eq!(metadata.item_id.as_deref(), Some("item-visible"));
+    }
+
+    #[test]
+    fn final_completion_acceptance_snapshot_rejects_overflow_but_allows_closed() {
+        let overflow = UpstreamTerminalState::InboundBufferOverflow(InboundBufferOverflow {
+            cause: InboundBufferOverflowCause::MessageCount,
+            queued_messages: 1,
+            queued_bytes: 1,
+            incoming_bytes: 1,
+            max_messages: 1,
+            max_bytes: 1,
+        });
+
+        assert!(matches!(
+            final_completion_acceptance_error(overflow),
+            Some(ThreadlineError::UpstreamInboundBufferOverflow)
+        ));
+        assert!(
+            final_completion_acceptance_error(UpstreamTerminalState::Closed(
+                UpstreamCloseMetadata {
+                    code: None,
+                    reason: None,
+                    error: None,
+                },
+            ))
+            .is_none()
+        );
     }
 
     #[test]

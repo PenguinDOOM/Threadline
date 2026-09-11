@@ -123,6 +123,29 @@ The pump owns continuous socket IO. Other code communicates with the pump throug
 
 The pump must support reading upstream frames, writing outbound upstream messages, replying to server Ping frames with Pong, forwarding Text/Binary frames into an inbound queue, accepting outbound Text/Ping/Close commands, recording close/error metadata, and running while a session is retained.
 
+## Bounded upstream inbound buffering
+
+The upstream inbound queue is bounded independently for each WebSocket connection:
+
+* `--upstream-inbound-max-messages` / `THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES` defaults to `256` and accepts `1..=65536`.
+* `--upstream-inbound-max-bytes` / `THREADLINE_UPSTREAM_INBOUND_MAX_BYTES` defaults to `16777216` and accepts `1..=67108864`.
+
+Both values are validated at startup. Invalid values are rejected; they are not clamped and cannot disable the limits. The validated limits are immutable for the connection and are applied consistently to production, reconnect, and utility upstream connections. Existing stream constructors retain the same defaults for compatibility.
+
+The queue counts Text and Binary messages and charges the UTF-8 payload after Binary lossy conversion. Empty messages consume one message slot. Enqueue and byte-budget acquisition are non-blocking: the pump does not wait for inbound capacity, drop older events, or continue after losing an event. The guarantee covers queued message count and queued converted-payload bytes, not RSS or global process memory, downstream SSE, outbound buffering, transport reconstruction, conversion working space, the message already removed by a consumer, or allocator and channel overhead.
+
+The production WebSocket transport uses `max_message_size=B` and `max_frame_size=max(B, 125)`, including cumulative fragmented-message enforcement. A `MessageTooLong` capacity error is classified as the same overflow; unrelated capacity or write errors are not. A caller-provided already-created stream cannot have its transport limits changed by the compatibility constructor, so that caller remains responsible for transport configuration.
+
+The first data message that cannot fit records a sticky `InboundBufferOverflow` terminal snapshot with a cause such as message count, payload bytes, or transport size. Reaching either limit exactly is not itself an overflow: while the queue is full, the pump can still process Ping/Pong, and the next non-fitting data message determines the failure. Once overflow is observed, the pump exits and drops its socket ownership without waiting for a graceful close handshake or the downstream consumer. There is no guarantee about a separate network write becoming unblocked.
+
+All receive, send, first-send, reconnect, stale-marker, and registry decisions use the same terminal snapshot, so overflow is not collapsed into an ordinary close. The public failure is a non-recoverable HTTP 502 `server_error` with code `upstream_inbound_buffer_overflow` and fixed message `The upstream websocket inbound buffer overflowed.`. Before response headers it is returned as JSON; after SSE begins, the downstream terminal sequence is one `response.failed` and one `[DONE]` when the consumer observes it. A stopped downstream is not promised an immediate notification, but a later poll observes the same failure. The `ws_pump_inbound_overflow` diagnostic event is logged once with numeric cause and limit fields, never payload contents, tool arguments, credentials, or other secrets.
+
+For an active turn, overflow takes priority over queued downstream output. The registry invalidates the entry and all marker aliases; a later lookup receives `previous_response_not_found`, and Threadline does not reconnect, replay, or silently discard old events. After overflow has been observed, it does not start another internal-tool call or follow-up, and it does not accept a pending final completion. Events already delivered and side effects already started are not rolled back.
+
+Final completion has an explicit acceptance boundary. After internal-tool handling and the no-observable-output guard succeed, Threadline reads the terminal snapshot immediately before recording the marker and disarming the lease; overflow at that point rejects the completion. An `Open` snapshot or an ordinary `Closed` snapshot can still accept a completion that already satisfies the existing success conditions. The synchronous acceptance transition has no await between the snapshot and disarm, so an overflow observed afterward cannot revoke an already accepted final or create a second terminal sequence.
+
+For an idle retained session whose completion was already accepted, a later overflow is retained as a non-recoverable reason. The next acquire detaches the live handle lazily, preserves the aliases long enough to return the dedicated overflow error, and never reconnects or reuses that session. Repeated acquires return the same error until normal eviction removes the entry, after which `previous_response_not_found` is expected. A bounded queue may remain allocated until that lazy cleanup; immediate deallocation is not part of the contract. Normal idle close without overflow keeps its existing recoverable marker metadata.
+
 ## Idle sessions
 
 A retained session may be idle from the downstream perspective while still needing active upstream IO.

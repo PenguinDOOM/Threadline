@@ -7,6 +7,8 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 
 type ServerSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
@@ -25,6 +27,8 @@ pub struct ScriptedWebSocketServer {
     incoming_rx: Mutex<Option<mpsc::UnboundedReceiver<Message>>>,
     connected: Arc<Notify>,
     is_connected: Arc<AtomicBool>,
+    client_disconnected: Arc<Notify>,
+    is_client_disconnected: Arc<AtomicBool>,
     accept_task: JoinHandle<()>,
     reader_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -50,11 +54,15 @@ impl ScriptedWebSocketServer {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let connected = Arc::new(Notify::new());
         let is_connected = Arc::new(AtomicBool::new(false));
+        let client_disconnected = Arc::new(Notify::new());
+        let is_client_disconnected = Arc::new(AtomicBool::new(false));
 
         let accept_writer = Arc::clone(&writer);
         let accept_reader_task = Arc::clone(&reader_task);
         let accept_connected = Arc::clone(&connected);
         let accept_is_connected = Arc::clone(&is_connected);
+        let accept_client_disconnected = Arc::clone(&client_disconnected);
+        let accept_is_client_disconnected = Arc::clone(&is_client_disconnected);
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept client");
             let websocket = accept_async(stream).await.expect("accept websocket");
@@ -82,6 +90,8 @@ impl ScriptedWebSocketServer {
                         Err(_) => break,
                     }
                 }
+                accept_is_client_disconnected.store(true, Ordering::SeqCst);
+                accept_client_disconnected.notify_waiters();
             });
             *accept_reader_task.lock().await = Some(reader);
         });
@@ -92,6 +102,8 @@ impl ScriptedWebSocketServer {
             incoming_rx: Mutex::new(Some(incoming_rx)),
             connected,
             is_connected,
+            client_disconnected,
+            is_client_disconnected,
             accept_task,
             reader_task,
         }
@@ -105,8 +117,43 @@ impl ScriptedWebSocketServer {
         self.send(Message::Text(text.to_string())).await;
     }
 
+    pub async fn send_text_burst(&self, texts: &[&str]) {
+        self.wait_until_connected().await;
+        let mut writer = self.writer.lock().await;
+        let sink = writer.as_mut().expect("client connected");
+        for text in texts {
+            sink.send(Message::Text((*text).to_string()))
+                .await
+                .expect("send scripted text");
+        }
+    }
+
     pub async fn send_binary(&self, payload: Vec<u8>) {
         self.send(Message::Binary(payload)).await;
+    }
+
+    pub async fn send_text_frame(&self, payload: &[u8]) {
+        self.send(Message::Frame(Frame::message(
+            payload.to_vec(),
+            OpCode::Data(Data::Text),
+            true,
+        )))
+        .await;
+    }
+
+    pub async fn send_fragmented_text(&self, first: &[u8], final_fragment: &[u8]) {
+        self.send(Message::Frame(Frame::message(
+            first.to_vec(),
+            OpCode::Data(Data::Text),
+            false,
+        )))
+        .await;
+        self.send(Message::Frame(Frame::message(
+            final_fragment.to_vec(),
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await;
     }
 
     pub async fn send_ping(&self, payload: &[u8]) {
@@ -152,6 +199,12 @@ impl ScriptedWebSocketServer {
         self.writer.lock().await.take();
         if let Some(task) = self.reader_task.lock().await.take() {
             task.abort();
+        }
+    }
+
+    pub async fn wait_for_client_disconnect(&self) {
+        while !self.is_client_disconnected.load(Ordering::SeqCst) {
+            self.client_disconnected.notified().await;
         }
     }
 

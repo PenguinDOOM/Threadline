@@ -6,7 +6,8 @@ use serde_json::{Map, Value};
 use crate::auth::LoadedUpstreamAuth;
 use crate::codex_ws::UpstreamSessionDescriptor;
 use crate::errors::ThreadlineError;
-use crate::ws_pump::LiveUpstreamWebSocket;
+use crate::tools::{InternalToolCall, PendingInternalToolOutput};
+use crate::ws_pump::{LiveUpstreamWebSocket, UpstreamWebSocketError};
 
 const UNSUPPORTED_RESPONSE_FIELDS: &[&str] = &[
     "max_output_tokens",
@@ -28,10 +29,29 @@ pub trait UpstreamConnector: Send + Sync {
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>>;
 }
 
+pub trait InternalToolExecutor: Send + Sync {
+    fn execute(
+        &self,
+        call: InternalToolCall,
+    ) -> BoxFuture<'static, Result<PendingInternalToolOutput, ThreadlineError>>;
+}
+
+struct DefaultInternalToolExecutor;
+
+impl InternalToolExecutor for DefaultInternalToolExecutor {
+    fn execute(
+        &self,
+        call: InternalToolCall,
+    ) -> BoxFuture<'static, Result<PendingInternalToolOutput, ThreadlineError>> {
+        Box::pin(async move { call.execute() })
+    }
+}
+
 #[derive(Clone)]
 pub struct ThreadlineServices {
     auth_provider: Arc<dyn UpstreamAuthProvider>,
     connector: Arc<dyn UpstreamConnector>,
+    internal_tool_executor: Arc<dyn InternalToolExecutor>,
 }
 
 pub struct ConnectedUpstream {
@@ -48,6 +68,19 @@ impl ThreadlineServices {
         Self {
             auth_provider,
             connector,
+            internal_tool_executor: Arc::new(DefaultInternalToolExecutor),
+        }
+    }
+
+    pub fn with_internal_tool_executor(
+        auth_provider: Arc<dyn UpstreamAuthProvider>,
+        connector: Arc<dyn UpstreamConnector>,
+        internal_tool_executor: Arc<dyn InternalToolExecutor>,
+    ) -> Self {
+        Self {
+            auth_provider,
+            connector,
+            internal_tool_executor,
         }
     }
 
@@ -57,6 +90,13 @@ impl ThreadlineServices {
 
     pub fn connector(&self) -> &Arc<dyn UpstreamConnector> {
         &self.connector
+    }
+
+    pub fn execute_internal_tool(
+        &self,
+        call: InternalToolCall,
+    ) -> BoxFuture<'static, Result<PendingInternalToolOutput, ThreadlineError>> {
+        self.internal_tool_executor.execute(call)
     }
 }
 
@@ -133,7 +173,7 @@ pub(crate) async fn send_response_create(
     upstream
         .send_text(text)
         .await
-        .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)
+        .map_err(map_upstream_websocket_error)
 }
 
 pub(crate) fn build_followup_tool_outputs_payload(
@@ -165,7 +205,16 @@ pub(crate) async fn send_followup_tool_outputs(
     upstream
         .send_text(text)
         .await
-        .map_err(|_| ThreadlineError::UpstreamWebSocketClosed)
+        .map_err(map_upstream_websocket_error)
+}
+
+fn map_upstream_websocket_error(error: UpstreamWebSocketError) -> ThreadlineError {
+    match error {
+        UpstreamWebSocketError::InboundBufferOverflow => {
+            ThreadlineError::UpstreamInboundBufferOverflow
+        }
+        UpstreamWebSocketError::OutboundQueueClosed => ThreadlineError::UpstreamWebSocketClosed,
+    }
 }
 
 fn require_payload_object(payload: Value) -> Result<Map<String, Value>, ThreadlineError> {

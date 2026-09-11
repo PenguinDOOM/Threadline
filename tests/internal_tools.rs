@@ -1,15 +1,18 @@
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, Response, StatusCode};
-use futures_util::{StreamExt, future::BoxFuture};
+use futures_util::{Stream, StreamExt, future::BoxFuture, future::poll_fn};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io;
 use std::io::Write;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -28,12 +31,14 @@ use threadline::errors::ThreadlineError;
 use threadline::http::build_router_with_services;
 use threadline::jobs::{ThreadlineJobManager, ThreadlineJobManagerConfig};
 use threadline::responses::{
-    ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
+    ConnectedUpstream, InternalToolExecutor, ThreadlineServices, UpstreamAuthProvider,
+    UpstreamConnector,
 };
 use threadline::tools::{
-    InternalToolCall, event_contains_internal_tool_name, inject_internal_tools,
+    InternalToolCall, PendingInternalToolOutput, event_contains_internal_tool_name,
+    inject_internal_tools,
 };
-use threadline::ws_pump::LiveUpstreamWebSocket;
+use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits};
 
 const JOB_START_NEXT_ACTION_HINT: &str = "This job is running in the background. Continue other useful work if available, then poll status or read output later when needed.";
 
@@ -58,12 +63,24 @@ struct PlannedConnection {
 #[derive(Clone)]
 struct RecordingConnector {
     plans: Arc<Mutex<VecDeque<PlannedConnection>>>,
+    inbound_limits: UpstreamInboundLimits,
 }
 
 impl RecordingConnector {
     fn new(plans: Vec<PlannedConnection>) -> Self {
         Self {
             plans: Arc::new(Mutex::new(plans.into())),
+            inbound_limits: UpstreamInboundLimits::DEFAULT,
+        }
+    }
+
+    fn with_inbound_limits(
+        plans: Vec<PlannedConnection>,
+        inbound_limits: UpstreamInboundLimits,
+    ) -> Self {
+        Self {
+            inbound_limits,
+            ..Self::new(plans)
         }
     }
 }
@@ -75,6 +92,7 @@ impl UpstreamConnector for RecordingConnector {
         session: Option<UpstreamSessionDescriptor>,
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
         let plans = Arc::clone(&self.plans);
+        let inbound_limits = self.inbound_limits;
         Box::pin(async move {
             let session = session.unwrap_or_else(new_session_descriptor);
             let plan = plans
@@ -88,7 +106,10 @@ impl UpstreamConnector for RecordingConnector {
                 .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
 
             Ok(ConnectedUpstream {
-                websocket: Arc::new(LiveUpstreamWebSocket::from_stream(stream)),
+                websocket: Arc::new(LiveUpstreamWebSocket::from_stream_with_limits(
+                    stream,
+                    inbound_limits,
+                )),
                 session,
                 turn_state: plan.turn_state,
             })
@@ -96,8 +117,56 @@ impl UpstreamConnector for RecordingConnector {
     }
 }
 
+#[derive(Clone)]
+struct PausedInternalToolExecutor {
+    started: Arc<Notify>,
+    resume: Arc<Notify>,
+    executions: Arc<AtomicUsize>,
+}
+
+impl PausedInternalToolExecutor {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+            executions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl InternalToolExecutor for PausedInternalToolExecutor {
+    fn execute(
+        &self,
+        call: InternalToolCall,
+    ) -> BoxFuture<'static, Result<PendingInternalToolOutput, ThreadlineError>> {
+        let started = Arc::clone(&self.started);
+        let resume = Arc::clone(&self.resume);
+        let executions = Arc::clone(&self.executions);
+        Box::pin(async move {
+            executions.fetch_add(1, Ordering::SeqCst);
+            started.notify_one();
+            resume.notified().await;
+            call.execute()
+        })
+    }
+}
+
 fn build_test_router(connector: Arc<dyn UpstreamConnector>) -> axum::Router {
     build_test_router_with_config(ThreadlineConfig::default(), connector)
+}
+
+fn build_test_router_with_internal_tool_executor(
+    connector: Arc<dyn UpstreamConnector>,
+    internal_tool_executor: Arc<dyn InternalToolExecutor>,
+) -> axum::Router {
+    build_router_with_services(
+        ThreadlineConfig::default(),
+        ThreadlineServices::with_internal_tool_executor(
+            Arc::new(StaticAuthProvider),
+            connector,
+            internal_tool_executor,
+        ),
+    )
 }
 
 fn build_test_router_with_config(
@@ -3126,4 +3195,141 @@ fn actual_internal_function_call_with_threadline_name_remains_suppressed() {
         event_contains_internal_tool_name(&event),
         "expected actual threadline function_call item to remain suppressible"
     );
+}
+
+#[tokio::test]
+async fn overflow_after_internal_tool_execution_skips_followup_and_hides_intermediate_events() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let app = build_test_router(Arc::new(connector));
+
+    let response = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"run internal tool loop"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("initial request");
+
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server.send_ping(b"tool queued").await;
+    assert!(matches!(
+        server.recv_client_message().await,
+        Some(Message::Pong(payload)) if payload == b"tool queued"
+    ));
+
+    let pending = Arc::new(Notify::new());
+    let pending_for_task = Arc::clone(&pending);
+    let body_task = tokio::spawn(async move {
+        let mut body_stream = response.into_body().into_data_stream();
+        let failed = poll_fn(
+            |context| match Pin::new(&mut body_stream).poll_next(context) {
+                Poll::Pending => {
+                    pending_for_task.notify_one();
+                    Poll::Pending
+                }
+                Poll::Ready(Some(chunk)) => Poll::Ready(chunk.expect("failed SSE chunk")),
+                Poll::Ready(None) => panic!("expected terminal failure frame"),
+            },
+        )
+        .await;
+        let done = body_stream
+            .next()
+            .await
+            .expect("DONE frame")
+            .expect("valid DONE frame");
+        assert!(body_stream.next().await.is_none());
+        (failed, done)
+    });
+    pending.notified().await;
+
+    server
+        .send_text_burst(&[
+            r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#,
+            r#"{"type":"response.output_text.delta","delta":"overflow"}"#,
+        ])
+        .await;
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("overflow should close the pump before the internal follow-up");
+
+    let (failed, done) = body_task.await.expect("body task");
+    let failed_text = String::from_utf8(failed.to_vec()).expect("failure utf8");
+    assert!(failed_text.contains("event: response.failed"));
+    assert!(failed_text.contains("upstream_inbound_buffer_overflow"));
+    assert!(!failed_text.contains("response-intermediate"));
+    assert!(!failed_text.contains("threadline_echo"));
+    assert_eq!(
+        String::from_utf8(done.to_vec()).expect("DONE utf8"),
+        "data: [DONE]\n\n"
+    );
+    assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn overflow_while_internal_tool_execution_is_pending_skips_followup_and_later_tools() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_inbound_limits(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
+    );
+    let executor = Arc::new(PausedInternalToolExecutor::new());
+    let app = build_test_router_with_internal_tool_executor(
+        Arc::new(connector),
+        Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+    );
+
+    let response = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"run internal tool loop"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("initial request");
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("overflow body")
+    });
+    executor.started.notified().await;
+
+    server
+        .send_text_burst(&[
+            r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-2","name":"threadline_echo","arguments":"{\"value\":\"beta\"}"}}"#,
+        ])
+        .await;
+    timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+        .await
+        .expect("overflow should close the pump while tool execution is pending");
+    executor.resume.notify_one();
+
+    let body = body_task.await.expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("failure utf8");
+    assert_eq!(body_text.matches("event: response.failed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(body_text.contains("upstream_inbound_buffer_overflow"));
+    assert!(!body_text.contains("response-intermediate"));
+    assert!(!body_text.contains("threadline_echo"));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(server.take_pending_client_messages().await.is_empty());
 }

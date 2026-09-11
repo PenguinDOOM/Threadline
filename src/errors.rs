@@ -57,6 +57,9 @@ pub enum ThreadlineError {
     )]
     UpstreamWebSocketClosed,
 
+    #[error("The upstream websocket inbound buffer overflowed.")]
+    UpstreamInboundBufferOverflow,
+
     #[error(
         "The upstream response.failed event cannot be streamed as a successful downstream response."
     )]
@@ -119,6 +122,7 @@ impl ThreadlineError {
             Self::UpstreamWebSocketConnectFailed => StatusCode::BAD_GATEWAY,
             Self::UpstreamWebSocketHandshakeRejected { status } => *status,
             Self::UpstreamWebSocketClosed => StatusCode::BAD_GATEWAY,
+            Self::UpstreamInboundBufferOverflow => StatusCode::BAD_GATEWAY,
             Self::UpstreamResponseFailed => StatusCode::BAD_GATEWAY,
             Self::UpstreamErrorEvent => StatusCode::BAD_GATEWAY,
             Self::UpstreamInvalidJson => StatusCode::BAD_GATEWAY,
@@ -188,6 +192,11 @@ impl ThreadlineError {
                 "upstream_websocket_closed",
                 "The upstream Codex websocket closed before Threadline finished streaming the response.",
                 "bad_gateway_error",
+            ),
+            Self::UpstreamInboundBufferOverflow => borrowed_public_error(
+                "upstream_inbound_buffer_overflow",
+                "The upstream websocket inbound buffer overflowed.",
+                "server_error",
             ),
             Self::UpstreamResponseFailed => borrowed_public_error(
                 "upstream_response_failed",
@@ -372,5 +381,23 @@ mod tests {
             "reasoning.context=all_turns is not supported for this model. The model metadata has use_responses_lite=false."
         );
         assert_eq!(document.error.error_type.as_ref(), "invalid_request_error");
+    }
+
+    #[test]
+    fn upstream_inbound_buffer_overflow_has_a_stable_nonrecoverable_public_error() {
+        let error = ThreadlineError::UpstreamInboundBufferOverflow;
+
+        assert_eq!(error.status_code(), StatusCode::BAD_GATEWAY);
+        assert!(!error.is_upstream_recoverable_close());
+        let document = error.public_error_document();
+        assert_eq!(
+            document.error.code.as_ref(),
+            "upstream_inbound_buffer_overflow"
+        );
+        assert_eq!(document.error.error_type.as_ref(), "server_error");
+        assert_eq!(
+            document.error.message.as_ref(),
+            "The upstream websocket inbound buffer overflowed."
+        );
     }
 }
