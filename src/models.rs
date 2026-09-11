@@ -46,24 +46,24 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 24] = [
         upstream_model_id: "gpt-6-sol",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "threadline-main-gpt-6-terra",
         upstream_model_id: "gpt-6-terra",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "threadline-main-gpt-6-luna",
         upstream_model_id: "gpt-6-luna",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "threadline-main-gpt-5.6-sol",
@@ -111,7 +111,7 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 24] = [
         profile: RouteProfile::Utility,
         advertised: false,
         persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "threadline-utility-gpt-5.6-luna",
@@ -150,24 +150,24 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 24] = [
         upstream_model_id: "gpt-6-sol",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "gpt-6-terra",
         upstream_model_id: "gpt-6-terra",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "gpt-6-luna",
         upstream_model_id: "gpt-6-luna",
         profile: RouteProfile::Main,
         advertised: false,
-        persistent_reasoning_eligible: false,
-        supports_reasoning_all_turns: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "gpt-5.6-sol",
@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_family_main_routes_are_hidden_with_unverified_reasoning_capabilities() {
+    fn gpt_6_family_main_routes_are_hidden_and_support_persistent_reasoning() {
         for (alias_id, upstream_model_id) in [
             ("threadline-main-gpt-6-sol", "gpt-6-sol"),
             ("threadline-main-gpt-6-terra", "gpt-6-terra"),
@@ -480,8 +480,8 @@ mod tests {
             assert_eq!(main.upstream_model_id, upstream_model_id);
             assert_eq!(main.profile, RouteProfile::Main);
             assert!(!main.advertised);
-            assert!(!main.persistent_reasoning_eligible);
-            assert!(!main.supports_reasoning_all_turns);
+            assert!(main.persistent_reasoning_eligible);
+            assert!(main.supports_reasoning_all_turns);
         }
 
         for model_id in GPT_6_FAMILY_RAW_IDS {
@@ -494,13 +494,13 @@ mod tests {
             assert_eq!(main.upstream_model_id, model_id);
             assert_eq!(main.profile, RouteProfile::Main);
             assert!(!main.advertised);
-            assert!(!main.persistent_reasoning_eligible);
-            assert!(!main.supports_reasoning_all_turns);
+            assert!(main.persistent_reasoning_eligible);
+            assert!(main.supports_reasoning_all_turns);
         }
     }
 
     #[test]
-    fn gpt_6_luna_utility_route_is_hidden_with_unverified_reasoning_capabilities() {
+    fn gpt_6_luna_utility_route_is_hidden_and_supports_reasoning_all_turns() {
         let utility = resolve_request_model_for_profile(
             json!({ "model": "threadline-utility-gpt-6-luna" })
                 .as_object()
@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(utility.profile, RouteProfile::Utility);
         assert!(!utility.advertised);
         assert!(!utility.persistent_reasoning_eligible);
-        assert!(!utility.supports_reasoning_all_turns);
+        assert!(utility.supports_reasoning_all_turns);
     }
 
     #[test]
@@ -673,8 +673,8 @@ mod tests {
             assert_eq!(compatibility.upstream_model_id, model_id);
             assert_eq!(compatibility.profile, RouteProfile::Main);
             assert!(!compatibility.advertised);
-            assert!(!compatibility.persistent_reasoning_eligible);
-            assert!(!compatibility.supports_reasoning_all_turns);
+            assert!(compatibility.persistent_reasoning_eligible);
+            assert!(compatibility.supports_reasoning_all_turns);
 
             assert_eq!(
                 resolve_request_model_for_profile(
@@ -784,7 +784,7 @@ mod tests {
                 RouteProfile::Main,
             )
             .unwrap();
-            assert!(!hidden_alias.supports_reasoning_all_turns);
+            assert!(hidden_alias.supports_reasoning_all_turns);
         }
 
         for model_id in GPT_6_FAMILY_RAW_IDS {
@@ -793,7 +793,7 @@ mod tests {
                 RouteProfile::Main,
             )
             .unwrap();
-            assert!(!hidden_compatibility.supports_reasoning_all_turns);
+            assert!(hidden_compatibility.supports_reasoning_all_turns);
         }
 
         let hidden_utility = resolve_request_model_for_profile(
@@ -803,7 +803,7 @@ mod tests {
             RouteProfile::Utility,
         )
         .unwrap();
-        assert!(!hidden_utility.supports_reasoning_all_turns);
+        assert!(hidden_utility.supports_reasoning_all_turns);
 
         let hidden_compatibility_quaternary = resolve_request_model_for_profile(
             json!({ "model": "gpt-5.5" }).as_object().unwrap(),
@@ -833,15 +833,27 @@ mod tests {
             assert!(alias.persistent_reasoning_eligible);
         }
 
+        for model_id in GPT_6_FAMILY_MAIN_ALIAS_IDS {
+            let alias = resolve_request_model_for_profile(
+                json!({ "model": model_id }).as_object().unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap();
+            assert!(alias.persistent_reasoning_eligible);
+        }
+
+        for model_id in GPT_6_FAMILY_RAW_IDS {
+            let alias = resolve_request_model_for_profile(
+                json!({ "model": model_id }).as_object().unwrap(),
+                RouteProfile::Main,
+            )
+            .unwrap();
+            assert!(alias.persistent_reasoning_eligible);
+        }
+
         for model_id in [
-            "threadline-main-gpt-6-sol",
-            "threadline-main-gpt-6-terra",
-            "threadline-main-gpt-6-luna",
             "threadline-main-gpt-5.5",
             "threadline-main-gpt-5.4",
-            "gpt-6-sol",
-            "gpt-6-terra",
-            "gpt-6-luna",
             "gpt-5.5",
             "gpt-5.4",
             "gpt-5.4-mini",
