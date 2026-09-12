@@ -55,6 +55,7 @@ Threadline reads configuration from CLI flags or environment variables.
 | `--profile` | `THREADLINE_PROFILE` | `main` | Route profile for this listener. Use `main` for retained-session routes and `utility` for stateless utility-only model aliases. |
 | `--codex-client-version` | `THREADLINE_CODEX_CLIENT_VERSION` | `0.136.0` | Codex client version Threadline sends to the upstream backend for compatibility. |
 | `--retained-session-capacity` | `THREADLINE_RETAINED_SESSION_CAPACITY` | `64` | Maximum number of retained sessions kept available for response continuation. |
+| `--max-request-body-bytes` | `THREADLINE_MAX_REQUEST_BODY_BYTES` | `33554432` | Maximum HTTP DATA bytes accepted for `POST /v1/responses`. Accepted range: positive `usize`, `1..=usize::MAX`. |
 | `--upstream-inbound-max-messages` | `THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES` | `256` | Maximum number of queued upstream Text/Binary messages per connection. Accepted range: `1..=65536`. |
 | `--upstream-inbound-max-bytes` | `THREADLINE_UPSTREAM_INBOUND_MAX_BYTES` | `16777216` | Maximum queued upstream payload bytes per connection after UTF-8 conversion. Accepted range: `1..=67108864`. |
 | `--jobs-enabled` | `THREADLINE_JOBS_ENABLED` | `false` | Enables local job execution support for long-running work. |
@@ -66,6 +67,21 @@ Threadline reads configuration from CLI flags or environment variables.
 | `--job-allowed-commands` | `THREADLINE_JOB_ALLOWED_COMMANDS` | None | comma-separated exact program names allowed for jobs. Threadline compares `command[0]` against each configured entry exactly, without normalizing wrappers, paths, or aliases. |
 | `--log-level` | `THREADLINE_LOG_LEVEL` | `info` | Threadline log verbosity. Supported Rust tracing levels include `error`, `warn`, `info`, `debug`, and `trace`. |
 
+`--max-request-body-bytes` limits only the HTTP DATA bytes read from `POST /v1/responses`. It does not measure characters or tokens, and does not include HTTP headers or chunk framing. A body at or below the configured limit passes the size check; a larger body is rejected before JSON or model validation. Missing or invalid `Content-Type` is rejected with HTTP 415 before body size handling, including for an oversized body. With a supported JSON `Content-Type`, an oversized body returns HTTP 413 with this fixed document:
+
+```text
+{"error":{"code":"request_body_too_large","type":"invalid_request_error","message":"The /v1/responses request body exceeds the configured byte limit."}}
+```
+The default is `33554432` bytes (`32 MiB = 32 * 1024 * 1024 bytes`). Values must be positive `usize` integers in the range `1..=usize::MAX`; zero, negative values, non-integers, and values above the platform `usize` maximum are rejected at startup. CLI values take precedence over environment values, and the setting is applied after restarting the application. The same setting is inherited by Main and Utility listeners, including both listeners started by one process; other endpoints remain unchanged.
+
+Examples:
+
+```bash
+threadline --max-request-body-bytes 67108864
+THREADLINE_MAX_REQUEST_BODY_BYTES=67108864 threadline
+```
+This is a finite compatibility policy, not a measured optimal limit. It does not guarantee bounds for JSON expansion, clones, allocator overhead, concurrent-request RSS, or upstream acceptance. There is no implicit hard ceiling or unlimited fallback; choose a finite value appropriate for the deployment.
+
 Job capacity limits are finite `usize` values. The defaults are `16` active workers and `128` retained registry entries; the retained limit counts starting, running, and terminal entries. A value of `0` denies new job starts rather than meaning unlimited, and values are not clamped or adjusted when the retained limit is smaller than the active limit. Jobs remain disabled by default, and the output buffer remains `32768` bytes by default.
 
 Retention cleanup is lazy. Each job-manager operation, including a missing-id lookup and a rejected start, first removes eligible entries whose terminal age is at least the `300`-second TTL. An entry is eligible only when it is terminal, its worker execution has finished, and it has a terminal timestamp. Expired entries are removed before capacity decisions. When retained capacity is needed and active capacity permits admission, unexpired eligible terminal entries are evicted in ascending completion-time order, with `job_id` as the deterministic tie-breaker. This is not LRU, reads and repeated cancellation do not refresh the TTL, and no deletion is promised while the API is inactive. Capacity pressure can remove unexpired terminal history, so the TTL is not a minimum-retention guarantee.
@@ -76,7 +92,6 @@ If capacity admission is refused, the stable error is `ok: false` with code `job
 
 These limits bound managed workers and registry entries, not process RSS, global output/result bytes, allocator overhead, detached work, or arbitrary descendant processes. Cancellation does not forcibly abort an uncooperative future or manage an arbitrary process tree. The standalone environment configuration helper keeps its existing invalid-value fallback-to-default behavior, while startup command-line parsing rejects malformed, negative, and overflowing values; valid zero remains zero.
 Threadline does not accept an arbitrary model override through CLI flags or environment variables.
-
 The upstream inbound limits are applied independently to each upstream WebSocket connection. They are immutable for the lifetime of that connection. Values are validated at startup; zero, negative, non-numeric, and out-of-range values are rejected rather than clamped or treated as unlimited. The defaults are finite policy defaults, not performance benchmarks. Very small values can reject otherwise ordinary upstream output, so tune them deliberately within the supported ranges.
 
 These limits bound queued upstream message count and converted UTF-8 payload bytes. They are not a process-wide memory or RSS limit, and they do not bound the downstream SSE stream, outbound queue, payload allocation and conversion working space, or allocator and transport overhead. Binary payloads use lossy UTF-8 conversion for queue accounting. The production connector also applies the byte limit to WebSocket message size and uses a frame limit of `max(bytes, 125)`; callers that provide an already-created stream remain responsible for its transport configuration.
@@ -127,7 +142,6 @@ Use the two-process form when startup isolation or process-by-process debugging 
 These are the visible model ids that Threadline advertises from `/v1/models`.
 
 Main profile aliases:
-
 - `threadline-main-gpt-6-astra`
 - `threadline-main-gpt-5.6-sol`
 - `threadline-main-gpt-5.6-terra`
@@ -136,7 +150,6 @@ Main profile aliases:
 - `threadline-main-gpt-5.4`
 
 Utility profile aliases:
-
 - `threadline-utility-gpt-5.6-luna`
 - `threadline-utility-gpt-5.4-mini`
 - `threadline-utility-gpt-5.3-codex-spark`

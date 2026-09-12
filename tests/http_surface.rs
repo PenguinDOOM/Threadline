@@ -1,8 +1,13 @@
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode};
+use axum::Router;
+use axum::body::{Body, Bytes, HttpBody, to_bytes};
+use axum::extract::Json;
+use axum::http::{HeaderValue, Request, StatusCode};
+use axum::routing::post;
 use futures_util::future::BoxFuture;
+use futures_util::stream;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tower::ServiceExt;
 
 use threadline::auth::LoadedUpstreamAuth;
@@ -21,6 +26,30 @@ struct MissingAuthProvider;
 
 impl UpstreamAuthProvider for MissingAuthProvider {
     fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
+        Err(ThreadlineError::UpstreamCredentialsUnavailable)
+    }
+}
+
+#[derive(Clone)]
+struct CountingMissingAuthProvider {
+    loads: Arc<AtomicUsize>,
+}
+
+impl CountingMissingAuthProvider {
+    fn new() -> Self {
+        Self {
+            loads: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn load_count(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+}
+
+impl UpstreamAuthProvider for CountingMissingAuthProvider {
+    fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
         Err(ThreadlineError::UpstreamCredentialsUnavailable)
     }
 }
@@ -100,6 +129,8 @@ const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 7] = [
     "gpt-5.3-codex-spark",
 ];
 
+const REQUEST_BODY_WHITESPACE_CHUNK_BYTES: usize = 64 * 1024;
+
 async fn read_json_body(response: axum::response::Response) -> Value {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&body).unwrap()
@@ -122,6 +153,106 @@ async fn post_responses_json(app: axum::Router, payload: Value) -> axum::respons
     .unwrap()
 }
 
+async fn post_responses_request_body(app: axum::Router, body: String) -> axum::response::Response {
+    post_responses_body(app, Some("application/json"), Body::from(body)).await
+}
+
+async fn post_responses_body(
+    app: axum::Router,
+    content_type: Option<&str>,
+    body: Body,
+) -> axum::response::Response {
+    let mut request = Request::builder().method("POST").uri("/v1/responses");
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    app.oneshot(request.body(body).unwrap()).await.unwrap()
+}
+
+fn json_body_with_trailing_whitespace(prefix: &'static str, total_bytes: usize) -> Body {
+    assert!(total_bytes >= prefix.len());
+
+    let whitespace_chunk = Bytes::from(vec![b' '; REQUEST_BODY_WHITESPACE_CHUNK_BYTES]);
+    let remaining_bytes = total_bytes - prefix.len();
+    Body::from_stream(stream::unfold(
+        (Some(Bytes::from_static(prefix.as_bytes())), remaining_bytes),
+        move |(prefix, remaining_bytes)| {
+            let whitespace_chunk = whitespace_chunk.clone();
+            async move {
+                if let Some(prefix) = prefix {
+                    return Some((Ok::<Bytes, std::io::Error>(prefix), (None, remaining_bytes)));
+                }
+                if remaining_bytes == 0 {
+                    return None;
+                }
+
+                let chunk_bytes = remaining_bytes.min(whitespace_chunk.len());
+                Some((
+                    Ok(whitespace_chunk.slice(..chunk_bytes)),
+                    (None, remaining_bytes - chunk_bytes),
+                ))
+            }
+        },
+    ))
+}
+
+async fn post_responses_stream_request_body(
+    app: axum::Router,
+    chunks: Vec<Result<Bytes, std::io::Error>>,
+) -> axum::response::Response {
+    let body = Body::from_stream(stream::iter(chunks));
+    assert_eq!(body.size_hint().upper(), None);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    assert!(request.headers().get("content-length").is_none());
+    app.oneshot(request).await.unwrap()
+}
+
+async fn post_baseline_json_body(
+    content_type: Option<&str>,
+    body: Body,
+) -> axum::response::Response {
+    async fn baseline(Json(_): Json<Value>) -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    let mut request = Request::builder().method("POST").uri("/");
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    Router::new()
+        .route("/", post(baseline))
+        .oneshot(request.body(body).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn response_parts(
+    response: axum::response::Response,
+) -> (StatusCode, Option<HeaderValue>, Bytes) {
+    let status = response.status();
+    let content_type = response.headers().get("content-type").cloned();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, content_type, body)
+}
+
+fn assert_request_body_too_large(payload: Value) {
+    assert_eq!(
+        payload,
+        json!({
+            "error": {
+                "code": "request_body_too_large",
+                "message": "The /v1/responses request body exceeds the configured byte limit.",
+                "type": "invalid_request_error"
+            }
+        })
+    );
+}
+
 fn assert_invalid_model_error(payload: &Value) {
     assert_eq!(payload["error"]["type"], "invalid_request_error");
     assert_eq!(payload["error"]["code"], "invalid_model");
@@ -140,6 +271,361 @@ fn utility_config() -> ThreadlineConfig {
     ThreadlineConfig {
         profile: RouteProfile::Utility,
         ..ThreadlineConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn request_body_limit_accepts_exact_utf8_bytes_and_rejects_one_byte_over() {
+    for (profile, model) in [
+        (RouteProfile::Main, "gpt-5.4"),
+        (RouteProfile::Utility, "threadline-utility-gpt-5.4-mini"),
+    ] {
+        let body = json!({ "model": model, "input": "cafe\u{301}" }).to_string();
+        let body_bytes = body.len();
+
+        for limit in [body_bytes + 1, body_bytes] {
+            let app = build_router_with_services(
+                ThreadlineConfig {
+                    profile,
+                    max_request_body_bytes: limit,
+                    ..ThreadlineConfig::default()
+                },
+                ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+            );
+            let response = post_responses_request_body(app, body.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "profile={profile:?}, limit={limit}"
+            );
+            assert_eq!(
+                read_json_body(response).await["error"]["code"],
+                "upstream_credentials_unavailable",
+                "profile={profile:?}, limit={limit}"
+            );
+        }
+
+        let auth = CountingMissingAuthProvider::new();
+        let app = build_router_with_services(
+            ThreadlineConfig {
+                profile,
+                max_request_body_bytes: body_bytes - 1,
+                ..ThreadlineConfig::default()
+            },
+            ThreadlineServices::new(Arc::new(auth.clone()), Arc::new(UnusedConnector)),
+        );
+        let response = post_responses_request_body(app, body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "profile={profile:?}"
+        );
+        assert_request_body_too_large(read_json_body(response).await);
+        assert_eq!(auth.load_count(), 0, "profile={profile:?}");
+    }
+}
+
+#[tokio::test]
+async fn request_body_limit_counts_unknown_length_chunks_cumulatively_without_auth() {
+    let body = br#"{"model":"gpt-5.4"}"#;
+    let limit = body.len();
+    let chunks = [
+        Bytes::copy_from_slice(&body[..8]),
+        Bytes::copy_from_slice(&body[8..]),
+    ];
+    assert!(chunks.iter().all(|chunk| chunk.len() <= limit));
+    let exact_app = build_router_with_services(
+        ThreadlineConfig {
+            max_request_body_bytes: limit,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+    let exact = post_responses_stream_request_body(
+        exact_app,
+        vec![Ok(chunks[0].clone()), Ok(chunks[1].clone())],
+    )
+    .await;
+    assert_eq!(exact.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        read_json_body(exact).await["error"]["code"],
+        "upstream_credentials_unavailable"
+    );
+
+    let over_auth = CountingMissingAuthProvider::new();
+    let over_app = build_router_with_services(
+        ThreadlineConfig {
+            max_request_body_bytes: limit - 1,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::new(Arc::new(over_auth.clone()), Arc::new(UnusedConnector)),
+    );
+    let over = post_responses_stream_request_body(
+        over_app,
+        vec![Ok(chunks[0].clone()), Ok(chunks[1].clone())],
+    )
+    .await;
+    assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_request_body_too_large(read_json_body(over).await);
+    assert_eq!(over_auth.load_count(), 0);
+}
+
+#[tokio::test]
+async fn request_body_limit_preserves_non_413_json_rejections() {
+    for (content_type, body) in [
+        (Some("application/json"), "{".to_string()),
+        (None, "{}".to_string()),
+        (Some("text/plain"), " ".repeat(2048)),
+    ] {
+        let baseline =
+            response_parts(post_baseline_json_body(content_type, Body::from(body.clone())).await)
+                .await;
+        let auth = CountingMissingAuthProvider::new();
+        let app = build_router_with_services(
+            ThreadlineConfig {
+                max_request_body_bytes: 1,
+                ..ThreadlineConfig::default()
+            },
+            ThreadlineServices::new(Arc::new(auth.clone()), Arc::new(UnusedConnector)),
+        );
+        let actual =
+            response_parts(post_responses_body(app, content_type, Body::from(body)).await).await;
+        assert_eq!(actual, baseline, "content_type={content_type:?}");
+        assert_eq!(auth.load_count(), 0, "content_type={content_type:?}");
+    }
+}
+
+#[tokio::test]
+async fn request_body_limit_preserves_io_read_error_rejection() {
+    let baseline = response_parts(
+        post_baseline_json_body(
+            Some("application/json"),
+            Body::from_stream(stream::iter(vec![Err::<Bytes, _>(std::io::Error::other(
+                "read failed",
+            ))])),
+        )
+        .await,
+    )
+    .await;
+    let auth = CountingMissingAuthProvider::new();
+    let app = build_router_with_services(
+        ThreadlineConfig {
+            max_request_body_bytes: 1024,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::new(Arc::new(auth.clone()), Arc::new(UnusedConnector)),
+    );
+    let actual = response_parts(
+        post_responses_body(
+            app,
+            Some("application/json"),
+            Body::from_stream(stream::iter(vec![Err::<Bytes, _>(std::io::Error::other(
+                "read failed",
+            ))])),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(actual, baseline);
+    assert_eq!(actual.0, StatusCode::BAD_REQUEST);
+    assert_ne!(actual.0, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(auth.load_count(), 0);
+}
+
+#[tokio::test]
+async fn request_body_limit_accepts_large_json_above_axum_default_with_default_and_custom_limits() {
+    let input = "x".repeat(2 * 1024 * 1024 + 1);
+    let serialized_payload = serde_json::to_vec(&json!({"model":"gpt-5.4","input":input}))
+        .expect("serialized request payload");
+    let body_bytes = serialized_payload.len();
+    let empty_payload_bytes = serde_json::to_vec(&json!({"model":"gpt-5.4","input":""}))
+        .expect("serialized empty request payload")
+        .len();
+    assert_eq!(body_bytes, empty_payload_bytes + input.len());
+    assert!(body_bytes > 2 * 1024 * 1024);
+    assert!(body_bytes < 4 * 1024 * 1024);
+
+    for config in [
+        ThreadlineConfig::default(),
+        ThreadlineConfig {
+            max_request_body_bytes: 4 * 1024 * 1024,
+            ..ThreadlineConfig::default()
+        },
+    ] {
+        let app = build_router_with_services(
+            config,
+            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+        );
+        let response = post_responses_body(
+            app,
+            Some("application/json"),
+            Body::from(serialized_payload.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            read_json_body(response).await["error"]["code"],
+            "upstream_credentials_unavailable"
+        );
+    }
+
+    let auth = CountingMissingAuthProvider::new();
+    let app = build_router_with_services(
+        ThreadlineConfig {
+            max_request_body_bytes: body_bytes - 1,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::new(Arc::new(auth.clone()), Arc::new(UnusedConnector)),
+    );
+    let response = post_responses_body(
+        app,
+        Some("application/json"),
+        Body::from(serialized_payload),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_request_body_too_large(read_json_body(response).await);
+    assert_eq!(auth.load_count(), 0);
+}
+
+#[tokio::test]
+async fn request_body_limit_preserves_json_semantic_validation() {
+    let app = build_router_with_services(
+        ThreadlineConfig {
+            max_request_body_bytes: 1024,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+    let scalar = post_responses_json(app, json!("not an object")).await;
+    assert_eq!(scalar.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        read_json_body(scalar).await["error"]["code"],
+        "invalid_request_error"
+    );
+
+    let app = build_router_with_services(
+        ThreadlineConfig {
+            max_request_body_bytes: 1024,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+    let array = post_responses_json(app, json!(["not an object"])).await;
+    assert_eq!(array.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        read_json_body(array).await["error"]["code"],
+        "invalid_request_error"
+    );
+}
+
+#[tokio::test]
+async fn request_body_limit_preserves_invalid_model_validation_and_prioritizes_oversize() {
+    let app = build_router_with_services(
+        ThreadlineConfig {
+            max_request_body_bytes: 1024,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+    let invalid_model = post_responses_json(app, json!({"model":"not-supported"})).await;
+    assert_eq!(invalid_model.status(), StatusCode::BAD_REQUEST);
+    assert_invalid_model_error(&read_json_body(invalid_model).await);
+
+    let auth = CountingMissingAuthProvider::new();
+    let app = build_router_with_services(
+        ThreadlineConfig {
+            max_request_body_bytes: 1,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::new(Arc::new(auth.clone()), Arc::new(UnusedConnector)),
+    );
+    let over_malformed =
+        post_responses_body(app, Some("application/json"), Body::from("{".repeat(2))).await;
+    assert_eq!(over_malformed.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_request_body_too_large(read_json_body(over_malformed).await);
+    assert_eq!(auth.load_count(), 0);
+}
+
+#[tokio::test]
+async fn request_body_limit_enforces_default_boundary_without_auth() {
+    let prefix = r#"{"model":"gpt-5.4"}"#;
+    let exact_body = json_body_with_trailing_whitespace(prefix, 32 * 1024 * 1024);
+    assert_eq!(exact_body.size_hint().upper(), None);
+    let exact_app = build_router_with_services(
+        ThreadlineConfig::default(),
+        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
+    );
+    let exact = post_responses_body(exact_app, Some("application/json"), exact_body).await;
+    assert_eq!(exact.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        read_json_body(exact).await["error"]["code"],
+        "upstream_credentials_unavailable"
+    );
+
+    let over_body = json_body_with_trailing_whitespace(prefix, 32 * 1024 * 1024 + 1);
+    assert_eq!(over_body.size_hint().upper(), None);
+    let over_auth = CountingMissingAuthProvider::new();
+    let over_app = build_router_with_services(
+        ThreadlineConfig::default(),
+        ThreadlineServices::new(Arc::new(over_auth.clone()), Arc::new(UnusedConnector)),
+    );
+    let over = post_responses_body(over_app, Some("application/json"), over_body).await;
+    assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        read_json_body(over).await,
+        json!({
+            "error": {
+                "code": "request_body_too_large",
+                "message": "The /v1/responses request body exceeds the configured byte limit.",
+                "type": "invalid_request_error"
+            }
+        })
+    );
+    assert_eq!(over_auth.load_count(), 0);
+}
+
+#[tokio::test]
+async fn request_body_limit_leaves_non_response_routes_unchanged_for_both_profiles() {
+    for profile in [RouteProfile::Main, RouteProfile::Utility] {
+        for uri in ["/health", "/v1/models"] {
+            let baseline = response_parts(
+                build_router(ThreadlineConfig {
+                    profile,
+                    max_request_body_bytes: 1,
+                    ..ThreadlineConfig::default()
+                })
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let oversized = response_parts(
+                build_router(ThreadlineConfig {
+                    profile,
+                    max_request_body_bytes: 1,
+                    ..ThreadlineConfig::default()
+                })
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::from("oversized unused request body"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(baseline.0, StatusCode::OK, "profile={profile:?}, uri={uri}");
+            assert_eq!(oversized, baseline, "profile={profile:?}, uri={uri}");
+        }
     }
 }
 

@@ -4119,6 +4119,58 @@ async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_do
 }
 
 #[tokio::test]
+async fn request_body_limit_forwards_large_input_and_preserves_visible_sse_completion() {
+    timeout(Duration::from_secs(1), async {
+        let server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = RecordingConnector::new(vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }]);
+        let app = build_test_router(
+            ThreadlineConfig {
+                max_request_body_bytes: 4 * 1024 * 1024,
+                ..ThreadlineConfig::default()
+            },
+            Arc::new(connector),
+        );
+        let input = "x".repeat(2 * 1024 * 1024 + 1);
+        let payload = json!({"model":"gpt-5.4","input":input});
+        let serialized_payload =
+            serde_json::to_vec(&payload).expect("serialized request payload");
+        assert!(serialized_payload.len() > 2 * 1024 * 1024);
+        assert!(serialized_payload.len() < 4 * 1024 * 1024);
+        let response = post_responses(app, payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+
+        let upstream_request: Value = serde_json::from_str(&message_text(
+            server.recv_client_message().await.expect("response.create"),
+        ))
+        .expect("response.create json");
+        assert_eq!(upstream_request["input"], input);
+
+        server
+            .send_text(r#"{"type":"response.output_text.delta","delta":"visible text"}"#)
+            .await;
+        server
+            .send_text(
+                r#"{"type":"response.completed","response":{"id":"response-large","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible text"}]}]}}"#,
+            )
+            .await;
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body_text.contains("visible text"));
+        assert!(body_text.contains("event: response.output_text.delta"));
+        assert!(body_text.contains("event: response.completed"));
+        assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+        assert!(!body_text.contains("event: response.failed"));
+    })
+    .await
+    .expect("request body bridge scenario should complete");
+}
+
+#[tokio::test]
 async fn completed_with_internal_function_call_and_assistant_text_synthesizes_delta() {
     let completed_event = json!({
         "type": "response.completed",

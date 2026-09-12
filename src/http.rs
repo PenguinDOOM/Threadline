@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::future::BoxFuture;
@@ -88,7 +90,10 @@ pub fn build_router_with_services(
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
-        .route("/v1/responses", post(responses_route))
+        .route(
+            "/v1/responses",
+            post(responses_route).layer(DefaultBodyLimit::max(config.max_request_body_bytes)),
+        )
         .with_state(state)
 }
 
@@ -117,10 +122,19 @@ async fn models(State(state): State<AppState>) -> Json<ModelListPayload> {
 async fn responses_route(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Result<impl axum::response::IntoResponse, ThreadlineError> {
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Result<Response, ThreadlineError> {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return Err(ThreadlineError::RequestBodyTooLarge);
+        }
+        Err(rejection) => return Ok(rejection.into_response()),
+    };
     let request_metadata = extract_downstream_request_metadata(&headers);
-    responses_handler(State(state.responses), Json(payload), request_metadata).await
+    responses_handler(State(state.responses), Json(payload), request_metadata)
+        .await
+        .map(IntoResponse::into_response)
 }
 
 fn extract_downstream_request_metadata(headers: &HeaderMap) -> DownstreamRequestMetadata {

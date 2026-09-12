@@ -27,6 +27,9 @@ pub enum ThreadlineError {
     #[error("The /v1/responses request body was not a valid JSON object.")]
     InvalidResponsesRequest,
 
+    #[error("The /v1/responses request body exceeds the configured byte limit.")]
+    RequestBodyTooLarge,
+
     #[error("The /v1/responses request must include a supported string model.")]
     InvalidModel,
 
@@ -114,6 +117,7 @@ impl ThreadlineError {
         match self {
             Self::ResponsesNotReady => StatusCode::NOT_IMPLEMENTED,
             Self::InvalidResponsesRequest => StatusCode::BAD_REQUEST,
+            Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InvalidModel => StatusCode::BAD_REQUEST,
             Self::UnsupportedReasoningContext => StatusCode::BAD_REQUEST,
             Self::PreviousResponseNotFound => StatusCode::BAD_REQUEST,
@@ -149,6 +153,11 @@ impl ThreadlineError {
             Self::InvalidResponsesRequest => borrowed_public_error(
                 "invalid_request_error",
                 "The /v1/responses request body must be a JSON object.",
+                "invalid_request_error",
+            ),
+            Self::RequestBodyTooLarge => borrowed_public_error(
+                "request_body_too_large",
+                "The /v1/responses request body exceeds the configured byte limit.",
                 "invalid_request_error",
             ),
             Self::InvalidModel => borrowed_public_error(

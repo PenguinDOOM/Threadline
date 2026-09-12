@@ -21,6 +21,7 @@ const DEFAULT_PERSISTENT_REASONING_ENABLED: bool = false;
 const DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES: usize = 32 * 1024;
 const DEFAULT_JOB_RETENTION_TTL_SECS: u64 = 300;
 const DEFAULT_LOG_LEVEL: &str = "info";
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 static ACTIVE_JOB_MANAGER_CONFIG: LazyLock<Mutex<ThreadlineJobManagerConfig>> =
     LazyLock::new(|| Mutex::new(ThreadlineJobManagerConfig::default()));
@@ -88,6 +89,17 @@ pub struct ThreadlineConfig {
         long_help = "Maximum retained session capacity for response continuation. Higher values allow more completed response markers to keep a retained session available for follow-up requests."
     )]
     pub retained_session_capacity: usize,
+
+    #[arg(
+        long,
+        env = "THREADLINE_MAX_REQUEST_BODY_BYTES",
+        default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES,
+        value_parser = parse_max_request_body_bytes,
+        value_name = "BYTES",
+        help = "Maximum accepted /v1/responses request body size in bytes.",
+        long_help = "Maximum accepted /v1/responses request body size in bytes. Requests larger than this finite limit are rejected before Threadline processes them."
+    )]
+    pub max_request_body_bytes: usize,
 
     #[arg(
         long,
@@ -199,6 +211,7 @@ impl Default for ThreadlineConfig {
             profile: DEFAULT_PROFILE,
             codex_client_version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
             retained_session_capacity: DEFAULT_RETAINED_SESSION_CAPACITY,
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             upstream_inbound_max_messages: DEFAULT_UPSTREAM_INBOUND_MAX_MESSAGES,
             upstream_inbound_max_bytes: DEFAULT_UPSTREAM_INBOUND_MAX_BYTES,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
@@ -310,6 +323,10 @@ fn parse_upstream_inbound_max_messages(value: &str) -> Result<usize, String> {
     parse_bounded_usize(value, 1, MAX_UPSTREAM_INBOUND_MAX_MESSAGES)
 }
 
+fn parse_max_request_body_bytes(value: &str) -> Result<usize, String> {
+    parse_bounded_usize(value, 1, usize::MAX)
+}
+
 fn parse_upstream_inbound_max_bytes(value: &str) -> Result<usize, String> {
     parse_bounded_usize(value, 1, MAX_UPSTREAM_INBOUND_MAX_BYTES)
 }
@@ -351,8 +368,9 @@ mod tests {
     use crate::models::RouteProfile;
 
     use super::{
-        DEFAULT_CODEX_CLIENT_VERSION, DEFAULT_MAX_ACTIVE_JOBS, DEFAULT_MAX_RETAINED_JOBS,
-        ThreadlineConfig, UpstreamInboundLimits, job_manager_config_from_environment,
+        DEFAULT_CODEX_CLIENT_VERSION, DEFAULT_MAX_ACTIVE_JOBS, DEFAULT_MAX_REQUEST_BODY_BYTES,
+        DEFAULT_MAX_RETAINED_JOBS, ThreadlineConfig, UpstreamInboundLimits,
+        job_manager_config_from_environment,
     };
 
     struct ProfileEnvGuard {
@@ -430,6 +448,10 @@ mod tests {
         retained: Option<OsString>,
     }
 
+    struct RequestBodyLimitEnvGuard {
+        max_request_body_bytes: Option<OsString>,
+    }
+
     impl JobCapacityEnvGuard {
         fn acquire() -> Self {
             Self {
@@ -443,6 +465,23 @@ mod tests {
         fn drop(&mut self) {
             restore_env_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", self.active.take());
             restore_env_var("THREADLINE_JOB_MAX_RETAINED_JOBS", self.retained.take());
+        }
+    }
+
+    impl RequestBodyLimitEnvGuard {
+        fn acquire() -> Self {
+            Self {
+                max_request_body_bytes: std::env::var_os("THREADLINE_MAX_REQUEST_BODY_BYTES"),
+            }
+        }
+    }
+
+    impl Drop for RequestBodyLimitEnvGuard {
+        fn drop(&mut self) {
+            restore_env_var(
+                "THREADLINE_MAX_REQUEST_BODY_BYTES",
+                self.max_request_body_bytes.take(),
+            );
         }
     }
 
@@ -612,6 +651,67 @@ mod tests {
     }
 
     #[test]
+    fn request_body_limit_defaults_overrides_and_rejects_invalid_values() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        let _guard = RequestBodyLimitEnvGuard::acquire();
+        unsafe { std::env::remove_var("THREADLINE_MAX_REQUEST_BODY_BYTES") };
+
+        let default_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(
+            ThreadlineConfig::default().max_request_body_bytes,
+            33_554_432
+        );
+        assert_eq!(default_config.max_request_body_bytes, 33_554_432);
+        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 33_554_432);
+
+        unsafe { std::env::set_var("THREADLINE_MAX_REQUEST_BODY_BYTES", "1") };
+        let minimum_environment_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(minimum_environment_config.max_request_body_bytes, 1);
+
+        unsafe { std::env::set_var("THREADLINE_MAX_REQUEST_BODY_BYTES", "3") };
+        let environment_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(environment_config.max_request_body_bytes, 3);
+
+        let cli_config =
+            ThreadlineCli::try_parse_from(["threadline", "--max-request-body-bytes", "1"])
+                .expect("positive body limit should parse")
+                .server;
+        assert_eq!(cli_config.max_request_body_bytes, 1);
+
+        for invalid in [
+            "0",
+            "-1",
+            "not-a-number",
+            "999999999999999999999999999999999999",
+        ] {
+            assert!(
+                ThreadlineCli::try_parse_from(["threadline", "--max-request-body-bytes", invalid])
+                    .is_err(),
+                "CLI should reject {invalid:?}"
+            );
+            unsafe { std::env::set_var("THREADLINE_MAX_REQUEST_BODY_BYTES", invalid) };
+            assert!(
+                ThreadlineCli::try_parse_from(["threadline"]).is_err(),
+                "environment should reject {invalid:?}"
+            );
+        }
+
+        let maximum = usize::MAX.to_string();
+        let maximum_config =
+            ThreadlineCli::try_parse_from(["threadline", "--max-request-body-bytes", &maximum])
+                .expect("usize maximum should parse")
+                .server;
+        assert_eq!(maximum_config.max_request_body_bytes, usize::MAX);
+
+        unsafe { std::env::set_var("THREADLINE_MAX_REQUEST_BODY_BYTES", &maximum) };
+        let maximum_environment_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(
+            maximum_environment_config.max_request_body_bytes,
+            usize::MAX
+        );
+    }
+
+    #[test]
     fn job_capacity_defaults_cli_values_and_zero_are_preserved() {
         let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let _guard = JobCapacityEnvGuard::acquire();
@@ -766,6 +866,10 @@ mod tests {
             (
                 "retained-session-capacity",
                 &["retained session", "capacity"][..],
+            ),
+            (
+                "max-request-body-bytes",
+                &["/v1/responses", "body", "bytes", "finite"][..],
             ),
             (
                 "upstream-inbound-max-messages",

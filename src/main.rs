@@ -243,6 +243,7 @@ mod tests {
             port: 8100,
             utility_port: Some(8101),
             retained_session_capacity: 9,
+            max_request_body_bytes: 1234,
             jobs_enabled: true,
             persistent_reasoning_enabled: true,
             ..ThreadlineConfig::default()
@@ -254,6 +255,7 @@ mod tests {
         assert_eq!(utility_config.profile, RouteProfile::Utility);
         assert_eq!(utility_config.port, 8101);
         assert_eq!(utility_config.retained_session_capacity, 0);
+        assert_eq!(utility_config.max_request_body_bytes, 1234);
         assert!(!utility_config.jobs_enabled);
         assert!(!utility_config.persistent_reasoning_enabled);
 
