@@ -66,6 +66,9 @@ pub enum ThreadlineError {
     #[error("The upstream websocket inbound buffer overflowed.")]
     UpstreamInboundBufferOverflow,
 
+    #[error("The upstream websocket liveness check timed out.")]
+    UpstreamLivenessTimeout,
+
     #[error(
         "The upstream response.failed event cannot be streamed as a successful downstream response."
     )]
@@ -131,6 +134,7 @@ impl ThreadlineError {
             Self::UpstreamWebSocketHandshakeRejected { status } => *status,
             Self::UpstreamWebSocketClosed => StatusCode::BAD_GATEWAY,
             Self::UpstreamInboundBufferOverflow => StatusCode::BAD_GATEWAY,
+            Self::UpstreamLivenessTimeout => StatusCode::BAD_GATEWAY,
             Self::UpstreamResponseFailed => StatusCode::BAD_GATEWAY,
             Self::UpstreamErrorEvent => StatusCode::BAD_GATEWAY,
             Self::UpstreamInvalidJson => StatusCode::BAD_GATEWAY,
@@ -214,6 +218,11 @@ impl ThreadlineError {
             Self::UpstreamInboundBufferOverflow => borrowed_public_error(
                 "upstream_inbound_buffer_overflow",
                 "The upstream websocket inbound buffer overflowed.",
+                "server_error",
+            ),
+            Self::UpstreamLivenessTimeout => borrowed_public_error(
+                "upstream_liveness_timeout",
+                "The upstream websocket liveness check timed out.",
                 "server_error",
             ),
             Self::UpstreamResponseFailed => borrowed_public_error(
@@ -434,6 +443,21 @@ mod tests {
         assert_eq!(
             document.error.message.as_ref(),
             "The upstream websocket connection timed out."
+        );
+    }
+
+    #[test]
+    fn upstream_liveness_timeout_has_a_stable_public_error() {
+        let error = ThreadlineError::UpstreamLivenessTimeout;
+
+        assert_eq!(error.status_code(), StatusCode::BAD_GATEWAY);
+        assert!(!error.is_upstream_recoverable_close());
+        let document = error.public_error_document();
+        assert_eq!(document.error.code.as_ref(), "upstream_liveness_timeout");
+        assert_eq!(document.error.error_type.as_ref(), "server_error");
+        assert_eq!(
+            document.error.message.as_ref(),
+            "The upstream websocket liveness check timed out."
         );
     }
 }

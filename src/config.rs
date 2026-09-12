@@ -9,6 +9,7 @@ use crate::models::RouteProfile;
 use crate::ws_pump::{
     DEFAULT_UPSTREAM_INBOUND_MAX_BYTES, DEFAULT_UPSTREAM_INBOUND_MAX_MESSAGES,
     MAX_UPSTREAM_INBOUND_MAX_BYTES, MAX_UPSTREAM_INBOUND_MAX_MESSAGES, UpstreamInboundLimits,
+    UpstreamWatchdogPolicy,
 };
 
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -23,6 +24,8 @@ const DEFAULT_JOB_RETENTION_TTL_SECS: u64 = 300;
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
 const MAX_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 3600;
+const DEFAULT_UPSTREAM_PONG_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_UPSTREAM_WRITE_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 static ACTIVE_JOB_MANAGER_CONFIG: LazyLock<Mutex<ThreadlineJobManagerConfig>> =
@@ -138,6 +141,28 @@ pub struct ThreadlineConfig {
 
     #[arg(
         long,
+        env = "THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS",
+        default_value_t = DEFAULT_UPSTREAM_PONG_TIMEOUT_SECS,
+        value_parser = parse_upstream_watchdog_timeout_secs,
+        value_name = "SECONDS",
+        help = "Maximum time to wait for a matching upstream websocket Pong.",
+        long_help = "Maximum time to wait for a matching upstream websocket Pong after Threadline sends a liveness challenge."
+    )]
+    pub upstream_pong_timeout_secs: u64,
+
+    #[arg(
+        long,
+        env = "THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS",
+        default_value_t = DEFAULT_UPSTREAM_WRITE_TIMEOUT_SECS,
+        value_parser = parse_upstream_watchdog_timeout_secs,
+        value_name = "SECONDS",
+        help = "Maximum time allowed for an upstream websocket write or control flush.",
+        long_help = "Maximum total time allowed for one upstream websocket Text, Ping, or automatic control-frame flush operation."
+    )]
+    pub upstream_write_timeout_secs: u64,
+
+    #[arg(
+        long,
         env = "THREADLINE_JOBS_ENABLED",
         default_value_t = DEFAULT_JOBS_ENABLED,
         value_name = "BOOL",
@@ -228,6 +253,8 @@ impl Default for ThreadlineConfig {
             upstream_inbound_max_messages: DEFAULT_UPSTREAM_INBOUND_MAX_MESSAGES,
             upstream_inbound_max_bytes: DEFAULT_UPSTREAM_INBOUND_MAX_BYTES,
             upstream_connect_timeout_secs: DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS,
+            upstream_pong_timeout_secs: DEFAULT_UPSTREAM_PONG_TIMEOUT_SECS,
+            upstream_write_timeout_secs: DEFAULT_UPSTREAM_WRITE_TIMEOUT_SECS,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
             persistent_reasoning_enabled: DEFAULT_PERSISTENT_REASONING_ENABLED,
             job_output_buffer_limit_bytes: DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,
@@ -271,6 +298,13 @@ impl ThreadlineConfig {
         } else {
             Err("upstream connect timeout must be between 1 and 3600 seconds")
         }
+    }
+
+    pub fn upstream_watchdog_policy(&self) -> Result<UpstreamWatchdogPolicy, &'static str> {
+        UpstreamWatchdogPolicy::new(
+            Duration::from_secs(self.upstream_pong_timeout_secs),
+            Duration::from_secs(self.upstream_write_timeout_secs),
+        )
     }
 
     pub fn job_manager_config(&self) -> ThreadlineJobManagerConfig {
@@ -354,6 +388,14 @@ fn parse_upstream_inbound_max_bytes(value: &str) -> Result<usize, String> {
 }
 
 fn parse_upstream_connect_timeout_secs(value: &str) -> Result<u64, String> {
+    parse_upstream_timeout_secs(value)
+}
+
+fn parse_upstream_watchdog_timeout_secs(value: &str) -> Result<u64, String> {
+    parse_upstream_timeout_secs(value)
+}
+
+fn parse_upstream_timeout_secs(value: &str) -> Result<u64, String> {
     let parsed = value
         .parse::<u64>()
         .map_err(|_| "must be an integer between 1 and 3600".to_string())?;
@@ -402,7 +444,7 @@ mod tests {
 
     use super::{
         DEFAULT_CODEX_CLIENT_VERSION, DEFAULT_MAX_ACTIVE_JOBS, DEFAULT_MAX_REQUEST_BODY_BYTES,
-        DEFAULT_MAX_RETAINED_JOBS, ThreadlineConfig, UpstreamInboundLimits,
+        DEFAULT_MAX_RETAINED_JOBS, ThreadlineConfig, UpstreamInboundLimits, UpstreamWatchdogPolicy,
         job_manager_config_from_environment,
     };
 
@@ -489,6 +531,11 @@ mod tests {
         value: Option<OsString>,
     }
 
+    struct UpstreamWatchdogTimeoutsEnvGuard {
+        pong: Option<OsString>,
+        write: Option<OsString>,
+    }
+
     impl UpstreamConnectTimeoutEnvGuard {
         fn acquire() -> Self {
             Self {
@@ -503,6 +550,22 @@ mod tests {
                 "THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS",
                 self.value.take(),
             );
+        }
+    }
+
+    impl UpstreamWatchdogTimeoutsEnvGuard {
+        fn acquire() -> Self {
+            Self {
+                pong: std::env::var_os("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS"),
+                write: std::env::var_os("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS"),
+            }
+        }
+    }
+
+    impl Drop for UpstreamWatchdogTimeoutsEnvGuard {
+        fn drop(&mut self) {
+            restore_env_var("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS", self.pong.take());
+            restore_env_var("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS", self.write.take());
         }
     }
 
@@ -755,6 +818,104 @@ mod tests {
 
         assert_eq!(from_environment.upstream_connect_timeout_secs, 17);
         assert_eq!(from_cli.upstream_connect_timeout_secs, 23);
+    }
+
+    #[test]
+    fn upstream_watchdog_timeouts_validate_cli_environment_and_policy() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        let _guard = UpstreamWatchdogTimeoutsEnvGuard::acquire();
+        unsafe {
+            std::env::remove_var("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS");
+            std::env::remove_var("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS");
+        }
+
+        let defaults = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(defaults.upstream_pong_timeout_secs, 60);
+        assert_eq!(defaults.upstream_write_timeout_secs, 60);
+        assert_eq!(
+            defaults.upstream_watchdog_policy(),
+            Ok(UpstreamWatchdogPolicy::DEFAULT)
+        );
+
+        unsafe {
+            std::env::set_var("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS", "17");
+            std::env::set_var("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS", "19");
+        }
+
+        let from_environment = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(from_environment.upstream_pong_timeout_secs, 17);
+        assert_eq!(from_environment.upstream_write_timeout_secs, 19);
+
+        let from_cli = ThreadlineCli::try_parse_from([
+            "threadline",
+            "--upstream-pong-timeout-secs",
+            "23",
+            "--upstream-write-timeout-secs",
+            "29",
+        ])
+        .expect("valid CLI values")
+        .server;
+        assert_eq!(from_cli.upstream_pong_timeout_secs, 23);
+        assert_eq!(from_cli.upstream_write_timeout_secs, 29);
+        assert_eq!(
+            from_cli.upstream_watchdog_policy().unwrap().pong_timeout(),
+            std::time::Duration::from_secs(23)
+        );
+        assert_eq!(
+            from_cli.upstream_watchdog_policy().unwrap().write_timeout(),
+            std::time::Duration::from_secs(29)
+        );
+    }
+
+    #[test]
+    fn upstream_watchdog_timeouts_reject_invalid_values_and_accept_boundaries() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        let _guard = UpstreamWatchdogTimeoutsEnvGuard::acquire();
+        unsafe {
+            std::env::remove_var("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS");
+            std::env::remove_var("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS");
+        }
+
+        for flag in [
+            "--upstream-pong-timeout-secs",
+            "--upstream-write-timeout-secs",
+        ] {
+            for value in ["0", "3601", "-1", "not-a-number"] {
+                assert!(ThreadlineCli::try_parse_from(["threadline", flag, value]).is_err());
+            }
+            for value in ["1", "3600"] {
+                assert!(ThreadlineCli::try_parse_from(["threadline", flag, value]).is_ok());
+            }
+        }
+
+        for config in [
+            ThreadlineConfig {
+                upstream_pong_timeout_secs: 0,
+                ..ThreadlineConfig::default()
+            },
+            ThreadlineConfig {
+                upstream_pong_timeout_secs: 3601,
+                ..ThreadlineConfig::default()
+            },
+            ThreadlineConfig {
+                upstream_write_timeout_secs: 0,
+                ..ThreadlineConfig::default()
+            },
+            ThreadlineConfig {
+                upstream_write_timeout_secs: 3601,
+                ..ThreadlineConfig::default()
+            },
+        ] {
+            assert!(config.upstream_watchdog_policy().is_err());
+        }
+
+        assert!(
+            UpstreamWatchdogPolicy::new(
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_millis(1),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, Response, StatusCode};
@@ -23,7 +23,7 @@ use threadline::http::build_router_with_services;
 use threadline::responses::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
 };
-use threadline::ws_pump::LiveUpstreamWebSocket;
+use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamWatchdogPolicy};
 
 #[derive(Clone)]
 struct StaticAuthProvider;
@@ -42,12 +42,14 @@ struct PlannedConnection {
     server: Arc<ScriptedWebSocketServer>,
     turn_state: Option<String>,
     wait_until_closed_before_return: bool,
+    watchdog_policy: Option<UpstreamWatchdogPolicy>,
 }
 
 #[derive(Clone)]
 struct RecordingConnector {
     plans: Arc<Mutex<VecDeque<PlannedConnection>>>,
     sessions: Arc<Mutex<Vec<UpstreamSessionDescriptor>>>,
+    websockets: Arc<Mutex<Vec<Weak<LiveUpstreamWebSocket>>>>,
 }
 
 impl RecordingConnector {
@@ -55,11 +57,16 @@ impl RecordingConnector {
         Self {
             plans: Arc::new(Mutex::new(plans.into())),
             sessions: Arc::new(Mutex::new(Vec::new())),
+            websockets: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     async fn recorded_sessions(&self) -> Vec<UpstreamSessionDescriptor> {
         self.sessions.lock().await.clone()
+    }
+
+    async fn recorded_websockets(&self) -> Vec<Weak<LiveUpstreamWebSocket>> {
+        self.websockets.lock().await.clone()
     }
 }
 
@@ -71,6 +78,7 @@ impl UpstreamConnector for RecordingConnector {
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
         let plans = Arc::clone(&self.plans);
         let sessions = Arc::clone(&self.sessions);
+        let websockets = Arc::clone(&self.websockets);
         Box::pin(async move {
             let session = session.unwrap_or_else(new_session_descriptor);
             let plan = plans
@@ -83,7 +91,17 @@ impl UpstreamConnector for RecordingConnector {
             let (stream, _) = connect_async(plan.server.url())
                 .await
                 .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
-            let websocket = Arc::new(LiveUpstreamWebSocket::from_stream(stream));
+            let websocket = Arc::new(match plan.watchdog_policy {
+                Some(policy) => {
+                    LiveUpstreamWebSocket::from_stream_with_ping_interval_and_watchdog_policy(
+                        stream,
+                        Duration::from_millis(5),
+                        policy,
+                    )
+                }
+                None => LiveUpstreamWebSocket::from_stream(stream),
+            });
+            websockets.lock().await.push(Arc::downgrade(&websocket));
 
             if plan.wait_until_closed_before_return {
                 timeout(Duration::from_secs(1), async {
@@ -109,6 +127,11 @@ fn build_test_router(connector: Arc<dyn UpstreamConnector>) -> axum::Router {
         ThreadlineConfig::default(),
         ThreadlineServices::new(Arc::new(StaticAuthProvider), connector),
     )
+}
+
+fn short_watchdog_policy() -> UpstreamWatchdogPolicy {
+    UpstreamWatchdogPolicy::new(Duration::from_millis(30), Duration::from_secs(1))
+        .expect("valid watchdog policy")
 }
 
 async fn post_responses(app: axum::Router, payload: Value) -> Response<Body> {
@@ -278,6 +301,183 @@ async fn seed_marker(app: axum::Router, server: &ScriptedWebSocketServer, marker
         .expect("seed body");
 }
 
+async fn seed_marker_without_reader(
+    app: axum::Router,
+    server: &ScriptedWebSocketServer,
+    marker: &str,
+) {
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    server
+        .send_text(&assistant_text_completed_event(marker, "seed completion").to_string())
+        .await;
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+}
+
+#[tokio::test]
+async fn retained_continuation_liveness_timeout_before_preflight_returns_previous_response_not_found_without_reconnect()
+ {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: Some("retained-turn-state".to_string()),
+            wait_until_closed_before_return: false,
+            watchdog_policy: Some(short_watchdog_policy()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&unexpected_reconnect_server),
+            turn_state: None,
+            wait_until_closed_before_return: false,
+            watchdog_policy: None,
+        },
+    ]);
+    let app = build_test_router(Arc::new(connector.clone()));
+
+    seed_marker_without_reader(app.clone(), &retained_server, "response-1").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let response = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let payload: Value = serde_json::from_slice(&body).expect("error json");
+    assert_eq!(payload["error"]["code"], "previous_response_not_found");
+
+    let no_reconnect = timeout(
+        Duration::from_millis(250),
+        unexpected_reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_reconnect.is_err());
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+}
+
+#[tokio::test]
+async fn retained_continuation_liveness_timeout_before_first_upstream_event_returns_stale_sse_and_invalidates_aliases()
+ {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start_with_stoppable_reader().await);
+    let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: Some("retained-turn-state".to_string()),
+            wait_until_closed_before_return: false,
+            watchdog_policy: Some(short_watchdog_policy()),
+        },
+        PlannedConnection {
+            server: Arc::clone(&unexpected_reconnect_server),
+            turn_state: None,
+            wait_until_closed_before_return: false,
+            watchdog_policy: None,
+        },
+    ]);
+    let app = build_test_router(Arc::new(connector.clone()));
+
+    seed_marker_without_reader(app.clone(), &retained_server, "response-1").await;
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("seed response.create");
+
+    let response = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"followup",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = retained_server
+        .recv_client_message()
+        .await
+        .expect("continuation response.create");
+    retained_server.stop_reader();
+    let retained_websocket = connector
+        .recorded_websockets()
+        .await
+        .into_iter()
+        .next()
+        .expect("retained websocket");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if retained_websocket.upgrade().is_some_and(|websocket| {
+                matches!(
+                    websocket.terminal_state(),
+                    threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(_)
+                )
+            }) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("watchdog terminal snapshot before downstream body polling");
+
+    let body = timeout(
+        Duration::from_secs(1),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("timeout body")
+    .expect("response body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_response_failed_payload(&payload, "previous_response_not_found");
+    assert_done_frame(frames[1]);
+    assert!(
+        retained_websocket.upgrade().is_none(),
+        "the invalidated retained entry must not keep the timed-out upstream alive"
+    );
+
+    let retry = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"retry",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
+    let retry_body = to_bytes(retry.into_body(), usize::MAX)
+        .await
+        .expect("retry body");
+    let retry_payload: Value = serde_json::from_slice(&retry_body).expect("retry error json");
+    assert_eq!(
+        retry_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+
+    let no_reconnect = timeout(
+        Duration::from_millis(250),
+        unexpected_reconnect_server.recv_client_message(),
+    )
+    .await;
+    assert!(no_reconnect.is_err());
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+}
+
 #[tokio::test]
 async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -285,6 +485,7 @@ async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
         server: Arc::clone(&server),
         turn_state: None,
         wait_until_closed_before_return: false,
+        watchdog_policy: None,
     }]);
     let app = build_test_router(Arc::new(connector.clone()));
 
@@ -327,11 +528,13 @@ async fn live_retained_continuation_close_before_first_send_returns_previous_res
             server: Arc::clone(&retained_server),
             turn_state: Some("turn-state-1".to_string()),
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
         PlannedConnection {
             server: Arc::clone(&unexpected_reconnect_server),
             turn_state: None,
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
     ]);
     let app = build_test_router(Arc::new(connector.clone()));
@@ -400,6 +603,7 @@ async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
         server: Arc::clone(&seed_server),
         turn_state: Some("turn-state-1".to_string()),
         wait_until_closed_before_return: false,
+        watchdog_policy: None,
     }]);
     let app = build_test_router(Arc::new(connector.clone()));
 
@@ -467,11 +671,13 @@ async fn retained_continuation_close_after_send_before_first_upstream_event_repl
             server: Arc::clone(&retained_server),
             turn_state: Some("turn-state-1".to_string()),
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
         PlannedConnection {
             server: Arc::clone(&unexpected_reconnect_server),
             turn_state: None,
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
     ]);
     let app = build_test_router(Arc::new(connector.clone()));
@@ -547,16 +753,19 @@ async fn stale_continuation_with_spare_reconnect_plans_returns_previous_response
             server: Arc::clone(&seed_server),
             turn_state: Some("turn-state-1".to_string()),
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
         PlannedConnection {
             server: Arc::clone(&first_attempt_server),
             turn_state: None,
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
         PlannedConnection {
             server: Arc::clone(&reconnect_server),
             turn_state: None,
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
     ]);
     let app = build_test_router(Arc::new(connector.clone()));
@@ -610,11 +819,13 @@ async fn stale_continuation_returns_previous_response_not_found_before_sse_witho
             server: Arc::clone(&seed_server),
             turn_state: Some("turn-state-1".to_string()),
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
         PlannedConnection {
             server: Arc::clone(&unexpected_reconnect_server),
             turn_state: None,
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
     ]);
     let app = build_test_router(Arc::new(connector.clone()));
@@ -666,16 +877,19 @@ async fn summary_request_first_send_failure_does_not_reconnect_as_continuation()
             server: Arc::clone(&seed_server),
             turn_state: Some("turn-state-1".to_string()),
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
         PlannedConnection {
             server: Arc::clone(&first_attempt_server),
             turn_state: None,
             wait_until_closed_before_return: true,
+            watchdog_policy: None,
         },
         PlannedConnection {
             server: Arc::clone(&unexpected_reconnect_server),
             turn_state: None,
             wait_until_closed_before_return: false,
+            watchdog_policy: None,
         },
     ]);
     let app = build_test_router(Arc::new(connector.clone()));

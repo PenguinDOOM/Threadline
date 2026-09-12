@@ -54,6 +54,7 @@ struct RegistryEntry {
     upstream: Option<Arc<LiveUpstreamWebSocket>>,
     in_use: bool,
     recoverable: bool,
+    liveness_timed_out: bool,
     last_used: Instant,
     markers: Vec<String>,
 }
@@ -108,6 +109,7 @@ impl RetainedSessionRegistry {
                 upstream: None,
                 in_use: true,
                 recoverable: true,
+                liveness_timed_out: false,
                 last_used: Instant::now(),
                 markers: Vec::new(),
             },
@@ -152,6 +154,10 @@ impl RetainedSessionRegistry {
             return Err(RegistryAcquireError::UpstreamInboundBufferOverflow);
         }
 
+        if entry.liveness_timed_out {
+            return Err(RegistryAcquireError::PreviousResponseNotFound);
+        }
+
         if let Some(upstream) = entry.upstream.as_ref() {
             match upstream.terminal_state() {
                 UpstreamTerminalState::InboundBufferOverflow(_) => {
@@ -162,6 +168,12 @@ impl RetainedSessionRegistry {
                 UpstreamTerminalState::Closed(_) => {
                     entry.upstream = None;
                     entry.recoverable = true;
+                }
+                UpstreamTerminalState::LivenessTimeout(_) => {
+                    entry.upstream = None;
+                    entry.recoverable = true;
+                    entry.liveness_timed_out = true;
+                    return Err(RegistryAcquireError::PreviousResponseNotFound);
                 }
                 UpstreamTerminalState::Open => {}
             }
@@ -246,6 +258,18 @@ impl RetainedSessionLease {
     pub fn finalize_recoverable_turn(&mut self) {
         self.detach_upstream_recoverably();
         self.disarm_active_turn();
+        self.remove_markerless_entry();
+    }
+
+    pub fn finalize_liveness_timeout_turn(&mut self) {
+        self.detach_upstream_recoverably();
+        self.disarm_active_turn();
+        if let Ok(mut state) = self.registry.lock()
+            && let Some(entry) = state.entries.get_mut(&self.entry_id)
+        {
+            entry.liveness_timed_out = true;
+        }
+        self.remove_markerless_entry();
     }
 
     pub fn detach_upstream_recoverably(&mut self) {
@@ -306,6 +330,7 @@ impl RetainedSessionLease {
         if let Some(entry) = state.entries.get_mut(&self.entry_id) {
             entry.upstream = upstream;
             entry.recoverable = true;
+            entry.liveness_timed_out = false;
             entry.last_used = Instant::now();
         }
     }
@@ -341,6 +366,23 @@ impl RetainedSessionLease {
         self.removed = true;
         self.released = true;
     }
+
+    fn remove_markerless_entry(&mut self) {
+        let is_markerless = self
+            .registry
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .entries
+                    .get(&self.entry_id)
+                    .map(|entry| entry.markers.is_empty())
+            })
+            .unwrap_or(false);
+        if is_markerless {
+            self.remove_entry();
+        }
+    }
 }
 
 impl Drop for RetainedSessionLease {
@@ -364,6 +406,59 @@ fn remove_entry(state: &mut RegistryState, entry_id: u64) {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::io::duplex;
+    use tokio::time::advance;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    use crate::ws_pump::{UpstreamLivenessTimeout, UpstreamWatchdogPolicy};
+
+    fn explicit_session() -> UpstreamSessionDescriptor {
+        UpstreamSessionDescriptor {
+            session_id: "session-known".to_string(),
+            thread_id: "thread-known".to_string(),
+            window_id: "thread-known:7".to_string(),
+            turn_state: Some("turn-state-known".to_string()),
+        }
+    }
+
+    fn set_entry_metadata(
+        registry: &RetainedSessionRegistry,
+        entry_id: u64,
+        session: UpstreamSessionDescriptor,
+    ) {
+        let mut state = registry.inner.lock().expect("registry mutex poisoned");
+        let entry = state
+            .entries
+            .get_mut(&entry_id)
+            .expect("entry should exist");
+        entry.session = session;
+        entry.window_generation = 7;
+    }
+
+    async fn liveness_timed_out_upstream() -> Arc<LiveUpstreamWebSocket> {
+        let (client_io, _server_io) = duplex(1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let policy = UpstreamWatchdogPolicy::new(Duration::from_millis(1), Duration::from_secs(1))
+            .expect("valid watchdog policy");
+        let upstream = Arc::new(
+            LiveUpstreamWebSocket::from_stream_with_ping_interval_and_watchdog_policy(
+                client,
+                Duration::ZERO,
+                policy,
+            ),
+        );
+
+        tokio::task::yield_now().await;
+        advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            upstream.terminal_state(),
+            UpstreamTerminalState::LivenessTimeout(UpstreamLivenessTimeout { .. })
+        ));
+
+        upstream
+    }
 
     #[tokio::test]
     async fn recording_a_completed_marker_refreshes_last_used() {
@@ -460,5 +555,106 @@ mod tests {
                 Err(RegistryAcquireError::UpstreamInboundBufferOverflow)
             ));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_liveness_timeout_preserves_completed_aliases_and_metadata_after_repeated_acquire()
+    {
+        let registry = RetainedSessionRegistry::new(1);
+        let mut lease = registry.acquire_new().await.expect("create session");
+        let session = explicit_session();
+        set_entry_metadata(&registry, lease.entry_id, session.clone());
+        lease.record_completed_marker("response-accepted").await;
+        lease.record_completed_marker("response-alias").await;
+        lease
+            .replace_upstream(Some(liveness_timed_out_upstream().await))
+            .await;
+        lease.release();
+
+        let entry_id = lease.entry_id;
+        for _ in 0..2 {
+            assert!(matches!(
+                registry.acquire_previous("response-accepted").await,
+                Err(RegistryAcquireError::PreviousResponseNotFound)
+            ));
+        }
+
+        let state = registry.inner.lock().expect("registry mutex poisoned");
+        let entry = state.entries.get(&entry_id).expect("entry should remain");
+        assert_eq!(state.markers.get("response-accepted"), Some(&entry_id));
+        assert_eq!(state.markers.get("response-alias"), Some(&entry_id));
+        assert_eq!(entry.markers, vec!["response-accepted", "response-alias"]);
+        assert_eq!(entry.session, session);
+        assert_eq!(entry.window_generation, 7);
+        assert!(entry.upstream.is_none());
+        assert!(entry.recoverable);
+        assert!(entry.liveness_timed_out);
+        assert!(!entry.in_use);
+    }
+
+    #[tokio::test]
+    async fn finalize_liveness_timeout_preserves_completed_metadata_and_reclaims_markerless_entry()
+    {
+        let registry = RetainedSessionRegistry::new(1);
+        let mut lease = registry.acquire_new().await.expect("create session");
+        let session = explicit_session();
+        set_entry_metadata(&registry, lease.entry_id, session.clone());
+        lease.record_completed_marker("response-accepted").await;
+        lease.record_completed_marker("response-alias").await;
+        lease.arm_active_turn();
+        lease.finalize_liveness_timeout_turn();
+
+        let entry_id = lease.entry_id;
+        {
+            let state = registry.inner.lock().expect("registry mutex poisoned");
+            let entry = state.entries.get(&entry_id).expect("entry should remain");
+            assert_eq!(state.markers.get("response-accepted"), Some(&entry_id));
+            assert_eq!(state.markers.get("response-alias"), Some(&entry_id));
+            assert!(!state.markers.contains_key("response-unaccepted-final"));
+            assert_eq!(entry.markers, vec!["response-accepted", "response-alias"]);
+            assert_eq!(entry.session, session);
+            assert_eq!(entry.window_generation, 7);
+            assert!(entry.upstream.is_none());
+            assert!(entry.recoverable);
+            assert!(entry.liveness_timed_out);
+            assert!(entry.in_use);
+        }
+
+        lease.release();
+        {
+            let state = registry.inner.lock().expect("registry mutex poisoned");
+            assert!(
+                !state
+                    .entries
+                    .get(&entry_id)
+                    .expect("entry should remain")
+                    .in_use
+            );
+        }
+        assert!(matches!(
+            registry.acquire_previous("response-unaccepted-final").await,
+            Err(RegistryAcquireError::PreviousResponseNotFound)
+        ));
+
+        let markerless_registry = RetainedSessionRegistry::new(1);
+        let mut markerless_lease = markerless_registry
+            .acquire_new()
+            .await
+            .expect("create markerless session");
+        markerless_lease.arm_active_turn();
+        markerless_lease.finalize_liveness_timeout_turn();
+
+        {
+            let state = markerless_registry
+                .inner
+                .lock()
+                .expect("registry mutex poisoned");
+            assert!(state.entries.is_empty());
+            assert!(state.markers.is_empty());
+        }
+        markerless_registry
+            .acquire_new()
+            .await
+            .expect("markerless timeout should reclaim capacity");
     }
 }

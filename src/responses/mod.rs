@@ -383,6 +383,7 @@ pub(crate) async fn responses_handler(
         lease: prepared.lease,
         base_request: prepared.upstream_request,
         pending_internal_outputs: Vec::new(),
+        followup_send_started: false,
         previous_response_id: prepared.previous_response_id,
         execute_internal_tools: prepared.execute_internal_tools,
         suppressed_internal_output_indexes: std::collections::HashSet::new(),
@@ -513,7 +514,9 @@ fn retained_session_conflict_reroute_reason(
 
 fn rewrite_stale_continuation_first_send_error(error: ThreadlineError) -> ThreadlineError {
     match error {
-        ThreadlineError::UpstreamWebSocketClosed => ThreadlineError::PreviousResponseNotFound,
+        ThreadlineError::UpstreamWebSocketClosed | ThreadlineError::UpstreamLivenessTimeout => {
+            ThreadlineError::PreviousResponseNotFound
+        }
         other => other,
     }
 }
@@ -528,6 +531,9 @@ fn continuation_terminal_error(
         }
         crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
             Some(ThreadlineError::UpstreamInboundBufferOverflow)
+        }
+        crate::ws_pump::UpstreamTerminalState::LivenessTimeout(_) => {
+            Some(ThreadlineError::PreviousResponseNotFound)
         }
     }
 }
@@ -641,6 +647,9 @@ async fn ensure_upstream(
             crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
                 return Err(ThreadlineError::UpstreamInboundBufferOverflow);
             }
+            crate::ws_pump::UpstreamTerminalState::LivenessTimeout(_) => {
+                return Err(ThreadlineError::UpstreamLivenessTimeout);
+            }
             crate::ws_pump::UpstreamTerminalState::Closed(_) => {
                 lease.detach_upstream_recoverably();
             }
@@ -727,16 +736,112 @@ fn maybe_inject_virtual_tool_summarizer_instruction(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::{
-        continuation_terminal_error, normalize_persistent_reasoning_context,
-        rewrite_stale_continuation_first_send_error, thread_id_from_prompt_cache_key,
+        ResponsesRouteState, continuation_terminal_error, normalize_persistent_reasoning_context,
+        responses_handler, rewrite_stale_continuation_first_send_error,
+        thread_id_from_prompt_cache_key,
     };
+    use crate::auth::{AuthSource, LoadedUpstreamAuth, RefreshBoundary};
+    use crate::codex_ws::UpstreamSessionDescriptor;
     use crate::errors::ThreadlineError;
     use crate::models::{ModelAlias, RouteProfile, resolve_request_model_for_profile};
-    use crate::ws_pump::{
-        InboundBufferOverflow, InboundBufferOverflowCause, UpstreamTerminalState,
+    use crate::registry::{RegistryAcquireError, RetainedSessionRegistry};
+    use crate::responses::{
+        ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
     };
+    use crate::ws_pump::{
+        InboundBufferOverflow, InboundBufferOverflowCause, LiveUpstreamWebSocket,
+        UpstreamTerminalState,
+    };
+    use axum::Json;
+    use axum::body::to_bytes;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use futures_util::future::BoxFuture;
     use serde_json::json;
+
+    #[derive(Clone)]
+    struct StaticAuthProvider;
+
+    impl UpstreamAuthProvider for StaticAuthProvider {
+        fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
+            Ok(LoadedUpstreamAuth {
+                bearer_token: "test-token".to_string(),
+                source: AuthSource::CodexKeyring,
+                refresh_boundary: RefreshBoundary::NotAvailable,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingConnector {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl UpstreamConnector for CountingConnector {
+        fn connect(
+            &self,
+            _auth: LoadedUpstreamAuth,
+            _session: Option<UpstreamSessionDescriptor>,
+        ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(ThreadlineError::UpstreamWebSocketConnectFailed)
+            })
+        }
+    }
+
+    async fn assert_previous_response_not_found(response: axum::response::Response) {
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("stale continuation error body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("stale continuation error json");
+        assert_eq!(payload["error"]["code"], "previous_response_not_found");
+    }
+
+    async fn assert_markers_removed(registry: &RetainedSessionRegistry, markers: &[&str]) {
+        for marker in markers {
+            assert_eq!(
+                registry
+                    .acquire_previous(marker)
+                    .await
+                    .expect_err("armed first-send failure must remove every alias"),
+                RegistryAcquireError::PreviousResponseNotFound,
+                "marker {marker}"
+            );
+        }
+    }
+
+    async fn seed_retained_aliases_for_first_send_timeout() -> (
+        Arc<RetainedSessionRegistry>,
+        Arc<LiveUpstreamWebSocket>,
+        Arc<AtomicUsize>,
+    ) {
+        let registry = Arc::new(RetainedSessionRegistry::new(1));
+        let send_attempts = Arc::new(AtomicUsize::new(0));
+        let upstream = Arc::new(
+            LiveUpstreamWebSocket::test_liveness_timeout_after_first_text_send(Arc::clone(
+                &send_attempts,
+            )),
+        );
+        assert!(matches!(
+            upstream.terminal_state(),
+            UpstreamTerminalState::Open
+        ));
+
+        let mut lease = registry.acquire_new().await.expect("seed retained session");
+        lease.replace_upstream(Some(Arc::clone(&upstream))).await;
+        lease.record_completed_marker("response-accepted").await;
+        lease.record_completed_marker("response-alias").await;
+        lease.release();
+        (registry, upstream, send_attempts)
+    }
 
     fn persistent_reasoning_alias() -> &'static ModelAlias {
         resolve_request_model_for_profile(
@@ -870,6 +975,73 @@ mod tests {
         assert!(matches!(
             rewritten,
             ThreadlineError::PreviousResponseNotFound
+        ));
+    }
+
+    #[test]
+    fn stale_continuation_first_send_rewrites_liveness_timeout_to_previous_response_not_found() {
+        let rewritten =
+            rewrite_stale_continuation_first_send_error(ThreadlineError::UpstreamLivenessTimeout);
+
+        assert!(matches!(
+            rewritten,
+            ThreadlineError::PreviousResponseNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn retained_continuation_first_send_liveness_timeout_invalidates_all_aliases_without_reconnect()
+     {
+        let (registry, upstream, send_attempts) =
+            seed_retained_aliases_for_first_send_timeout().await;
+
+        let connector_calls = Arc::new(AtomicUsize::new(0));
+        let state = ResponsesRouteState {
+            profile: RouteProfile::Main,
+            persistent_reasoning_enabled: false,
+            registry: Arc::clone(&registry),
+            services: ThreadlineServices::new(
+                Arc::new(StaticAuthProvider),
+                Arc::new(CountingConnector {
+                    calls: Arc::clone(&connector_calls),
+                }),
+            ),
+        };
+
+        let response = match responses_handler(
+            State(state),
+            Json(json!({
+                "model": "gpt-5.4",
+                "input": "continue",
+                "previous_response_id": "response-accepted"
+            })),
+            Default::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("first-send liveness timeout must not begin an SSE response"),
+            Err(error) => error.into_response(),
+        };
+        assert_previous_response_not_found(response).await;
+        assert_eq!(send_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(connector_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            upstream.terminal_state(),
+            UpstreamTerminalState::LivenessTimeout(_)
+        ));
+
+        assert_markers_removed(&registry, &["response-accepted", "response-alias"]).await;
+    }
+
+    #[test]
+    fn stale_continuation_first_send_preserves_inbound_overflow_error() {
+        let preserved = rewrite_stale_continuation_first_send_error(
+            ThreadlineError::UpstreamInboundBufferOverflow,
+        );
+
+        assert!(matches!(
+            preserved,
+            ThreadlineError::UpstreamInboundBufferOverflow
         ));
     }
 

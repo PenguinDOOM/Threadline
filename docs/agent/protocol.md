@@ -131,6 +131,41 @@ The deadline covers the total asynchronous connection future, including DNS, TCP
 
 When the deadline expires, Threadline drops the connection future before creating a pump and does not retry automatically. Before response headers, the client receives the existing JSON error with HTTP `502`, `type=server_error`, code `upstream_websocket_connect_timeout`, and message `The upstream websocket connection timed out.`. Existing handshake rejection and other connection error classifications remain unchanged. The default is an operational policy value, not a measured Codex service-level agreement.
 
+## Upstream WebSocket liveness watchdog
+
+Established upstream WebSockets use an immutable watchdog policy:
+
+* `--upstream-pong-timeout-secs` / `THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS` defaults to `60` seconds and bounds the wait for a matching client liveness-challenge Pong.
+* `--upstream-write-timeout-secs` / `THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS` defaults to `60` seconds and bounds one Text send, client Ping send, or automatic control-frame flush.
+
+Both startup settings accept only integer values in `1..=3600`. CLI values take precedence over environment values. Zero, negative, non-integer, and out-of-range values are rejected; no setting disables or clamps either deadline. The validated policy is immutable for a connection and applies to Main, Utility, auxiliary summary, and reconnect connections. Programmatic policy construction also rejects zero and values over 3600 seconds while permitting positive subsecond durations for tests. Existing constructors retain their default policy for compatibility.
+
+The current client Ping interval remains 30 seconds, with the first Ping due 30 seconds after pump start. It is not a public configuration setting. A pump has at most one outstanding client challenge with a non-reused payload no larger than the WebSocket control-frame limit. It records that challenge before sending the Ping and starts the Pong deadline once the send completes. A matching Pong that arrives before send completion is latched and acknowledges the challenge after completion. Only the current matching Pong succeeds; Text/Binary frames, server Ping frames, mismatched Pongs, stale duplicate Pongs, and unsolicited Pongs do not extend or satisfy the deadline. While a challenge is pending, the pump does not issue another client Ping. After acknowledgement, the next regular interval is scheduled without a catch-up Ping burst.
+
+The pump is a single persistent IO task. It retains a started send or flush operation until it completes while continuing to poll the reader and both deadlines. It does not cancel and resend writes for each reader event, and route handlers do not own raw WebSocket IO. Each operation's write deadline is fixed at its start; receiving a matching Pong, receiving more server Pings, or an implicit receive-side flush does not extend it. Server Ping responses remain tungstenite automatic Pongs. When the writer is free, dispatch priority is due client Ping, required automatic-control flush, then downstream Text; this is an operation-dispatch rule, not a guarantee of wire-frame order inside tungstenite.
+
+Deadline checks occur before dispatch so ready traffic cannot starve a due Ping or expiry. The earlier of the Pong and write deadlines determines the terminal cause; a tie uses the Pong cause, and a Pong observed at its deadline is too late. The terminal snapshot is sticky: a first `LivenessTimeout` records `PongDeadline` or `WriteDeadline`, its configured timeout and elapsed duration, and the affected outbound kind when applicable. It does not fabricate a peer close code. A successful record emits one `ws_pump_liveness_timeout` diagnostic containing only `cause`, `timeout_ms`, `elapsed_ms`, and `outbound_kind`, never challenge payloads, WebSocket payloads, tool arguments, or secrets. Existing inbound overflow remains first-terminal-state priority and is not downgraded to a timeout.
+
+On expiry, the pump drops in-flight IO and socket ownership without waiting for a graceful Close handshake or downstream consumption. Pending send and receive callers observe the same typed liveness timeout. Application-level control state is limited to one client challenge and a control-flush-needed flag. Tungstenite's internal encoded automatic-Pong write buffer is not given a fixed byte bound in this policy; repeated server Pings during a stalled write can accumulate there until the write deadline or owner drop releases the socket. This policy does not change `max_write_buffer_size` or the existing outbound Text capacity.
+
+The watchdog measures transport health only. Do not add a response, upstream event, assistant-output, or generic idle timeout under this policy. A healthy connection may remain silent while reasoning, waiting for internal tools or jobs, or retained idle. The defaults are operational values, not a Codex SLA.
+
+Before response headers, a liveness expiry maps to HTTP `502`, `type=server_error`, code `upstream_liveness_timeout`, and message `The upstream websocket liveness check timed out.`. After SSE begins, use the existing single terminal sequence: one `response.failed` carrying the code and message followed by one `[DONE]`. Do not add a new SSE error `type` field.
+
+### Liveness timeout retention lifecycle
+
+The route that observes the timeout determines retention behavior:
+
+* An idle Main session whose final completion was already accepted is lazily detached on the next acquire. Its older aliases and session metadata remain, and Main returns `previous_response_not_found` without reconnecting or replaying the marker.
+* A retained continuation that times out after it is armed but before its first upstream data event invalidates its unfinished entry and aliases, and returns `previous_response_not_found`. A new Main turn at the same point returns `upstream_liveness_timeout` and invalidates its unfinished entry. Neither path retries automatically.
+* After an upstream data event, including while queued downstream output waits or internal-tool processing later resumes, a timeout returns `upstream_liveness_timeout`, detaches the live handle, and explicitly finalizes the turn recoverably. Previously accepted markers remain; a markerless entry is removed. This timeout is not stored in the inbound-overflow unrecoverable bucket.
+* An intermediate internal-tool completion is neither a final marker nor a disarm point. A timeout while resuming after tool work prevents a new tool or follow-up from starting. A timeout from an already-started follow-up send uses terminal invalidation; started tool or send side effects are not rolled back or cancelled.
+* Immediately before final acceptance, the terminal snapshot rejects a queued completion and queued output if it reports a liveness timeout. Once completion has been accepted, the synthetic tail, `response.completed`, and `[DONE]` remain successful even if the socket times out later. An older response body is inert and cannot affect a newer lease.
+* Utility and auxiliary summary connections release only their transient transport on a post-connect timeout. They do not register, remove, or otherwise alter Main retained markers, and they do not reconnect.
+* If an armed response body is dropped before it explicitly observes the timeout, existing abandonment invalidation applies. Timeout metadata alone does not implicitly disarm that lease.
+
+Timeout notification can be delayed while an internal tool is awaited or while downstream has not polled the SSE body. When execution resumes, the terminal snapshot is checked before starting further tool or follow-up work.
+
 ## Bounded upstream inbound buffering
 
 The upstream inbound queue is bounded independently for each WebSocket connection:

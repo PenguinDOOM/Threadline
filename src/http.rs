@@ -25,7 +25,7 @@ use crate::responses::{
     ConnectedUpstream, DownstreamRequestMetadata, ResponsesRouteState, ThreadlineServices,
     responses_handler,
 };
-use crate::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits};
+use crate::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits, UpstreamWatchdogPolicy};
 
 const MODEL_CREATED_UNSPECIFIED: u64 = 0;
 const DEFAULT_UPSTREAM_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
@@ -58,7 +58,16 @@ struct ModelEntry {
 }
 
 pub fn build_router(config: ThreadlineConfig) -> Router {
-    let connector = DefaultUpstreamConnector {
+    let connector = default_upstream_connector(&config);
+
+    build_router_with_services(
+        config,
+        ThreadlineServices::new(Arc::new(DefaultAuthProvider), Arc::new(connector)),
+    )
+}
+
+fn default_upstream_connector(config: &ThreadlineConfig) -> DefaultUpstreamConnector {
+    DefaultUpstreamConnector {
         codex_client_version: config.codex_client_version.clone(),
         inbound_limits: config
             .upstream_inbound_limits()
@@ -66,12 +75,10 @@ pub fn build_router(config: ThreadlineConfig) -> Router {
         connect_timeout: config
             .upstream_connect_timeout()
             .expect("clap validates upstream connect timeout"),
-    };
-
-    build_router_with_services(
-        config,
-        ThreadlineServices::new(Arc::new(DefaultAuthProvider), Arc::new(connector)),
-    )
+        watchdog_policy: config
+            .upstream_watchdog_policy()
+            .expect("clap validates upstream watchdog timeouts"),
+    }
 }
 
 pub fn build_router_with_services(
@@ -166,6 +173,7 @@ struct DefaultUpstreamConnector {
     codex_client_version: String,
     inbound_limits: UpstreamInboundLimits,
     connect_timeout: Duration,
+    watchdog_policy: UpstreamWatchdogPolicy,
 }
 
 impl DefaultUpstreamConnector {
@@ -231,6 +239,7 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
         let codex_client_version = self.codex_client_version.clone();
         let inbound_limits = self.inbound_limits;
         let connect_timeout = self.connect_timeout;
+        let watchdog_policy = self.watchdog_policy;
 
         Box::pin(async move {
             let upstream_url = Self::upstream_url();
@@ -258,10 +267,13 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
                 .map(ToString::to_string);
 
             Ok(ConnectedUpstream {
-                websocket: Arc::new(LiveUpstreamWebSocket::from_stream_with_limits(
-                    stream,
-                    inbound_limits,
-                )),
+                websocket: Arc::new(
+                    LiveUpstreamWebSocket::from_stream_with_watchdog_policy_and_limits(
+                        stream,
+                        watchdog_policy,
+                        inbound_limits,
+                    ),
+                ),
                 session: handshake.session,
                 turn_state,
             })
@@ -299,6 +311,26 @@ mod tests {
         assert_eq!(ordinary.max_frame_size, Some(512));
     }
 
+    #[test]
+    fn production_connector_uses_watchdog_policy_from_config() {
+        let config = ThreadlineConfig {
+            upstream_pong_timeout_secs: 17,
+            upstream_write_timeout_secs: 19,
+            ..ThreadlineConfig::default()
+        };
+
+        let connector = default_upstream_connector(&config);
+
+        assert_eq!(
+            connector.watchdog_policy.pong_timeout(),
+            Duration::from_secs(17)
+        );
+        assert_eq!(
+            connector.watchdog_policy.write_timeout(),
+            Duration::from_secs(19)
+        );
+    }
+
     fn test_auth() -> crate::auth::LoadedUpstreamAuth {
         crate::auth::LoadedUpstreamAuth {
             bearer_token: "test-token".to_string(),
@@ -312,6 +344,7 @@ mod tests {
             codex_client_version: "test".to_string(),
             inbound_limits: UpstreamInboundLimits::DEFAULT,
             connect_timeout,
+            watchdog_policy: UpstreamWatchdogPolicy::DEFAULT,
         }
     }
 

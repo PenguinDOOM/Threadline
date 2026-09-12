@@ -18,6 +18,9 @@ type ServerSink = futures_util::stream::SplitSink<
 #[derive(Clone, Copy)]
 enum StartupBehavior {
     KeepAlive,
+    KeepAliveWithoutReader,
+    KeepAliveAfterFirstClientMessageWithoutReader,
+    KeepAliveUntilReaderStopped,
     DisconnectAfterHandshake,
 }
 
@@ -29,6 +32,8 @@ pub struct ScriptedWebSocketServer {
     is_connected: Arc<AtomicBool>,
     client_disconnected: Arc<Notify>,
     is_client_disconnected: Arc<AtomicBool>,
+    reader_stop_requested: Arc<AtomicBool>,
+    reader_stop: Arc<Notify>,
     accept_task: JoinHandle<()>,
     reader_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -37,6 +42,19 @@ pub struct ScriptedWebSocketServer {
 impl ScriptedWebSocketServer {
     pub async fn start() -> Self {
         Self::start_with_behavior(StartupBehavior::KeepAlive).await
+    }
+
+    pub async fn start_without_reader() -> Self {
+        Self::start_with_behavior(StartupBehavior::KeepAliveWithoutReader).await
+    }
+
+    pub async fn start_after_first_client_message_without_reader() -> Self {
+        Self::start_with_behavior(StartupBehavior::KeepAliveAfterFirstClientMessageWithoutReader)
+            .await
+    }
+
+    pub async fn start_with_stoppable_reader() -> Self {
+        Self::start_with_behavior(StartupBehavior::KeepAliveUntilReaderStopped).await
     }
 
     pub async fn start_disconnect_after_handshake() -> Self {
@@ -56,6 +74,8 @@ impl ScriptedWebSocketServer {
         let is_connected = Arc::new(AtomicBool::new(false));
         let client_disconnected = Arc::new(Notify::new());
         let is_client_disconnected = Arc::new(AtomicBool::new(false));
+        let reader_stop_requested = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::new(Notify::new());
 
         let accept_writer = Arc::clone(&writer);
         let accept_reader_task = Arc::clone(&reader_task);
@@ -63,6 +83,8 @@ impl ScriptedWebSocketServer {
         let accept_is_connected = Arc::clone(&is_connected);
         let accept_client_disconnected = Arc::clone(&client_disconnected);
         let accept_is_client_disconnected = Arc::clone(&is_client_disconnected);
+        let accept_reader_stop_requested = Arc::clone(&reader_stop_requested);
+        let accept_reader_stop = Arc::clone(&reader_stop);
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept client");
             let websocket = accept_async(stream).await.expect("accept websocket");
@@ -74,10 +96,65 @@ impl ScriptedWebSocketServer {
                 return;
             }
 
+            if matches!(startup_behavior, StartupBehavior::KeepAliveWithoutReader) {
+                let (sink, stream) = websocket.split();
+                *accept_writer.lock().await = Some(sink);
+                accept_is_connected.store(true, Ordering::SeqCst);
+                accept_connected.notify_waiters();
+                let reader = tokio::spawn(async move {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                });
+                *accept_reader_task.lock().await = Some(reader);
+                return;
+            }
+
             let (sink, mut stream) = websocket.split();
             *accept_writer.lock().await = Some(sink);
             accept_is_connected.store(true, Ordering::SeqCst);
             accept_connected.notify_waiters();
+
+            if matches!(
+                startup_behavior,
+                StartupBehavior::KeepAliveAfterFirstClientMessageWithoutReader
+            ) {
+                let reader = tokio::spawn(async move {
+                    if let Some(Ok(message)) = stream.next().await {
+                        let _ = incoming_tx.send(message);
+                    }
+                    std::future::pending::<()>().await;
+                });
+                *accept_reader_task.lock().await = Some(reader);
+                return;
+            }
+
+            if matches!(
+                startup_behavior,
+                StartupBehavior::KeepAliveUntilReaderStopped
+            ) {
+                let reader = tokio::spawn(async move {
+                    loop {
+                        if accept_reader_stop_requested.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::select! {
+                            _ = accept_reader_stop.notified() => {}
+                            message = stream.next() => match message {
+                                Some(Ok(message)) => {
+                                    if incoming_tx.send(message).is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Err(_)) | None => break,
+                            }
+                        }
+                    }
+                    accept_is_client_disconnected.store(true, Ordering::SeqCst);
+                    accept_client_disconnected.notify_waiters();
+                });
+                *accept_reader_task.lock().await = Some(reader);
+                return;
+            }
 
             let reader = tokio::spawn(async move {
                 while let Some(message) = stream.next().await {
@@ -104,6 +181,8 @@ impl ScriptedWebSocketServer {
             is_connected,
             client_disconnected,
             is_client_disconnected,
+            reader_stop_requested,
+            reader_stop,
             accept_task,
             reader_task,
         }
@@ -160,6 +239,10 @@ impl ScriptedWebSocketServer {
         self.send(Message::Ping(payload.to_vec())).await;
     }
 
+    pub async fn send_pong(&self, payload: Vec<u8>) {
+        self.send(Message::Pong(payload)).await;
+    }
+
     pub async fn send_close(&self, code: u16, reason: &str) {
         self.send(Message::Close(Some(
             tokio_tungstenite::tungstenite::protocol::CloseFrame {
@@ -192,6 +275,11 @@ impl ScriptedWebSocketServer {
             messages.push(message);
         }
         messages
+    }
+
+    pub fn stop_reader(&self) {
+        self.reader_stop_requested.store(true, Ordering::SeqCst);
+        self.reader_stop.notify_waiters();
     }
 
     pub async fn abort_connection(&self) {
@@ -230,5 +318,33 @@ impl Drop for ScriptedWebSocketServer {
         {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::StreamExt;
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::connect_async;
+
+    use super::ScriptedWebSocketServer;
+
+    #[tokio::test]
+    async fn abort_connection_drops_unpolled_reader_and_closes_peer_socket() {
+        let server = ScriptedWebSocketServer::start_without_reader().await;
+        let (client, _) = connect_async(server.url()).await.expect("connect client");
+        let (_writer, mut reader) = client.split();
+
+        server.abort_connection().await;
+
+        assert!(
+            matches!(
+                timeout(Duration::from_secs(1), reader.next())
+                    .await
+                    .expect("server abort should close the peer socket"),
+                None | Some(Err(_))
+            ),
+            "the peer must observe socket closure rather than wait for a timeout"
+        );
     }
 }

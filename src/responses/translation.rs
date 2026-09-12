@@ -81,6 +81,12 @@ impl ResponseStreamLease {
         }
     }
 
+    fn finalize_liveness_timeout_turn(&mut self) {
+        if let Self::Retained(lease) = self {
+            lease.finalize_liveness_timeout_turn();
+        }
+    }
+
     async fn mark_upstream_terminal(&mut self) {
         if let Self::Retained(lease) = self {
             lease.mark_upstream_terminal().await;
@@ -106,6 +112,9 @@ fn final_completion_acceptance_error(
     match terminal_state {
         crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
             Some(ThreadlineError::UpstreamInboundBufferOverflow)
+        }
+        crate::ws_pump::UpstreamTerminalState::LivenessTimeout(_) => {
+            Some(ThreadlineError::UpstreamLivenessTimeout)
         }
         crate::ws_pump::UpstreamTerminalState::Open
         | crate::ws_pump::UpstreamTerminalState::Closed(_) => None,
@@ -1052,6 +1061,7 @@ pub(super) struct ResponseStreamState {
     pub(super) lease: ResponseStreamLease,
     pub(super) base_request: serde_json::Map<String, Value>,
     pub(super) pending_internal_outputs: Vec<PendingInternalToolOutput>,
+    pub(super) followup_send_started: bool,
     pub(super) previous_response_id: Option<String>,
     pub(super) execute_internal_tools: bool,
     pub(super) suppressed_internal_output_indexes: HashSet<u64>,
@@ -1077,14 +1087,17 @@ pub(super) fn response_stream(
     stream::unfold(state, |mut state| async move {
         loop {
             if state.queued_final_completed.is_none()
-                && state.upstream.as_ref().is_some_and(|upstream| {
-                    matches!(
-                        upstream.terminal_state(),
-                        crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_)
-                    )
+                && let Some(error) = state.upstream.as_ref().and_then(|upstream| {
+                    final_completion_acceptance_error(upstream.terminal_state())
                 })
             {
-                let error = ThreadlineError::UpstreamInboundBufferOverflow;
+                let stale_continuation = matches!(error, ThreadlineError::UpstreamLivenessTimeout)
+                    && invalidate_stale_continuation_before_first_upstream_event(&mut state);
+                let error = if stale_continuation {
+                    ThreadlineError::PreviousResponseNotFound
+                } else {
+                    error
+                };
                 let failed_payload = terminal_failed_payload_from_error(None, None, &error);
                 trace_downstream_sse_event(&downstream_sse_trace_metadata(
                     &failed_payload,
@@ -1093,7 +1106,13 @@ pub(super) fn response_stream(
                 ));
                 discard_unaccepted_queued_output(&mut state);
                 state.upstream = None;
-                state.lease.mark_upstream_terminal().await;
+                if !stale_continuation {
+                    if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
+                        state.lease.finalize_liveness_timeout_turn();
+                    } else {
+                        state.lease.mark_upstream_terminal().await;
+                    }
+                }
                 state.lease.release();
                 state.final_done_pending = true;
                 return Some((
@@ -1229,6 +1248,39 @@ pub(super) fn response_stream(
                         state,
                     ));
                 }
+                Err(crate::ws_pump::UpstreamWebSocketError::LivenessTimeout) => {
+                    let stale_continuation =
+                        invalidate_stale_continuation_before_first_upstream_event(&mut state);
+                    let error = if stale_continuation {
+                        ThreadlineError::PreviousResponseNotFound
+                    } else {
+                        ThreadlineError::UpstreamLivenessTimeout
+                    };
+                    let failed_payload = terminal_failed_payload_from_error(None, None, &error);
+                    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                        &failed_payload,
+                        DownstreamTraceAction::Terminal,
+                        None,
+                    ));
+                    discard_unaccepted_queued_output(&mut state);
+                    state.upstream = None;
+                    if !stale_continuation {
+                        if state.followup_send_started {
+                            state.lease.mark_upstream_terminal().await;
+                            state.lease.release();
+                        } else {
+                            state.lease.finalize_liveness_timeout_turn();
+                            state.lease.release();
+                        }
+                    }
+                    state.final_done_pending = true;
+                    return Some((
+                        Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                            &failed_payload,
+                        )),
+                        state,
+                    ));
+                }
                 Ok(None) | Err(crate::ws_pump::UpstreamWebSocketError::OutboundQueueClosed) => {
                     match try_reconnect_or_terminal_error(&mut state).await {
                         Ok(Some(reconnected)) => {
@@ -1339,7 +1391,11 @@ pub(super) fn response_stream(
                             &error,
                         );
                         state.upstream = None;
-                        state.lease.mark_upstream_terminal().await;
+                        if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
+                            state.lease.finalize_liveness_timeout_turn();
+                        } else {
+                            state.lease.mark_upstream_terminal().await;
+                        }
                         state.lease.release();
                         state.final_done_pending = true;
                         return Some((
@@ -1352,7 +1408,37 @@ pub(super) fn response_stream(
                 };
 
                 if let Some(call) = internal_tool_call {
-                    match state.services.execute_internal_tool(call).await {
+                    let execution_result = state.services.execute_internal_tool(call).await;
+                    if let Some(error) = state.upstream.as_ref().and_then(|upstream| {
+                        final_completion_acceptance_error(upstream.terminal_state())
+                    }) {
+                        let failed_payload = terminal_failed_payload_from_error(
+                            parsed.get("response"),
+                            response_id_from_event(&parsed),
+                            &error,
+                        );
+                        trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                            &failed_payload,
+                            DownstreamTraceAction::Terminal,
+                            None,
+                        ));
+                        state.upstream = None;
+                        if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
+                            state.lease.finalize_liveness_timeout_turn();
+                        } else {
+                            state.lease.mark_upstream_terminal().await;
+                        }
+                        state.lease.release();
+                        state.final_done_pending = true;
+                        return Some((
+                            Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                &failed_payload,
+                            )),
+                            state,
+                        ));
+                    }
+
+                    match execution_result {
                         Ok(output) => {
                             if state
                                 .pending_internal_outputs
@@ -1489,6 +1575,35 @@ pub(super) fn response_stream(
                             ));
                         };
 
+                        if let Some(error) = state.upstream.as_ref().and_then(|upstream| {
+                            final_completion_acceptance_error(upstream.terminal_state())
+                        }) {
+                            let failed_payload = terminal_failed_payload_from_error(
+                                parsed.get("response"),
+                                Some(response_id),
+                                &error,
+                            );
+                            trace_downstream_sse_event(&downstream_sse_trace_metadata(
+                                &failed_payload,
+                                DownstreamTraceAction::Terminal,
+                                None,
+                            ));
+                            state.upstream = None;
+                            if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
+                                state.lease.finalize_liveness_timeout_turn();
+                            } else {
+                                state.lease.mark_upstream_terminal().await;
+                            }
+                            state.lease.release();
+                            state.final_done_pending = true;
+                            return Some((
+                                Ok::<Bytes, Infallible>(sse_terminal_response_failed_chunk(
+                                    &failed_payload,
+                                )),
+                                state,
+                            ));
+                        }
+
                         let outputs = mem::take(&mut state.pending_internal_outputs);
                         let output_count = outputs.len();
                         debug!(
@@ -1513,14 +1628,16 @@ pub(super) fn response_stream(
                                 state,
                             ));
                         };
-                        if let Err(error) = send_followup_tool_outputs(
+                        state.followup_send_started = true;
+                        let followup_result = send_followup_tool_outputs(
                             upstream,
                             &state.base_request,
                             response_id,
                             followup_input,
                         )
-                        .await
-                        {
+                        .await;
+                        state.followup_send_started = false;
+                        if let Err(error) = followup_result {
                             let failed_payload = terminal_failed_payload_from_error(
                                 parsed.get("response"),
                                 Some(response_id),
@@ -1615,7 +1732,11 @@ pub(super) fn response_stream(
                         );
                         discard_unaccepted_queued_output(&mut state);
                         state.upstream = None;
-                        state.lease.mark_upstream_terminal().await;
+                        if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
+                            state.lease.finalize_liveness_timeout_turn();
+                        } else {
+                            state.lease.mark_upstream_terminal().await;
+                        }
                         state.lease.release();
                         state.final_done_pending = true;
                         return Some((
@@ -1802,8 +1923,7 @@ pub(super) fn response_stream(
 async fn try_reconnect_or_terminal_error(
     state: &mut ResponseStreamState,
 ) -> Result<Option<Arc<LiveUpstreamWebSocket>>, ThreadlineError> {
-    if state.replay_stale_marker_on_pre_first_event_close && !state.upstream_event_seen {
-        state.lease.release();
+    if invalidate_stale_continuation_before_first_upstream_event(state) {
         return Err(ThreadlineError::PreviousResponseNotFound);
     }
 
@@ -1822,23 +1942,67 @@ async fn try_reconnect_or_terminal_error(
     .await
 }
 
+fn invalidate_stale_continuation_before_first_upstream_event(
+    state: &mut ResponseStreamState,
+) -> bool {
+    let is_continuation =
+        state.previous_response_id.is_some() || state.replay_stale_marker_on_pre_first_event_close;
+    if is_continuation && !state.upstream_event_seen {
+        state.lease.release();
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::Arc;
+
+    use futures_util::{StreamExt, future::BoxFuture};
     use serde_json::json;
 
     use super::{
-        CompletedSanitizationDiagnostics, DownstreamTraceAction, DownstreamTraceDiagnostics,
-        RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT, RESPONSES_TRANSLATION_EVENT_SUPPRESSED,
-        RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD, RESPONSES_TRANSLATION_UPSTREAM_EVENT,
+        CompletedSanitizationDiagnostics, DownstreamObservableOutputState, DownstreamTraceAction,
+        DownstreamTraceDiagnostics, RESPONSES_TRANSLATION_DOWNSTREAM_SSE_EVENT,
+        RESPONSES_TRANSLATION_EVENT_SUPPRESSED, RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD,
+        RESPONSES_TRANSLATION_UPSTREAM_EVENT, ResponseStreamLease, ResponseStreamState,
         UpstreamEventTraceMetadata, VisibleAssistantText, VisibleTextSourceKey,
-        downstream_sse_trace_metadata, final_completion_acceptance_error,
+        downstream_sse_trace_metadata, final_completion_acceptance_error, response_stream,
         sanitized_completed_event_with_diagnostics,
     };
+    use crate::auth::LoadedUpstreamAuth;
+    use crate::codex_ws::UpstreamSessionDescriptor;
     use crate::errors::ThreadlineError;
-    use crate::ws_pump::{
-        InboundBufferOverflow, InboundBufferOverflowCause, UpstreamCloseMetadata,
-        UpstreamTerminalState,
+    use crate::registry::{RegistryAcquireError, RetainedSessionRegistry};
+    use crate::responses::{
+        ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
     };
+    use crate::ws_pump::{
+        InboundBufferOverflow, InboundBufferOverflowCause, LiveUpstreamWebSocket,
+        UpstreamCloseMetadata, UpstreamTerminalState,
+    };
+
+    struct UnusedAuthProvider;
+
+    impl UpstreamAuthProvider for UnusedAuthProvider {
+        fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
+            Err(ThreadlineError::UpstreamWebSocketConnectFailed)
+        }
+    }
+
+    struct UnusedConnector;
+
+    impl UpstreamConnector for UnusedConnector {
+        fn connect(
+            &self,
+            _auth: LoadedUpstreamAuth,
+            _session: Option<UpstreamSessionDescriptor>,
+        ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+            Box::pin(async { Err(ThreadlineError::UpstreamWebSocketConnectFailed) })
+        }
+    }
 
     #[test]
     fn upstream_event_trace_metadata_redacts_argument_bodies_and_keeps_lengths() {
@@ -2170,5 +2334,102 @@ mod tests {
             RESPONSES_TRANSLATION_NO_OBSERVABLE_OUTPUT_GUARD,
             "responses_translation_no_observable_output_guard"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_internal_tool_followup_send_liveness_timeout_invalidates_retained_aliases() {
+        let (upstream, pending_send) =
+            LiveUpstreamWebSocket::test_followup_send_pending_for_liveness_timeout();
+        let upstream = Arc::new(upstream);
+        pending_send
+            .send_inbound_text(
+                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+            )
+            .await;
+        pending_send
+            .send_inbound_text(
+                r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#,
+            )
+            .await;
+
+        let registry = Arc::new(RetainedSessionRegistry::new(1));
+        let mut seeded_lease = registry.acquire_new().await.expect("seed retained lease");
+        seeded_lease
+            .replace_upstream(Some(Arc::clone(&upstream)))
+            .await;
+        seeded_lease
+            .record_completed_marker("response-accepted")
+            .await;
+        seeded_lease.record_completed_marker("response-alias").await;
+        seeded_lease.release();
+
+        let mut active_lease = registry
+            .acquire_previous("response-accepted")
+            .await
+            .expect("acquire retained lease");
+        active_lease.arm_active_turn();
+        let state = ResponseStreamState {
+            services: ThreadlineServices::new(
+                Arc::new(UnusedAuthProvider),
+                Arc::new(UnusedConnector),
+            ),
+            upstream: Some(Arc::clone(&upstream)),
+            lease: ResponseStreamLease::Retained(active_lease),
+            base_request: serde_json::Map::new(),
+            pending_internal_outputs: Vec::new(),
+            followup_send_started: false,
+            previous_response_id: Some("response-accepted".to_string()),
+            execute_internal_tools: true,
+            suppressed_internal_output_indexes: HashSet::new(),
+            upstream_event_seen: false,
+            replay_stale_marker_on_pre_first_event_close: false,
+            reconnect_attempted: false,
+            observable_output: DownstreamObservableOutputState::default(),
+            downstream_visible_text_sources: HashSet::new(),
+            downstream_visible_text_delta_count: 0,
+            visible_assistant_text: Vec::new(),
+            last_unidentified_visible_text: None,
+            queued_synthetic_output_text_deltas: VecDeque::new(),
+            queued_forwarded_event: None,
+            queued_final_completed: None,
+            final_done_pending: false,
+            apply_no_observable_output_failure: true,
+            done: false,
+        };
+        let stream_task =
+            tokio::spawn(async move { response_stream(state).collect::<Vec<_>>().await });
+
+        pending_send.wait_for_send_pending().await;
+        assert_eq!(pending_send.text_send_attempts(), 1);
+        pending_send.trigger_liveness_timeout().await;
+
+        let chunks = stream_task.await.expect("response stream task");
+        let body = chunks
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.expect("SSE chunk").to_vec()).expect("SSE utf8"))
+            .collect::<String>();
+        assert_eq!(body.matches("event: response.failed").count(), 1);
+        assert_eq!(body.matches("data: [DONE]").count(), 1);
+        assert!(body.contains("upstream_liveness_timeout"));
+        assert_eq!(pending_send.text_send_attempts(), 1);
+
+        for marker in [
+            "response-accepted",
+            "response-alias",
+            "response-intermediate",
+        ] {
+            assert_eq!(
+                registry
+                    .acquire_previous(marker)
+                    .await
+                    .expect_err("started follow-up timeout must invalidate every retained alias"),
+                RegistryAcquireError::PreviousResponseNotFound,
+                "marker {marker}"
+            );
+        }
+        registry
+            .acquire_new()
+            .await
+            .expect("invalidation should reclaim retained capacity");
     }
 }

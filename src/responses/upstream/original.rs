@@ -213,6 +213,7 @@ fn map_upstream_websocket_error(error: UpstreamWebSocketError) -> ThreadlineErro
         UpstreamWebSocketError::InboundBufferOverflow => {
             ThreadlineError::UpstreamInboundBufferOverflow
         }
+        UpstreamWebSocketError::LivenessTimeout => ThreadlineError::UpstreamLivenessTimeout,
         UpstreamWebSocketError::OutboundQueueClosed => ThreadlineError::UpstreamWebSocketClosed,
     }
 }

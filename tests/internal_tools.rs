@@ -6,10 +6,10 @@ use std::collections::VecDeque;
 use std::io;
 use std::io::Write;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Instant;
 use tokio::sync::{Mutex, Notify};
@@ -38,7 +38,7 @@ use threadline::tools::{
     InternalToolCall, PendingInternalToolOutput, event_contains_internal_tool_name,
     inject_internal_tools,
 };
-use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits};
+use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits, UpstreamWatchdogPolicy};
 
 const JOB_START_NEXT_ACTION_HINT: &str = "This job is running in the background. Continue other useful work if available, then poll status or read output later when needed.";
 
@@ -63,14 +63,18 @@ struct PlannedConnection {
 #[derive(Clone)]
 struct RecordingConnector {
     plans: Arc<Mutex<VecDeque<PlannedConnection>>>,
+    websockets: Arc<Mutex<Vec<Weak<LiveUpstreamWebSocket>>>>,
     inbound_limits: UpstreamInboundLimits,
+    watchdog_policy: Option<UpstreamWatchdogPolicy>,
 }
 
 impl RecordingConnector {
     fn new(plans: Vec<PlannedConnection>) -> Self {
         Self {
             plans: Arc::new(Mutex::new(plans.into())),
+            websockets: Arc::new(Mutex::new(Vec::new())),
             inbound_limits: UpstreamInboundLimits::DEFAULT,
+            watchdog_policy: None,
         }
     }
 
@@ -83,6 +87,20 @@ impl RecordingConnector {
             ..Self::new(plans)
         }
     }
+
+    fn with_watchdog_policy(
+        plans: Vec<PlannedConnection>,
+        watchdog_policy: UpstreamWatchdogPolicy,
+    ) -> Self {
+        Self {
+            watchdog_policy: Some(watchdog_policy),
+            ..Self::new(plans)
+        }
+    }
+
+    async fn recorded_websockets(&self) -> Vec<Weak<LiveUpstreamWebSocket>> {
+        self.websockets.lock().await.clone()
+    }
 }
 
 impl UpstreamConnector for RecordingConnector {
@@ -92,7 +110,9 @@ impl UpstreamConnector for RecordingConnector {
         session: Option<UpstreamSessionDescriptor>,
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
         let plans = Arc::clone(&self.plans);
+        let websockets = Arc::clone(&self.websockets);
         let inbound_limits = self.inbound_limits;
+        let watchdog_policy = self.watchdog_policy;
         Box::pin(async move {
             let session = session.unwrap_or_else(new_session_descriptor);
             let plan = plans
@@ -105,11 +125,20 @@ impl UpstreamConnector for RecordingConnector {
                 .await
                 .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
 
+            let websocket = Arc::new(match watchdog_policy {
+                Some(policy) => {
+                    LiveUpstreamWebSocket::from_stream_with_ping_interval_and_watchdog_policy(
+                        stream,
+                        Duration::from_millis(5),
+                        policy,
+                    )
+                }
+                None => LiveUpstreamWebSocket::from_stream_with_limits(stream, inbound_limits),
+            });
+            websockets.lock().await.push(Arc::downgrade(&websocket));
+
             Ok(ConnectedUpstream {
-                websocket: Arc::new(LiveUpstreamWebSocket::from_stream_with_limits(
-                    stream,
-                    inbound_limits,
-                )),
+                websocket,
                 session,
                 turn_state: plan.turn_state,
             })
@@ -147,6 +176,40 @@ impl InternalToolExecutor for PausedInternalToolExecutor {
             started.notify_one();
             resume.notified().await;
             call.execute()
+        })
+    }
+}
+
+#[derive(Clone)]
+struct PausedFailingInternalToolExecutor {
+    started: Arc<Notify>,
+    resume: Arc<Notify>,
+    executions: Arc<AtomicUsize>,
+}
+
+impl PausedFailingInternalToolExecutor {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+            executions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl InternalToolExecutor for PausedFailingInternalToolExecutor {
+    fn execute(
+        &self,
+        _call: InternalToolCall,
+    ) -> BoxFuture<'static, Result<PendingInternalToolOutput, ThreadlineError>> {
+        let started = Arc::clone(&self.started);
+        let resume = Arc::clone(&self.resume);
+        let executions = Arc::clone(&self.executions);
+        Box::pin(async move {
+            executions.fetch_add(1, Ordering::SeqCst);
+            started.notify_one();
+            resume.notified().await;
+            Err(ThreadlineError::InternalToolFailed)
         })
     }
 }
@@ -216,6 +279,11 @@ fn auxiliary_summary_text() -> &'static str {
         "\n",
         "Output your summary wrapped in <summary> and </summary> tags"
     )
+}
+
+fn short_watchdog_policy() -> UpstreamWatchdogPolicy {
+    UpstreamWatchdogPolicy::new(Duration::from_millis(30), Duration::from_secs(1))
+        .expect("valid watchdog policy")
 }
 
 fn auxiliary_summary_input_item() -> Value {
@@ -3645,4 +3713,596 @@ async fn overflow_while_internal_tool_execution_is_pending_skips_followup_and_la
     assert!(!body_text.contains("threadline_echo"));
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
     assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn paused_internal_tool_execution_stays_live_across_matching_pongs_before_followup() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        short_watchdog_policy(),
+    );
+    let executor = Arc::new(PausedInternalToolExecutor::new());
+    let app = build_test_router_with_internal_tool_executor(
+        Arc::new(connector),
+        Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+    );
+
+    let response = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"run paused internal tool"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("initial request");
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body")
+    });
+    timeout(Duration::from_secs(1), executor.started.notified())
+        .await
+        .expect("internal tool execution should start");
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let liveness_started = Instant::now();
+    for _ in 0..12 {
+        let ping = timeout(Duration::from_secs(1), server.recv_client_message())
+            .await
+            .expect("watchdog ping should arrive")
+            .expect("client should remain connected");
+        let Message::Ping(payload) = ping else {
+            panic!("expected watchdog ping, got {ping:?}");
+        };
+        server.send_pong(payload).await;
+    }
+    assert!(
+        liveness_started.elapsed() >= Duration::from_millis(60),
+        "matching Pongs must keep the paused tool alive for at least two Pong deadlines"
+    );
+    assert!(
+        !body_task.is_finished(),
+        "internal tool wait must not produce a downstream terminal event"
+    );
+
+    executor.resume.notify_one();
+    let followup: Value = serde_json::from_str(&message_text(
+        timeout(Duration::from_secs(1), server.recv_client_message())
+            .await
+            .expect("followup request should arrive")
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup["type"], "response.create");
+    assert_eq!(followup["previous_response_id"], "response-intermediate");
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-final","output":[{"id":"msg-final","type":"message","role":"assistant","content":[{"type":"output_text","text":"final answer"}]}]}}"#,
+        )
+        .await;
+
+    let body = timeout(Duration::from_secs(1), body_task)
+        .await
+        .expect("final response body timeout")
+        .expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("response utf8");
+    assert_eq!(body_text.matches("event: response.completed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(!body_text.contains("event: response.failed"));
+    assert!(body_text.contains("final answer"));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+
+    let intermediate = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume intermediate",
+            "previous_response_id":"response-intermediate"
+        }),
+    )
+    .await;
+    assert_eq!(intermediate.status(), StatusCode::BAD_REQUEST);
+    let intermediate_body = to_bytes(intermediate.into_body(), usize::MAX)
+        .await
+        .expect("intermediate marker body");
+    let intermediate_payload: Value =
+        serde_json::from_slice(&intermediate_body).expect("intermediate marker json");
+    assert_eq!(
+        intermediate_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
+async fn liveness_expiry_while_internal_tool_waits_skips_queued_work_and_keeps_prior_marker() {
+    let server =
+        Arc::new(ScriptedWebSocketServer::start_after_first_client_message_without_reader().await);
+    let replacement_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&replacement_server),
+                turn_state: None,
+            },
+        ],
+        UpstreamWatchdogPolicy::new(Duration::from_millis(100), Duration::from_secs(1))
+            .expect("valid watchdog policy"),
+    );
+    let connector_observer = connector.clone();
+    let executor = Arc::new(PausedInternalToolExecutor::new());
+    let app = build_router_with_services(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        ThreadlineServices::with_internal_tool_executor(
+            Arc::new(StaticAuthProvider),
+            Arc::new(connector),
+            Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+        ),
+    );
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-1","output":[{"id":"msg-seed","type":"message","role":"assistant","content":[{"type":"output_text","text":"seed answer"}]}]}}"#,
+        )
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+    let websocket = connector_observer
+        .recorded_websockets()
+        .await
+        .into_iter()
+        .next()
+        .expect("seed connection observer");
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"active internal tool",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    let body_task = tokio::spawn(async move {
+        to_bytes(active.into_body(), usize::MAX)
+            .await
+            .expect("active body")
+    });
+    timeout(Duration::from_secs(1), executor.started.notified())
+        .await
+        .expect("internal tool execution should start");
+    server
+        .send_text_burst(&[
+            r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-2","name":"threadline_echo","arguments":"{\"value\":\"beta\"}"}}"#,
+        ])
+        .await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let Some(upstream) = websocket.upgrade() else {
+                panic!("retained upstream dropped before recording liveness timeout");
+            };
+            if matches!(
+                upstream.terminal_state(),
+                threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(_)
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("watchdog should record liveness timeout while the tool is paused");
+
+    executor.resume.notify_one();
+    let body = timeout(Duration::from_secs(1), body_task)
+        .await
+        .expect("liveness failure body timeout")
+        .expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("failure utf8");
+    assert_eq!(body_text.matches("event: response.failed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(body_text.contains("upstream_liveness_timeout"));
+    assert!(!body_text.contains("event: response.completed"));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(server.take_pending_client_messages().await.is_empty());
+
+    for marker in ["response-1", "response-intermediate"] {
+        let stale = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"retry marker",
+                "previous_response_id":marker
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::BAD_REQUEST, "marker {marker}");
+        let stale_body = to_bytes(stale.into_body(), usize::MAX)
+            .await
+            .expect("stale marker body");
+        let stale_payload: Value = serde_json::from_slice(&stale_body).expect("stale marker json");
+        assert_eq!(
+            stale_payload["error"]["code"], "previous_response_not_found",
+            "marker {marker}"
+        );
+    }
+
+    let replacement = post_responses(app, json!({"model":"gpt-5.4","input":"new session"})).await;
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let _ = replacement_server
+        .recv_client_message()
+        .await
+        .expect("released retained entry should admit a new connection");
+    drop(replacement);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if websocket.upgrade().is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("explicit liveness finalization should release the prior live upstream");
+}
+
+#[tokio::test]
+async fn liveness_expiry_while_failing_internal_tool_waits_prioritizes_timeout() {
+    let server =
+        Arc::new(ScriptedWebSocketServer::start_after_first_client_message_without_reader().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamWatchdogPolicy::new(Duration::from_millis(100), Duration::from_secs(1))
+            .expect("valid watchdog policy"),
+    );
+    let connector_observer = connector.clone();
+    let executor = Arc::new(PausedFailingInternalToolExecutor::new());
+    let app = build_test_router_with_internal_tool_executor(
+        Arc::new(connector),
+        Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+    );
+
+    let response = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"failing internal tool"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("initial request");
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    let body_task = tokio::spawn(async move {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body")
+    });
+    timeout(Duration::from_secs(1), executor.started.notified())
+        .await
+        .expect("internal tool execution should start");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let Some(upstream) = connector_observer
+                .recorded_websockets()
+                .await
+                .into_iter()
+                .next()
+                .and_then(|websocket| websocket.upgrade())
+            else {
+                panic!("upstream dropped before recording liveness timeout");
+            };
+            if matches!(
+                upstream.terminal_state(),
+                threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(_)
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("watchdog should record liveness timeout while the tool is paused");
+
+    executor.resume.notify_one();
+    let body = timeout(Duration::from_secs(1), body_task)
+        .await
+        .expect("liveness failure body timeout")
+        .expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("failure utf8");
+    assert_eq!(body_text.matches("event: response.failed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(body_text.contains("upstream_liveness_timeout"));
+    assert!(!body_text.contains("internal_tool_failed"));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn liveness_timeout_after_internal_tool_followup_starts_invalidates_retained_aliases() {
+    let server =
+        Arc::new(ScriptedWebSocketServer::start_after_first_client_message_without_reader().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamWatchdogPolicy::new(Duration::from_millis(500), Duration::from_secs(1))
+            .expect("valid watchdog policy"),
+    );
+    let connector_observer = connector.clone();
+    let app = build_test_router(Arc::new(connector));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-1","output":[{"id":"msg-seed","type":"message","role":"assistant","content":[{"type":"output_text","text":"seed answer"}]}]}}"#,
+        )
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+    let websocket = connector_observer
+        .recorded_websockets()
+        .await
+        .into_iter()
+        .next()
+        .expect("seed connection observer");
+    let observed_upstream = websocket
+        .upgrade()
+        .expect("seed websocket should remain retained before the active turn");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"active internal tool",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let body_task = tokio::spawn(async move {
+        to_bytes(active.into_body(), usize::MAX)
+            .await
+            .expect("active body")
+    });
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                observed_upstream.terminal_state(),
+                threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(_)
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("started follow-up should encounter the watchdog timeout");
+
+    let body = timeout(Duration::from_secs(1), body_task)
+        .await
+        .expect("liveness failure body timeout")
+        .expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("failure utf8");
+    assert_eq!(body_text.matches("event: response.failed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(body_text.contains("upstream_liveness_timeout"));
+    assert!(!body_text.contains("event: response.completed"));
+
+    for marker in ["response-1", "response-intermediate"] {
+        let stale = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"retry marker",
+                "previous_response_id":marker
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::BAD_REQUEST, "marker {marker}");
+        let stale_body = to_bytes(stale.into_body(), usize::MAX)
+            .await
+            .expect("stale marker body");
+        let stale_payload: Value = serde_json::from_slice(&stale_body).expect("stale marker json");
+        assert_eq!(
+            stale_payload["error"]["code"], "previous_response_not_found",
+            "marker {marker}"
+        );
+    }
+    assert_eq!(connector_observer.recorded_websockets().await.len(), 1);
+    drop(observed_upstream);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if websocket.upgrade().is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal invalidation should release the live upstream");
+}
+
+#[tokio::test]
+async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_aliases() {
+    let server = Arc::new(ScriptedWebSocketServer::start_with_stoppable_reader().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        short_watchdog_policy(),
+    );
+    let connector_observer = connector.clone();
+    let app = build_test_router(Arc::new(connector));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
+    server
+        .send_text(
+            r#"{"type":"response.completed","response":{"id":"response-accepted","output":[{"id":"msg-seed","type":"message","role":"assistant","content":[{"type":"output_text","text":"seed answer"}]}]}}"#,
+        )
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+    let websocket = connector_observer
+        .recorded_websockets()
+        .await
+        .into_iter()
+        .next()
+        .expect("seed connection observer");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"active internal tool",
+            "previous_response_id":"response-accepted"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let body_task = tokio::spawn(async move {
+        to_bytes(active.into_body(), usize::MAX)
+            .await
+            .expect("active body")
+    });
+    server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
+        )
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
+        .await;
+
+    let followup: Value = serde_json::from_str(&message_text(
+        timeout(Duration::from_secs(1), server.recv_client_message())
+            .await
+            .expect("followup request should arrive")
+            .expect("followup request"),
+    ))
+    .expect("followup request json");
+    assert_eq!(followup["type"], "response.create");
+    assert_eq!(followup["previous_response_id"], "response-accepted");
+
+    server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-failed"}}"#)
+        .await;
+    server.stop_reader();
+
+    let body = timeout(Duration::from_secs(1), body_task)
+        .await
+        .expect("liveness failure body timeout")
+        .expect("body task");
+    let body_text = String::from_utf8(body.to_vec()).expect("failure utf8");
+    assert_eq!(body_text.matches("event: response.created").count(), 1);
+    assert_eq!(body_text.matches("event: response.failed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(body_text.contains("upstream_liveness_timeout"));
+    assert!(!body_text.contains("event: response.completed"));
+    assert!(!body_text.contains("response-intermediate"));
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let Some(upstream) = websocket.upgrade() else {
+                return;
+            };
+            if matches!(
+                upstream.terminal_state(),
+                threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(_)
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same upstream should record a liveness timeout");
+    assert_eq!(connector_observer.recorded_websockets().await.len(), 1);
+
+    for marker in [
+        "response-accepted",
+        "response-intermediate",
+        "response-failed",
+    ] {
+        let stale = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"retry marker",
+                "previous_response_id":marker
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::BAD_REQUEST, "marker {marker}");
+        let stale_body = to_bytes(stale.into_body(), usize::MAX)
+            .await
+            .expect("stale marker body");
+        let stale_payload: Value = serde_json::from_slice(&stale_body).expect("stale marker json");
+        assert_eq!(
+            stale_payload["error"]["code"], "previous_response_not_found",
+            "marker {marker}"
+        );
+    }
+    assert_eq!(connector_observer.recorded_websockets().await.len(), 1);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if websocket.upgrade().is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recoverable finalization should release live upstream ownership");
 }

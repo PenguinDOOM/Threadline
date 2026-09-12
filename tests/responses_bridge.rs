@@ -10,8 +10,8 @@ use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, Response, StatusCode};
 use futures_util::{Stream, StreamExt, future::BoxFuture, stream};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, oneshot};
-use tokio::time::{sleep, timeout};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
@@ -31,7 +31,7 @@ use threadline::models::RouteProfile;
 use threadline::responses::{
     ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
 };
-use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits};
+use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamInboundLimits, UpstreamWatchdogPolicy};
 
 #[derive(Clone)]
 struct StaticAuthProvider;
@@ -58,6 +58,7 @@ struct RecordingConnector {
     requested_sessions: Arc<Mutex<Vec<Option<UpstreamSessionDescriptor>>>>,
     websockets: Arc<Mutex<Vec<Weak<LiveUpstreamWebSocket>>>>,
     inbound_limits: UpstreamInboundLimits,
+    watchdog_policy: Option<UpstreamWatchdogPolicy>,
 }
 
 impl RecordingConnector {
@@ -68,6 +69,7 @@ impl RecordingConnector {
             requested_sessions: Arc::new(Mutex::new(Vec::new())),
             websockets: Arc::new(Mutex::new(Vec::new())),
             inbound_limits: UpstreamInboundLimits::DEFAULT,
+            watchdog_policy: None,
         }
     }
 
@@ -77,6 +79,16 @@ impl RecordingConnector {
     ) -> Self {
         Self {
             inbound_limits,
+            ..Self::new(plans)
+        }
+    }
+
+    fn with_watchdog_policy(
+        plans: Vec<PlannedConnection>,
+        watchdog_policy: UpstreamWatchdogPolicy,
+    ) -> Self {
+        Self {
+            watchdog_policy: Some(watchdog_policy),
             ..Self::new(plans)
         }
     }
@@ -105,6 +117,7 @@ impl UpstreamConnector for RecordingConnector {
         let requested_sessions = Arc::clone(&self.requested_sessions);
         let websockets = Arc::clone(&self.websockets);
         let inbound_limits = self.inbound_limits;
+        let watchdog_policy = self.watchdog_policy;
         Box::pin(async move {
             requested_sessions.lock().await.push(session.clone());
             let session = session.unwrap_or_else(new_session_descriptor);
@@ -119,10 +132,16 @@ impl UpstreamConnector for RecordingConnector {
                 .await
                 .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
 
-            let websocket = Arc::new(LiveUpstreamWebSocket::from_stream_with_limits(
-                stream,
-                inbound_limits,
-            ));
+            let websocket = Arc::new(match watchdog_policy {
+                Some(policy) => {
+                    LiveUpstreamWebSocket::from_stream_with_ping_interval_and_watchdog_policy(
+                        stream,
+                        Duration::from_millis(5),
+                        policy,
+                    )
+                }
+                None => LiveUpstreamWebSocket::from_stream_with_limits(stream, inbound_limits),
+            });
             websockets.lock().await.push(Arc::downgrade(&websocket));
 
             Ok(ConnectedUpstream {
@@ -215,6 +234,11 @@ fn build_test_router(
         config,
         ThreadlineServices::new(Arc::new(StaticAuthProvider), connector),
     )
+}
+
+fn short_watchdog_policy() -> UpstreamWatchdogPolicy {
+    UpstreamWatchdogPolicy::new(Duration::from_millis(30), Duration::from_secs(1))
+        .expect("valid watchdog policy")
 }
 
 async fn post_responses(app: axum::Router, payload: Value) -> Response<Body> {
@@ -769,6 +793,45 @@ async fn next_body_chunk(
         .await
         .expect("expected body chunk before EOF")
         .expect("body chunk")
+}
+
+async fn wait_for_liveness_timeout(connector: &RecordingConnector, index: usize) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let websocket = connector
+                .recorded_websockets()
+                .await
+                .get(index)
+                .and_then(Weak::upgrade);
+            if websocket.is_some_and(|websocket| {
+                matches!(
+                    websocket.terminal_state(),
+                    threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(_)
+                )
+            }) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upstream should record a liveness timeout");
+}
+
+async fn wait_for_websocket_release(connector: &RecordingConnector, index: usize) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if connector.recorded_websockets().await[index]
+                .upgrade()
+                .is_none()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("transient route should release its upstream websocket");
 }
 
 #[tokio::test]
@@ -7677,6 +7740,49 @@ async fn overflow_after_synthetic_delta_discards_queued_forwarded_event_before_f
 }
 
 #[tokio::test]
+async fn liveness_timeout_after_synthetic_delta_discards_queued_forwarded_event_before_failure() {
+    let server =
+        Arc::new(ScriptedWebSocketServer::start_after_first_client_message_without_reader().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        short_watchdog_policy(),
+    );
+    let connector_observer = connector.clone();
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"gpt-5.4","input":"queued output"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("response.create");
+    server
+        .send_text(
+            r#"{"type":"response.output_text.done","text":"old queued output","response_id":"response-queued"}"#,
+        )
+        .await;
+
+    let mut body = response.into_body().into_data_stream();
+    let synthetic_delta = next_body_chunk(&mut body).await;
+    let synthetic_delta_text = String::from_utf8(synthetic_delta.to_vec()).expect("delta utf8");
+    assert!(synthetic_delta_text.contains("event: response.output_text.delta"));
+
+    wait_for_liveness_timeout(&connector_observer, 0).await;
+
+    let failed = next_body_chunk(&mut body).await;
+    let failed_text = String::from_utf8(failed.to_vec()).expect("failure utf8");
+    assert!(failed_text.contains("event: response.failed"));
+    assert!(failed_text.contains("upstream_liveness_timeout"));
+    assert!(!failed_text.contains("response.output_text.done"));
+    let done = next_body_chunk(&mut body).await;
+    assert_eq!(
+        String::from_utf8(done.to_vec()).expect("done utf8"),
+        "data: [DONE]\n\n"
+    );
+    assert!(body.next().await.is_none());
+}
+
+#[tokio::test]
 async fn overflow_after_final_completion_acceptance_preserves_single_success_then_rejects_reuse() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::with_inbound_limits(
@@ -7741,6 +7847,312 @@ async fn overflow_after_final_completion_acceptance_preserves_single_success_the
     assert_eq!(
         resumed_payload["error"]["code"],
         "upstream_inbound_buffer_overflow"
+    );
+}
+
+#[tokio::test]
+async fn event_after_completed_aliases_liveness_timeout_preserves_only_prior_markers() {
+    let retained_server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&retained_server),
+            turn_state: None,
+        }],
+        UpstreamWatchdogPolicy::new(Duration::from_millis(500), Duration::from_secs(1))
+            .expect("valid watchdog policy"),
+    );
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    for (previous_response_id, response_id) in
+        [(None, "response-1"), (Some("response-1"), "response-2")]
+    {
+        let mut payload = json!({"model":"gpt-5.4","input":"completed turn"});
+        if let Some(previous_response_id) = previous_response_id {
+            payload["previous_response_id"] = json!(previous_response_id);
+        }
+        let response = post_responses(app.clone(), payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        retained_server
+            .send_text(&assistant_text_completed_event(response_id, "completed turn").to_string())
+            .await;
+        let _ = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("completed turn body");
+    }
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"active after upstream event",
+            "previous_response_id":"response-2"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    retained_server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-3"}}"#)
+        .await;
+
+    let active_body = timeout(
+        Duration::from_secs(1),
+        to_bytes(active.into_body(), usize::MAX),
+    )
+    .await
+    .expect("liveness timeout body")
+    .expect("liveness timeout response body");
+    let active_text = String::from_utf8(active_body.to_vec()).expect("active body utf8");
+    assert_eq!(active_text.matches("event: response.failed").count(), 1);
+    assert_eq!(active_text.matches("data: [DONE]").count(), 1);
+    assert!(active_text.contains("upstream_liveness_timeout"));
+    assert!(!active_text.contains("event: response.completed"));
+
+    for marker in ["response-1", "response-2", "response-3"] {
+        let resumed = post_responses(
+            app.clone(),
+            json!({
+                "model":"gpt-5.4",
+                "input":"resume after timeout",
+                "previous_response_id":marker
+            }),
+        )
+        .await;
+        assert_eq!(resumed.status(), StatusCode::BAD_REQUEST, "marker {marker}");
+        let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+            .await
+            .expect("stale marker body");
+        let resumed_payload: Value =
+            serde_json::from_slice(&resumed_body).expect("stale marker json");
+        assert_eq!(
+            resumed_payload["error"]["code"], "previous_response_not_found",
+            "marker {marker}"
+        );
+    }
+
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+}
+
+#[tokio::test]
+async fn event_after_fresh_liveness_timeout_removes_markerless_entry_and_releases_capacity() {
+    let timed_out_server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let replacement_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&timed_out_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&replacement_server),
+                turn_state: None,
+            },
+        ],
+        short_watchdog_policy(),
+    );
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let active = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"fresh"})).await;
+    assert_eq!(active.status(), StatusCode::OK);
+    timed_out_server
+        .send_text(r#"{"type":"response.created","response":{"id":"response-failed"}}"#)
+        .await;
+    let active_body = timeout(
+        Duration::from_secs(1),
+        to_bytes(active.into_body(), usize::MAX),
+    )
+    .await
+    .expect("liveness timeout body")
+    .expect("liveness timeout response body");
+    let active_text = String::from_utf8(active_body.to_vec()).expect("active body utf8");
+    assert_eq!(active_text.matches("event: response.failed").count(), 1);
+    assert_eq!(active_text.matches("data: [DONE]").count(), 1);
+    assert!(active_text.contains("upstream_liveness_timeout"));
+
+    let replacement = post_responses(
+        app,
+        json!({"model":"gpt-5.4","input":"replacement session"}),
+    )
+    .await;
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let _ = replacement_server
+        .recv_client_message()
+        .await
+        .expect("replacement request");
+    drop(replacement);
+    assert_eq!(connector.recorded_sessions().await.len(), 2);
+}
+
+#[tokio::test]
+async fn dropping_armed_body_before_liveness_observation_invalidates_completed_aliases() {
+    let server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        UpstreamWatchdogPolicy::new(Duration::from_millis(500), Duration::from_secs(1))
+            .expect("valid watchdog policy"),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    server
+        .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let active = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-5.4",
+            "input":"armed continuation",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::OK);
+    drop(active);
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-1"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("invalidated marker body");
+    let resumed_payload: Value =
+        serde_json::from_slice(&resumed_body).expect("invalidated marker json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+}
+
+#[tokio::test]
+async fn liveness_timeout_before_final_completion_acceptance_discards_completion_and_marker() {
+    let server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        short_watchdog_policy(),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    server
+        .send_text(&assistant_text_completed_event("response-final", "final answer").to_string())
+        .await;
+    sleep(Duration::from_millis(75)).await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("timeout body");
+    let body_text = String::from_utf8(body.to_vec()).expect("timeout body utf8");
+    assert_eq!(body_text.matches("event: response.failed").count(), 1);
+    assert_eq!(body_text.matches("data: [DONE]").count(), 1);
+    assert!(body_text.contains("upstream_liveness_timeout"));
+    assert!(!body_text.contains("event: response.completed"));
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-final"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("rejected marker body");
+    let resumed_payload: Value =
+        serde_json::from_slice(&resumed_body).expect("rejected marker json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
+    );
+}
+
+#[tokio::test]
+async fn liveness_timeout_after_final_completion_acceptance_preserves_success_and_done() {
+    let server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![PlannedConnection {
+            server: Arc::clone(&server),
+            turn_state: None,
+        }],
+        short_watchdog_policy(),
+    );
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    server
+        .send_text(&assistant_text_completed_event("response-final", "final answer").to_string())
+        .await;
+
+    let mut body = response.into_body().into_data_stream();
+    let synthetic_delta = next_body_chunk(&mut body).await;
+    assert!(
+        String::from_utf8(synthetic_delta.to_vec())
+            .expect("synthetic delta utf8")
+            .contains("response.output_text.delta")
+    );
+    sleep(Duration::from_millis(75)).await;
+
+    let completed = next_body_chunk(&mut body).await;
+    let completed_text = String::from_utf8(completed.to_vec()).expect("completed chunk utf8");
+    assert!(completed_text.contains("event: response.completed"));
+    let done = next_body_chunk(&mut body).await;
+    assert_eq!(
+        String::from_utf8(done.to_vec()).expect("done chunk utf8"),
+        "data: [DONE]\n\n"
+    );
+    assert!(body.next().await.is_none());
+
+    let resumed = post_responses(
+        app,
+        json!({
+            "model":"gpt-5.4",
+            "input":"resume",
+            "previous_response_id":"response-final"
+        }),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    let resumed_body = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("stale marker body");
+    let resumed_payload: Value = serde_json::from_slice(&resumed_body).expect("stale marker json");
+    assert_eq!(
+        resumed_payload["error"]["code"],
+        "previous_response_not_found"
     );
 }
 
@@ -8289,6 +8701,244 @@ async fn utility_overflow_is_transient_and_does_not_retry_the_connection() {
         .expect("next utility request");
     drop(next);
     assert_eq!(connector.recorded_sessions().await.len(), 2);
+}
+
+#[tokio::test]
+async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker() {
+    let main_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let missed_pong_server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let healthy_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&main_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&missed_pong_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&healthy_server),
+                turn_state: None,
+            },
+        ],
+        short_watchdog_policy(),
+    );
+    let app = build_test_router(
+        ThreadlineConfig {
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let _ = main_server
+        .recv_client_message()
+        .await
+        .expect("main seed request");
+    main_server
+        .send_text(&assistant_text_completed_event("response-main", "seed").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+
+    let (main_requests_tx, mut main_requests_rx) = mpsc::unbounded_channel();
+    let main_pong_server = Arc::clone(&main_server);
+    tokio::spawn(async move {
+        while let Some(message) = main_pong_server.recv_client_message().await {
+            match message {
+                Message::Ping(payload) => main_pong_server.send_pong(payload.to_vec()).await,
+                message => {
+                    let _ = main_requests_tx.send(message);
+                }
+            }
+        }
+    });
+
+    let missed = post_responses(
+        app.clone(),
+        auxiliary_summary_request(Some("response-main")),
+    )
+    .await;
+    assert_eq!(missed.status(), StatusCode::OK);
+    wait_for_liveness_timeout(&connector, 1).await;
+    let missed_text = String::from_utf8(
+        to_bytes(missed.into_body(), usize::MAX)
+            .await
+            .expect("missed pong body")
+            .to_vec(),
+    )
+    .expect("missed pong utf8");
+    assert_eq!(missed_text.matches("event: response.failed").count(), 1);
+    assert_eq!(missed_text.matches("data: [DONE]").count(), 1);
+    assert!(missed_text.contains("upstream_liveness_timeout"));
+    assert!(!missed_text.contains("event: response.completed"));
+    wait_for_websocket_release(&connector, 1).await;
+
+    let healthy = post_responses(
+        app.clone(),
+        auxiliary_summary_request(Some("response-main")),
+    )
+    .await;
+    assert_eq!(healthy.status(), StatusCode::OK);
+    let healthy_request: Value = serde_json::from_str(&message_text(
+        healthy_server
+            .recv_client_message()
+            .await
+            .expect("summary request"),
+    ))
+    .expect("summary request json");
+    assert!(healthy_request.get("previous_response_id").is_none());
+    let healthy_liveness_started = Instant::now();
+    for _ in 0..12 {
+        let ping = healthy_server
+            .recv_client_message()
+            .await
+            .expect("summary ping");
+        let Message::Ping(payload) = ping else {
+            panic!("expected watchdog ping, got {ping:?}");
+        };
+        healthy_server.send_pong(payload.to_vec()).await;
+    }
+    assert!(
+        healthy_liveness_started.elapsed() >= Duration::from_millis(60),
+        "matching Pongs must keep the auxiliary summary alive for at least two Pong deadlines"
+    );
+    healthy_server
+        .send_text(&assistant_text_completed_event("response-summary", "summary").to_string())
+        .await;
+    let healthy_text = String::from_utf8(
+        to_bytes(healthy.into_body(), usize::MAX)
+            .await
+            .expect("healthy summary body")
+            .to_vec(),
+    )
+    .expect("healthy summary utf8");
+    assert_eq!(healthy_text.matches("event: response.completed").count(), 1);
+    assert_eq!(healthy_text.matches("data: [DONE]").count(), 1);
+    assert!(!healthy_text.contains("response.failed"));
+    wait_for_websocket_release(&connector, 2).await;
+
+    let resumed = post_responses(
+        app.clone(),
+        json!({"model":"gpt-5.4","input":"resume","previous_response_id":"response-main"}),
+    )
+    .await;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let resumed_request: Value = serde_json::from_str(&message_text(
+        main_requests_rx
+            .recv()
+            .await
+            .expect("main continuation request"),
+    ))
+    .expect("main continuation json");
+    assert_eq!(resumed_request["previous_response_id"], "response-main");
+    main_server
+        .send_text(
+            &assistant_text_completed_event("response-main-continued", "continued").to_string(),
+        )
+        .await;
+    let _ = to_bytes(resumed.into_body(), usize::MAX)
+        .await
+        .expect("main continuation body");
+
+    assert_eq!(connector.recorded_sessions().await.len(), 3);
+    let requested_sessions = connector.recorded_requested_sessions().await;
+    assert!(requested_sessions[0].is_some());
+    assert_eq!(requested_sessions[1..], [None, None]);
+}
+
+#[tokio::test]
+async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
+    let missed_pong_server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let healthy_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::with_watchdog_policy(
+        vec![
+            PlannedConnection {
+                server: Arc::clone(&missed_pong_server),
+                turn_state: None,
+            },
+            PlannedConnection {
+                server: Arc::clone(&healthy_server),
+                turn_state: None,
+            },
+        ],
+        short_watchdog_policy(),
+    );
+    let app = build_test_router(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            retained_session_capacity: 1,
+            ..ThreadlineConfig::default()
+        },
+        Arc::new(connector.clone()),
+    );
+
+    let missed = post_responses(app.clone(), json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility missed pong","previous_response_id":"response-main"})).await;
+    assert_eq!(missed.status(), StatusCode::OK);
+    wait_for_liveness_timeout(&connector, 0).await;
+    let missed_text = String::from_utf8(
+        to_bytes(missed.into_body(), usize::MAX)
+            .await
+            .expect("utility missed pong body")
+            .to_vec(),
+    )
+    .expect("utility missed pong utf8");
+    assert_eq!(missed_text.matches("event: response.failed").count(), 1);
+    assert_eq!(missed_text.matches("data: [DONE]").count(), 1);
+    assert!(missed_text.contains("upstream_liveness_timeout"));
+    assert!(!missed_text.contains("event: response.completed"));
+    wait_for_websocket_release(&connector, 0).await;
+
+    let healthy = post_responses(app, json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility healthy","previous_response_id":"response-main"})).await;
+    assert_eq!(healthy.status(), StatusCode::OK);
+    let healthy_request: Value = serde_json::from_str(&message_text(
+        healthy_server
+            .recv_client_message()
+            .await
+            .expect("utility request"),
+    ))
+    .expect("utility request json");
+    assert!(healthy_request.get("previous_response_id").is_none());
+    let healthy_liveness_started = Instant::now();
+    for _ in 0..12 {
+        let ping = healthy_server
+            .recv_client_message()
+            .await
+            .expect("utility ping");
+        let Message::Ping(payload) = ping else {
+            panic!("expected watchdog ping, got {ping:?}");
+        };
+        healthy_server.send_pong(payload.to_vec()).await;
+    }
+    assert!(
+        healthy_liveness_started.elapsed() >= Duration::from_millis(60),
+        "matching Pongs must keep the Utility connection alive for at least two Pong deadlines"
+    );
+    healthy_server
+        .send_text(&assistant_text_completed_event("response-utility", "utility").to_string())
+        .await;
+    let healthy_text = String::from_utf8(
+        to_bytes(healthy.into_body(), usize::MAX)
+            .await
+            .expect("healthy utility body")
+            .to_vec(),
+    )
+    .expect("healthy utility utf8");
+    assert_eq!(healthy_text.matches("event: response.completed").count(), 1);
+    assert_eq!(healthy_text.matches("data: [DONE]").count(), 1);
+    assert!(!healthy_text.contains("response.failed"));
+    wait_for_websocket_release(&connector, 1).await;
+
+    assert_eq!(connector.recorded_sessions().await.len(), 2);
+    assert_eq!(
+        connector.recorded_requested_sessions().await,
+        vec![None, None]
+    );
 }
 
 #[tokio::test]

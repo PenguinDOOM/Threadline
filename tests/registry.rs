@@ -1,4 +1,14 @@
+use std::sync::Arc;
+
+use tokio::time::{Duration, timeout};
+use tokio_tungstenite::connect_async;
+
+#[path = "support/scripted_ws.rs"]
+mod scripted_ws;
+
+use scripted_ws::ScriptedWebSocketServer;
 use threadline::registry::{RegistryAcquireError, RetainedSessionRegistry};
+use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamTerminalState, UpstreamWatchdogPolicy};
 
 #[tokio::test]
 async fn previous_response_marker_reuses_the_same_retained_session_after_release() {
@@ -186,4 +196,61 @@ async fn recoverable_close_preserves_marker_continuity_without_a_live_socket() {
     assert_eq!(reacquired.session().session_id, original_session.session_id);
     assert!(!reacquired.has_live_upstream());
     assert!(reacquired.upstream().is_none());
+}
+
+#[tokio::test]
+async fn idle_liveness_timeout_preserves_completed_aliases_and_returns_stale_marker() {
+    let server = ScriptedWebSocketServer::start_without_reader().await;
+    let (stream, _) = connect_async(server.url())
+        .await
+        .expect("connect websocket");
+    let websocket = Arc::new(
+        LiveUpstreamWebSocket::from_stream_with_ping_interval_and_watchdog_policy(
+            stream,
+            Duration::from_millis(5),
+            UpstreamWatchdogPolicy::new(Duration::from_millis(5), Duration::from_secs(1))
+                .expect("valid watchdog policy"),
+        ),
+    );
+    let registry = RetainedSessionRegistry::new(1);
+    let mut lease = registry.acquire_new().await.expect("create session");
+    let original_session = lease.session().clone();
+    lease
+        .update_turn_state(Some("retained-turn-state".to_string()))
+        .await;
+    lease.replace_upstream(Some(Arc::clone(&websocket))).await;
+    lease.record_completed_marker("response-1").await;
+    lease.record_completed_marker("response-1-alias").await;
+    lease.release();
+
+    timeout(Duration::from_secs(1), async {
+        while matches!(websocket.terminal_state(), UpstreamTerminalState::Open) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle watchdog timeout");
+    assert!(matches!(
+        websocket.terminal_state(),
+        UpstreamTerminalState::LivenessTimeout(_)
+    ));
+
+    for marker in ["response-1", "response-1-alias", "response-1"] {
+        assert_eq!(
+            registry
+                .acquire_previous(marker)
+                .await
+                .expect_err("timed-out completed marker must stay stale"),
+            RegistryAcquireError::PreviousResponseNotFound
+        );
+    }
+
+    let replacement = registry
+        .acquire_new()
+        .await
+        .expect("capacity remains reusable");
+    assert_ne!(
+        replacement.session().session_id,
+        original_session.session_id
+    );
 }
