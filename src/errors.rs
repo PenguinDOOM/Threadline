@@ -52,6 +52,9 @@ pub enum ThreadlineError {
     #[error("Threadline could not connect to the upstream Codex websocket.")]
     UpstreamWebSocketConnectFailed,
 
+    #[error("The upstream websocket connection timed out.")]
+    UpstreamWebSocketConnectTimeout,
+
     #[error("The upstream Codex websocket handshake was rejected with HTTP {status}.")]
     UpstreamWebSocketHandshakeRejected { status: StatusCode },
 
@@ -124,6 +127,7 @@ impl ThreadlineError {
             Self::RetainedSessionConflict => StatusCode::CONFLICT,
             Self::RetainedSessionCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamWebSocketConnectFailed => StatusCode::BAD_GATEWAY,
+            Self::UpstreamWebSocketConnectTimeout => StatusCode::BAD_GATEWAY,
             Self::UpstreamWebSocketHandshakeRejected { status } => *status,
             Self::UpstreamWebSocketClosed => StatusCode::BAD_GATEWAY,
             Self::UpstreamInboundBufferOverflow => StatusCode::BAD_GATEWAY,
@@ -189,6 +193,11 @@ impl ThreadlineError {
                 "upstream_websocket_connect_failed",
                 "Threadline could not connect to the upstream Codex websocket.",
                 "bad_gateway_error",
+            ),
+            Self::UpstreamWebSocketConnectTimeout => borrowed_public_error(
+                "upstream_websocket_connect_timeout",
+                "The upstream websocket connection timed out.",
+                "server_error",
             ),
             Self::UpstreamWebSocketHandshakeRejected { status } => PublicErrorPayload {
                 code: Cow::Borrowed("upstream_websocket_handshake_rejected"),
@@ -407,6 +416,24 @@ mod tests {
         assert_eq!(
             document.error.message.as_ref(),
             "The upstream websocket inbound buffer overflowed."
+        );
+    }
+
+    #[test]
+    fn upstream_websocket_connect_timeout_has_a_stable_public_error() {
+        let error = ThreadlineError::UpstreamWebSocketConnectTimeout;
+
+        assert_eq!(error.status_code(), StatusCode::BAD_GATEWAY);
+        assert!(!error.is_upstream_recoverable_close());
+        let document = error.public_error_document();
+        assert_eq!(
+            document.error.code.as_ref(),
+            "upstream_websocket_connect_timeout"
+        );
+        assert_eq!(document.error.error_type.as_ref(), "server_error");
+        assert_eq!(
+            document.error.message.as_ref(),
+            "The upstream websocket connection timed out."
         );
     }
 }

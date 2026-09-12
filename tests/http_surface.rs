@@ -67,6 +67,35 @@ impl UpstreamConnector for UnusedConnector {
     }
 }
 
+#[derive(Clone)]
+struct TimeoutConnector {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl UpstreamConnector for TimeoutConnector {
+    fn connect(
+        &self,
+        _auth: LoadedUpstreamAuth,
+        _session: Option<UpstreamSessionDescriptor>,
+    ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(ThreadlineError::UpstreamWebSocketConnectTimeout) })
+    }
+}
+
+#[derive(Clone)]
+struct AvailableAuthProvider;
+
+impl UpstreamAuthProvider for AvailableAuthProvider {
+    fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
+        Ok(LoadedUpstreamAuth {
+            bearer_token: "test-token".to_string(),
+            source: threadline::auth::AuthSource::CodexHomeAuth,
+            refresh_boundary: threadline::auth::RefreshBoundary::NotAvailable,
+        })
+    }
+}
+
 const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 4] = [
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-5.6-sol",
@@ -1175,4 +1204,45 @@ async fn responses_endpoint_reports_configuration_error_for_allowed_model_when_u
         payload["error"]["message"],
         "Threadline could not load upstream credentials."
     );
+}
+
+#[tokio::test]
+async fn responses_endpoint_maps_connect_timeout_to_fixed_server_error_for_main_and_utility() {
+    for (profile, model) in [
+        (RouteProfile::Main, "gpt-5.4"),
+        (RouteProfile::Utility, "threadline-utility-gpt-5.4-mini"),
+    ] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = build_router_with_services(
+            ThreadlineConfig {
+                profile,
+                retained_session_capacity: 1,
+                ..ThreadlineConfig::default()
+            },
+            ThreadlineServices::new(
+                Arc::new(AvailableAuthProvider),
+                Arc::new(TimeoutConnector {
+                    attempts: attempts.clone(),
+                }),
+            ),
+        );
+        let second_app = app.clone();
+        let response = post_responses_json(app, json!({ "model": model })).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            read_json_body(response).await,
+            json!({
+                "error": {
+                    "code": "upstream_websocket_connect_timeout",
+                    "message": "The upstream websocket connection timed out.",
+                    "type": "server_error"
+                }
+            })
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let second_response = post_responses_json(second_app, json!({ "model": model })).await;
+        assert_eq!(second_response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
 }

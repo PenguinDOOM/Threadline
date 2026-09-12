@@ -123,6 +123,14 @@ The pump owns continuous socket IO. Other code communicates with the pump throug
 
 The pump must support reading upstream frames, writing outbound upstream messages, replying to server Ping frames with Pong, forwarding Text/Binary frames into an inbound queue, accepting outbound Text/Ping/Close commands, recording close/error metadata, and running while a session is retained.
 
+## Upstream connection establishment
+
+Upstream connection establishment is bounded by `--upstream-connect-timeout-secs` or `THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS`. The default is `30` seconds, and startup accepts only integer values in the range `1..=3600`. CLI values take precedence over environment values. Zero, negative, non-integer, and out-of-range values are rejected during startup; the setting is not disableable and values are not clamped.
+
+The deadline covers the total asynchronous connection future, including DNS, TCP, TLS, and the HTTP upgrade. It does not cover synchronous authentication discovery or refresh work, and it does not promise that a blocking internal operation is physically interrupted at the exact deadline. Main, Utility, and auxiliary summary connections use the same connector policy.
+
+When the deadline expires, Threadline drops the connection future before creating a pump and does not retry automatically. Before response headers, the client receives the existing JSON error with HTTP `502`, `type=server_error`, code `upstream_websocket_connect_timeout`, and message `The upstream websocket connection timed out.`. Existing handshake rejection and other connection error classifications remain unchanged. The default is an operational policy value, not a measured Codex service-level agreement.
+
 ## Bounded upstream inbound buffering
 
 The upstream inbound queue is bounded independently for each WebSocket connection:
@@ -364,7 +372,7 @@ Panic only for impossible internal invariants where continuing would be unsafe.
 
 ## Public error codes and safety
 
-Use stable error codes for expected states, including `previous_response_not_found`, `retained_session_conflict`, `retained_session_capacity_exceeded`, `upstream_websocket_connect_failed`, `upstream_websocket_closed`, `internal_tool_failed`, and `job_not_found`.
+Use stable error codes for expected states, including `previous_response_not_found`, `retained_session_conflict`, `retained_session_capacity_exceeded`, `upstream_websocket_connect_failed`, `upstream_websocket_connect_timeout`, `upstream_websocket_closed`, `internal_tool_failed`, and `job_not_found`.
 
 Add new public error codes only when callers can act on them or logs need stable categorization.
 

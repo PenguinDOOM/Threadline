@@ -21,6 +21,8 @@ const DEFAULT_PERSISTENT_REASONING_ENABLED: bool = false;
 const DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES: usize = 32 * 1024;
 const DEFAULT_JOB_RETENTION_TTL_SECS: u64 = 300;
 const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
+const MAX_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 static ACTIVE_JOB_MANAGER_CONFIG: LazyLock<Mutex<ThreadlineJobManagerConfig>> =
@@ -125,6 +127,17 @@ pub struct ThreadlineConfig {
 
     #[arg(
         long,
+        env = "THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS",
+        default_value_t = DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS,
+        value_parser = parse_upstream_connect_timeout_secs,
+        value_name = "SECONDS",
+        help = "Maximum time allowed to establish the upstream websocket connection.",
+        long_help = "Maximum total time allowed to establish the upstream websocket connection, including DNS, TCP, TLS, and HTTP upgrade."
+    )]
+    pub upstream_connect_timeout_secs: u64,
+
+    #[arg(
+        long,
         env = "THREADLINE_JOBS_ENABLED",
         default_value_t = DEFAULT_JOBS_ENABLED,
         value_name = "BOOL",
@@ -214,6 +227,7 @@ impl Default for ThreadlineConfig {
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             upstream_inbound_max_messages: DEFAULT_UPSTREAM_INBOUND_MAX_MESSAGES,
             upstream_inbound_max_bytes: DEFAULT_UPSTREAM_INBOUND_MAX_BYTES,
+            upstream_connect_timeout_secs: DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
             persistent_reasoning_enabled: DEFAULT_PERSISTENT_REASONING_ENABLED,
             job_output_buffer_limit_bytes: DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,
@@ -249,6 +263,14 @@ impl ThreadlineConfig {
             self.upstream_inbound_max_messages,
             self.upstream_inbound_max_bytes,
         )
+    }
+
+    pub fn upstream_connect_timeout(&self) -> Result<Duration, &'static str> {
+        if (1..=MAX_UPSTREAM_CONNECT_TIMEOUT_SECS).contains(&self.upstream_connect_timeout_secs) {
+            Ok(Duration::from_secs(self.upstream_connect_timeout_secs))
+        } else {
+            Err("upstream connect timeout must be between 1 and 3600 seconds")
+        }
     }
 
     pub fn job_manager_config(&self) -> ThreadlineJobManagerConfig {
@@ -329,6 +351,17 @@ fn parse_max_request_body_bytes(value: &str) -> Result<usize, String> {
 
 fn parse_upstream_inbound_max_bytes(value: &str) -> Result<usize, String> {
     parse_bounded_usize(value, 1, MAX_UPSTREAM_INBOUND_MAX_BYTES)
+}
+
+fn parse_upstream_connect_timeout_secs(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "must be an integer between 1 and 3600".to_string())?;
+    if (1..=MAX_UPSTREAM_CONNECT_TIMEOUT_SECS).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("must be between 1 and 3600".to_string())
+    }
 }
 
 fn parse_bounded_usize(value: &str, minimum: usize, maximum: usize) -> Result<usize, String> {
@@ -450,6 +483,27 @@ mod tests {
 
     struct RequestBodyLimitEnvGuard {
         max_request_body_bytes: Option<OsString>,
+    }
+
+    struct UpstreamConnectTimeoutEnvGuard {
+        value: Option<OsString>,
+    }
+
+    impl UpstreamConnectTimeoutEnvGuard {
+        fn acquire() -> Self {
+            Self {
+                value: std::env::var_os("THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS"),
+            }
+        }
+    }
+
+    impl Drop for UpstreamConnectTimeoutEnvGuard {
+        fn drop(&mut self) {
+            restore_env_var(
+                "THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS",
+                self.value.take(),
+            );
+        }
     }
 
     impl JobCapacityEnvGuard {
@@ -633,6 +687,74 @@ mod tests {
         );
         assert!(UpstreamInboundLimits::new(0, 1).is_err());
         assert!(UpstreamInboundLimits::new(1, 0).is_err());
+    }
+
+    #[test]
+    fn upstream_connect_timeout_defaults_and_accepts_boundaries() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        let default_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(default_config.upstream_connect_timeout_secs, 30);
+        assert_eq!(
+            default_config.upstream_connect_timeout(),
+            Ok(std::time::Duration::from_secs(30))
+        );
+
+        for value in ["1", "3600"] {
+            let config = ThreadlineCli::try_parse_from([
+                "threadline",
+                "--upstream-connect-timeout-secs",
+                value,
+            ])
+            .expect("boundary should be accepted")
+            .server;
+            assert!(config.upstream_connect_timeout().is_ok());
+        }
+
+        for value in ["0", "3601", "-1", "not-a-number"] {
+            assert!(
+                ThreadlineCli::try_parse_from([
+                    "threadline",
+                    "--upstream-connect-timeout-secs",
+                    value,
+                ])
+                .is_err()
+            );
+        }
+
+        assert!(
+            ThreadlineConfig {
+                upstream_connect_timeout_secs: 0,
+                ..ThreadlineConfig::default()
+            }
+            .upstream_connect_timeout()
+            .is_err()
+        );
+        assert!(
+            ThreadlineConfig {
+                upstream_connect_timeout_secs: 3601,
+                ..ThreadlineConfig::default()
+            }
+            .upstream_connect_timeout()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn upstream_connect_timeout_cli_overrides_environment() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        let _guard = UpstreamConnectTimeoutEnvGuard::acquire();
+        unsafe {
+            std::env::set_var("THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS", "17");
+        }
+
+        let from_environment = ThreadlineCli::parse_from(["threadline"]).server;
+        let from_cli =
+            ThreadlineCli::try_parse_from(["threadline", "--upstream-connect-timeout-secs", "23"])
+                .expect("valid CLI override")
+                .server;
+
+        assert_eq!(from_environment.upstream_connect_timeout_secs, 17);
+        assert_eq!(from_cli.upstream_connect_timeout_secs, 23);
     }
 
     #[test]
