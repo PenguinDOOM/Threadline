@@ -310,6 +310,20 @@ Cancellation should be best effort. A cancelled job should move to a stable canc
 
 Unknown job ids should return `job_not_found`.
 
+### Job retention and capacity
+
+Job admission is bounded by two immutable `usize` limits. `--job-max-active-jobs` / `THREADLINE_JOB_MAX_ACTIVE_JOBS` defaults to `16` and counts admitted managed workers whose execution reservation has not finished. `--job-max-retained-jobs` / `THREADLINE_JOB_MAX_RETAINED_JOBS` defaults to `128` and counts every registry entry, including starting, running, and terminal jobs. A value of `0` denies new admissions; it never means unlimited. Values are not clamped and no relationship is imposed between the limits, so a retained limit below the active limit is valid. Jobs remain disabled by default, the output buffer defaults to `32768` bytes, and the retention TTL defaults to `300` seconds.
+
+Every public job-manager boundary performs lazy TTL cleanup: `spawn_job`, `start_command_json`, `poll_json`, `read_output_json`, `get_result_json`, `cancel_json`, and explicit `prune_expired`. This includes missing-id lookups and starts rejected as disabled, invalid, or disallowed. An entry is removable only when it has terminal public state, the worker execution has finished, and `finished_at` is present. Entries at age greater than or equal to the TTL are removed first. TTL is measured from the original terminal transition; reads, repeated cancellation, and worker-exit cleanup do not refresh it. TTL cleanup does not delete anything during total API inactivity, and it is not a minimum-retention guarantee.
+
+When active capacity permits a new admission but retained capacity is full, the manager removes the minimum number of eligible terminal entries in ascending `(finished_at, job_id)` order. This is completion order with a lexical `job_id` tie-breaker, not LRU or access order. Unexpired eligible history may be evicted under retained-capacity pressure. Active-capacity rejection does not evict unexpired history, and unfinished entries are never removed to manufacture space. Admission, expiry cleanup, victim selection, and insertion are one decision under the registry lock; worker spawning, process IO, cancellation, and joins occur outside that lock.
+
+Capacity rejection has the stable public shape `ok: false`, code `job_capacity_exceeded`, and message `Threadline job capacity is exhausted.`. It has no `job_id`, status, or success hint, and the rejected closure or command is not started. Successful starts retain the existing immediate `starting` response and short `next_action_hint`. Worker launch failure uses `job_worker_spawn_failed` with message `Threadline could not start the job worker.`. Failure to launch a Threadline-owned output reader uses `job_output_reader_spawn_failed` with message `Threadline could not start a job output reader.`; owned pipe and child resources are cleaned up before the execution reservation is released. If cleanup cannot be confirmed, the entry remains unfinished and non-evictable, capacity remains consumed until a disruptive restart, and the fixed `job_worker_cleanup_incomplete` diagnostic is emitted.
+
+Public terminal state does not by itself release active capacity. Starting, cancelled, and early-completed jobs remain active while their worker or owned command resources are still executing. Cancellation is best effort and does not forcibly abort an uncooperative future or manage arbitrary descendant processes. A call that already acquired an entry completes against that entry and returns its snapshot even if another operation removes the registry key; a later lookup then returns `job_not_found`. Surviving entries preserve their existing result, buffered output, `next_offset`, and `truncated_before` semantics.
+
+The limits bound managed worker reservations and registry entries only. They do not guarantee a process RSS bound, a global output/result byte budget, or cleanup of detached work, arbitrary descendants, or process-abort state. The standalone environment configuration helper retains its established invalid-value fallback-to-default behavior, while startup Clap parsing rejects malformed, negative, and overflowing values; valid zero remains zero. This distinction documents existing configuration paths and does not add a separate startup behavior.
+
 ## Job completion and output
 
 Job completion must not automatically push a new upstream response.
@@ -333,6 +347,8 @@ Buffered output may be available before job completion, but final claims that de
 Do not return unbounded logs in a single response.
 
 Do not expose local paths, credentials, environment secrets, or private machine details through job output.
+
+Retention diagnostics use stable structured events: `job_retention_pruned` reports the removed count, remaining count, and TTL; `job_capacity_rejected` reports an `active` or `retained` reason, active and entry counts, and both limits; and `job_retention_evicted` reports the job id, terminal state, age, entry count, and retained limit. Pruning and eviction events are emitted only for actual removals, while each refused admission emits one capacity-rejection event. These diagnostics must not include job names, command arguments, output, results, environment values, or credentials.
 
 ## Error handling
 

@@ -363,6 +363,8 @@ fn shell_job_manager() -> ThreadlineJobManager {
         jobs_enabled: true,
         output_buffer_limit_bytes: 1024,
         retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec![shell_program()],
     })
 }
@@ -3025,11 +3027,322 @@ async fn start_job_tool_serializes_success_hint_in_function_call_output() {
 }
 
 #[tokio::test]
+async fn start_job_tool_serializes_capacity_rejection_without_success_hint() {
+    let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 0,
+        max_retained_jobs: 1,
+        allowed_commands: vec![shell_program()],
+    });
+    let call = InternalToolCall::from_event(&json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-capacity-rejected",
+            "name": "threadline_start_job",
+            "arguments": {"command": shell_command("Write-Output 'not started'")}
+        }
+    }))
+    .expect("start parse")
+    .expect("start call");
+
+    let output = call
+        .execute_with_job_manager(&manager)
+        .expect("capacity output")
+        .into_followup_input();
+    let payload: Value =
+        serde_json::from_str(output["output"].as_str().expect("capacity output string"))
+            .expect("capacity json");
+
+    assert_eq!(output["type"], "function_call_output");
+    assert_eq!(output["call_id"], "call-capacity-rejected");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["code"], "job_capacity_exceeded");
+    assert_eq!(payload.get("next_action_hint"), None);
+}
+
+#[tokio::test]
+async fn poll_job_tool_serializes_expired_job_not_found_with_its_call_id() {
+    let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::ZERO,
+        max_active_jobs: 1,
+        max_retained_jobs: 1,
+        allowed_commands: vec![shell_program()],
+    });
+    let started = manager.spawn_job("expires-before-poll", |context| async move {
+        context.complete(json!({"summary": "expired"}));
+    });
+    let job_id = started["job_id"].as_str().expect("job id");
+    tokio::task::yield_now().await;
+
+    let call = InternalToolCall::from_event(&json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": "call-expired-job",
+            "name": "threadline_poll_job",
+            "arguments": {"job_id": job_id}
+        }
+    }))
+    .expect("poll parse")
+    .expect("poll call");
+    let output = call
+        .execute_with_job_manager(&manager)
+        .expect("expired job output")
+        .into_followup_input();
+    let payload: Value = serde_json::from_str(output["output"].as_str().expect("output string"))
+        .expect("output JSON");
+
+    assert_eq!(output["type"], "function_call_output");
+    assert_eq!(output["call_id"], "call-expired-job");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["code"], "job_not_found");
+    assert_eq!(payload.get("next_action_hint"), None);
+}
+
+#[tokio::test]
+async fn job_retention_diagnostics_report_only_safe_required_fields() {
+    let log_buffer = SharedLogBuffer::new();
+    let trace_dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(log_buffer.clone())
+            .finish(),
+    );
+    tracing::dispatcher::with_default(&trace_dispatch, tracing::callsite::rebuild_interest_cache);
+    let active_capacity_manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 1,
+        max_retained_jobs: 3,
+        allowed_commands: vec![shell_program()],
+    });
+    let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
+    let (first_finished_tx, first_finished_rx) = tokio::sync::oneshot::channel();
+    let first = tracing::dispatcher::with_default(&trace_dispatch, || {
+        active_capacity_manager.spawn_job("active-name-sentinel", move |context| async move {
+            context.mark_running();
+            let _ = tokio::time::timeout(Duration::from_secs(1), first_release_rx).await;
+            context.complete(json!({"result": "active-result-sentinel"}));
+            let _ = first_finished_tx.send(());
+        })
+    });
+    assert_eq!(first["ok"], true);
+    let command_output_sentinel = "command-output-sentinel";
+    let environment_sentinel = "environment-sentinel";
+    let environment_variable = "THREADLINE_TEST_RETENTION_ENV";
+    let command = if cfg!(windows) {
+        format!(
+            "$env:{environment_variable}=\"{environment_sentinel}\"; Write-Output \"{command_output_sentinel} $env:{environment_variable}\""
+        )
+    } else {
+        format!(
+            "{environment_variable}='{environment_sentinel}'; export {environment_variable}; printf '%s %s\\n' '{command_output_sentinel}' \"${environment_variable}\""
+        )
+    };
+    let active_rejected = tracing::dispatcher::with_default(&trace_dispatch, || {
+        active_capacity_manager.start_command_json(shell_command(&command))
+    });
+    assert_eq!(active_rejected["code"], "job_capacity_exceeded");
+    first_release_tx.send(()).expect("release active worker");
+    first_finished_rx.await.expect("active worker finished");
+
+    let retained_capacity_manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 2,
+        max_retained_jobs: 1,
+        allowed_commands: vec![shell_program()],
+    });
+    let (retained_release_tx, retained_release_rx) = tokio::sync::oneshot::channel();
+    let (retained_finished_tx, retained_finished_rx) = tokio::sync::oneshot::channel();
+    let (retained_started_tx, retained_started_rx) = tokio::sync::oneshot::channel();
+    let retained = tracing::dispatcher::with_default(&trace_dispatch, || {
+        retained_capacity_manager.spawn_job("retained-name-sentinel", move |context| async move {
+            context.mark_running();
+            let _ = retained_started_tx.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(1), retained_release_rx).await;
+            context.complete(json!({"result": "retained-result-sentinel"}));
+            let _ = retained_finished_tx.send(());
+        })
+    });
+    assert_eq!(retained["ok"], true);
+    retained_started_rx.await.expect("retained worker started");
+
+    let retained_rejected = tracing::dispatcher::with_default(&trace_dispatch, || {
+        retained_capacity_manager.spawn_job("retained-rejected-name-sentinel", |_| async move {
+            panic!("retained rejection must not execute");
+        })
+    });
+    assert_eq!(retained_rejected["code"], "job_capacity_exceeded");
+    retained_release_tx
+        .send(())
+        .expect("release retained worker");
+    retained_finished_rx
+        .await
+        .expect("retained worker finished");
+
+    let eviction_manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 2,
+        max_retained_jobs: 1,
+        allowed_commands: vec![shell_program()],
+    });
+    let evicted = eviction_manager.start_command_json(shell_command(&command));
+    let evicted_id = evicted["job_id"]
+        .as_str()
+        .expect("evicted job id")
+        .to_string();
+    let eviction_result =
+        wait_for_terminal_result(&eviction_manager, &evicted_id, Duration::from_secs(2)).await;
+    assert_eq!(eviction_result["result"]["kind"], "command");
+    assert_eq!(
+        eviction_result["result"]["command"],
+        json!(shell_command(&command))
+    );
+    let eviction_output = eviction_manager.read_output_json(&evicted_id, 0);
+    assert!(
+        eviction_output
+            .to_string()
+            .contains(command_output_sentinel)
+            && eviction_output.to_string().contains(environment_sentinel),
+        "evicted command did not produce its child-environment output: {eviction_output}"
+    );
+    sleep(Duration::from_millis(10)).await;
+    let admitted_after_eviction = tracing::dispatcher::with_default(&trace_dispatch, || {
+        eviction_manager.spawn_job("eviction-trigger-name-sentinel", |context| async move {
+            context.complete(json!({"result": "eviction-trigger-result-sentinel"}));
+        })
+    });
+    assert_eq!(admitted_after_eviction["ok"], true);
+
+    let prune_manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::from_secs(1),
+        max_active_jobs: 1,
+        max_retained_jobs: 1,
+        allowed_commands: vec![shell_program()],
+    });
+    let prunable = prune_manager.start_command_json(shell_command(&command));
+    let prunable_id = prunable["job_id"]
+        .as_str()
+        .expect("prunable job id")
+        .to_string();
+    let prune_result =
+        wait_for_terminal_result(&prune_manager, &prunable_id, Duration::from_secs(2)).await;
+    assert_eq!(prune_result["result"]["kind"], "command");
+    assert_eq!(
+        prune_result["result"]["command"],
+        json!(shell_command(&command))
+    );
+    let prune_output = prune_manager.read_output_json(&prunable_id, 0);
+    assert!(
+        prune_output.to_string().contains(command_output_sentinel)
+            && prune_output.to_string().contains(environment_sentinel),
+        "pruned command did not produce its child-environment output: {prune_output}"
+    );
+    sleep(Duration::from_millis(1100)).await;
+    let prunable_poll = tracing::dispatcher::with_default(&trace_dispatch, || {
+        prune_manager.poll_json(&prunable_id)
+    });
+    assert_eq!(prunable_poll["code"], "job_not_found");
+
+    let logs = log_buffer.logs();
+    let retention_events = logs
+        .lines()
+        .filter(|line| {
+            line.contains("job_capacity_rejected")
+                || line.contains("job_retention_evicted")
+                || line.contains("job_retention_pruned")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        retention_events.len() == 4,
+        "expected active and retained rejections plus one eviction and one prune: {logs}"
+    );
+
+    let active_rejection = retention_events[0];
+    assert!(
+        active_rejection.contains("job_capacity_rejected")
+            && active_rejection.contains("reason=\"active\"")
+            && active_rejection.contains("active_count=1")
+            && active_rejection.contains("entry_count=1")
+            && active_rejection.contains("max_active_jobs=1")
+            && active_rejection.contains("max_retained_jobs=3"),
+        "active capacity diagnostic fields were missing: {active_rejection}"
+    );
+    let retained_rejection = retention_events[1];
+    assert!(
+        retained_rejection.contains("job_capacity_rejected")
+            && retained_rejection.contains("reason=\"retained\"")
+            && retained_rejection.contains("active_count=1")
+            && retained_rejection.contains("entry_count=1")
+            && retained_rejection.contains("max_active_jobs=2")
+            && retained_rejection.contains("max_retained_jobs=1"),
+        "retained capacity diagnostic fields were missing: {retained_rejection}"
+    );
+    let eviction = retention_events[2];
+    assert!(
+        eviction.contains("job_retention_evicted")
+            && eviction.contains(&evicted_id)
+            && eviction.contains("terminal_state=Some(Completed)")
+            && eviction.contains("age_secs=")
+            && eviction.contains("entry_count=0")
+            && eviction.contains("retained_limit=1"),
+        "eviction diagnostic fields were missing: {eviction}"
+    );
+    let prune = retention_events[3];
+    assert!(
+        prune.contains("job_retention_pruned")
+            && prune.contains("removed_count=1")
+            && prune.contains("remaining_count=0")
+            && prune.contains("retention_ttl_secs=1"),
+        "prune diagnostic fields were missing: {prune}"
+    );
+
+    for event in retention_events {
+        for sentinel in [
+            "active-name-sentinel",
+            "active-result-sentinel",
+            "retained-name-sentinel",
+            "retained-rejected-name-sentinel",
+            "retained-result-sentinel",
+            "evicted-name-sentinel",
+            "eviction-trigger-name-sentinel",
+            "eviction-trigger-result-sentinel",
+            "prune-sentinel-job",
+            command_output_sentinel,
+            environment_sentinel,
+            environment_variable,
+            &command,
+        ] {
+            assert!(
+                !event.contains(sentinel),
+                "sentinel leaked into retention diagnostic: {event}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn job_tool_outputs_are_serialized_as_function_call_output_json() {
     let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
         jobs_enabled: true,
         output_buffer_limit_bytes: 1024,
         retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec![],
     });
     let started = manager.spawn_job("tool-job", move |context| async move {

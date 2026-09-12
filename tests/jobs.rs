@@ -1,11 +1,35 @@
-use std::time::Instant;
+use std::{
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use serde_json::json;
 use threadline::jobs::{JobTerminalState, ThreadlineJobManager, ThreadlineJobManagerConfig};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{Duration, sleep};
 
 const JOB_START_NEXT_ACTION_HINT: &str = "This job is running in the background. Continue other useful work if available, then poll status or read output later when needed.";
+
+struct FutureExitSignal(Option<oneshot::Sender<()>>);
+
+impl Drop for FutureExitSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct WorkerReleaseGuard(watch::Sender<()>);
+
+impl Drop for WorkerReleaseGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
 
 fn shell_program() -> String {
     if cfg!(windows) {
@@ -33,6 +57,8 @@ fn shell_job_manager() -> ThreadlineJobManager {
         jobs_enabled: true,
         output_buffer_limit_bytes: 1024,
         retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec![shell_program()],
     })
 }
@@ -84,6 +110,17 @@ async fn wait_for_terminal_result(
     }
 }
 
+async fn wait_for_lazy_removal(manager: &ThreadlineJobManager, job_id: &str) {
+    for _ in 0..64 {
+        if manager.poll_json(job_id)["code"] == "job_not_found" {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    panic!("job was not lazily removed after its worker exited");
+}
+
 async fn assert_no_output_for(
     manager: &ThreadlineJobManager,
     job_id: &str,
@@ -107,6 +144,8 @@ async fn job_manager_transitions_through_starting_running_and_completed() {
         jobs_enabled: true,
         output_buffer_limit_bytes: 1024,
         retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec![],
     });
     let (start_tx, start_rx) = oneshot::channel();
@@ -155,6 +194,8 @@ async fn job_output_reads_are_incremental_and_bounded() {
         jobs_enabled: true,
         output_buffer_limit_bytes: 10,
         retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec![],
     });
 
@@ -193,6 +234,8 @@ async fn job_output_limit_and_offsets_use_utf8_bytes() {
         jobs_enabled: true,
         output_buffer_limit_bytes: 8,
         retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec![],
     });
 
@@ -239,7 +282,9 @@ async fn completed_and_cancelled_jobs_persist_until_ttl_cleanup() {
     let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
         jobs_enabled: true,
         output_buffer_limit_bytes: 1024,
-        retention_ttl: Duration::from_millis(30),
+        retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec![],
     });
 
@@ -275,11 +320,233 @@ async fn completed_and_cancelled_jobs_persist_until_ttl_cleanup() {
     assert_eq!(manager.poll_json(&completed_id)["status"], "completed");
     assert_eq!(manager.poll_json(&cancelled_id)["status"], "cancelled");
 
-    sleep(Duration::from_millis(40)).await;
-    assert_eq!(manager.prune_expired(), 2);
+    assert_eq!(manager.prune_expired(), 0);
+    assert_eq!(manager.poll_json(&completed_id)["status"], "completed");
+    assert_eq!(manager.poll_json(&cancelled_id)["status"], "cancelled");
+}
 
-    assert_eq!(manager.poll_json(&completed_id)["code"], "job_not_found");
-    assert_eq!(manager.poll_json(&cancelled_id)["code"], "job_not_found");
+#[tokio::test]
+async fn completed_and_failed_jobs_lazily_expire_after_their_workers_exit() {
+    let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::ZERO,
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
+        allowed_commands: vec![],
+    });
+    let (completed_tx, completed_rx) = oneshot::channel();
+    let (failed_tx, failed_rx) = oneshot::channel();
+
+    let completed = manager.spawn_job("expired-completed", move |context| async move {
+        let _worker_exit = FutureExitSignal(Some(completed_tx));
+        context.complete(json!({"summary": "expired"}));
+    });
+    let completed_id = completed["job_id"].as_str().expect("job id").to_string();
+    let failed = manager.spawn_job("expired-failed", move |context| async move {
+        let _worker_exit = FutureExitSignal(Some(failed_tx));
+        context.fail("expected_failure", "failed before expiry");
+    });
+    let failed_id = failed["job_id"].as_str().expect("job id").to_string();
+
+    completed_rx.await.expect("completed worker exited");
+    failed_rx.await.expect("failed worker exited");
+
+    wait_for_lazy_removal(&manager, &completed_id).await;
+    wait_for_lazy_removal(&manager, &failed_id).await;
+}
+
+#[tokio::test]
+async fn cancelled_running_work_keeps_its_slot_and_entry_until_worker_exit() {
+    let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 1024,
+        retention_ttl: Duration::ZERO,
+        max_active_jobs: 1,
+        max_retained_jobs: 2,
+        allowed_commands: vec![],
+    });
+    let (release_tx, release_rx) = watch::channel(());
+    let _release_guard = WorkerReleaseGuard(release_tx);
+    let (running_tx, running_rx) = oneshot::channel();
+    let (worker_exit_tx, worker_exit_rx) = oneshot::channel();
+
+    let first = manager.spawn_job("cancelled-running", move |context| async move {
+        let _worker_exit = FutureExitSignal(Some(worker_exit_tx));
+        context.mark_running();
+        let _ = running_tx.send(());
+        let mut release_rx = release_rx;
+        let _ = release_rx.changed().await;
+    });
+    let first_id = first["job_id"].as_str().expect("job id").to_string();
+    running_rx.await.expect("worker started");
+
+    assert_eq!(manager.poll_json(&first_id)["status"], "running");
+    let cancellation_snapshot = manager.cancel_json(&first_id);
+    assert_eq!(cancellation_snapshot["ok"], true);
+    assert_eq!(cancellation_snapshot["status"], "cancelled");
+    let rejected = manager.spawn_job("must-not-run", |_| async move {
+        panic!("rejected task must not run");
+    });
+    assert_eq!(rejected["code"], "job_capacity_exceeded");
+    assert_eq!(rejected.get("next_action_hint"), None);
+    assert_eq!(manager.poll_json(&first_id)["status"], "cancelled");
+
+    drop(_release_guard);
+    worker_exit_rx
+        .await
+        .expect("cancelled worker future exited");
+    wait_for_lazy_removal(&manager, &first_id).await;
+
+    let accepted = manager.spawn_job("after-exit", |context| async move {
+        context.complete(json!({"summary": "accepted"}));
+    });
+    assert_eq!(accepted["ok"], true);
+}
+
+#[tokio::test]
+async fn concurrent_starts_admit_exactly_available_active_slots_without_running_rejected_closures()
+{
+    for (max_active_jobs, max_retained_jobs) in [(2, 4), (4, 2)] {
+        let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+            jobs_enabled: true,
+            output_buffer_limit_bytes: 1024,
+            retention_ttl: Duration::from_secs(60),
+            max_active_jobs,
+            max_retained_jobs,
+            allowed_commands: vec![],
+        });
+        let start_gate = Arc::new(Barrier::new(5));
+        let (release_tx, release_rx) = watch::channel(());
+        let release_guard = WorkerReleaseGuard(release_tx);
+        let (ran_tx, mut ran_rx) = tokio::sync::mpsc::unbounded_channel();
+        let closure_invocations = Arc::new(AtomicUsize::new(0));
+        let runtime = tokio::runtime::Handle::current();
+        let starts = std::thread::scope(|scope| {
+            let attempts = (0..4)
+                .map(|index| {
+                    let manager = manager.clone();
+                    let start_gate = start_gate.clone();
+                    let release_rx = release_rx.clone();
+                    let ran_tx = ran_tx.clone();
+                    let closure_invocations = closure_invocations.clone();
+                    let runtime = runtime.clone();
+                    scope.spawn(move || {
+                        let _runtime_guard = runtime.enter();
+                        start_gate.wait();
+                        manager.spawn_job("concurrent", move |context| {
+                            closure_invocations.fetch_add(1, Ordering::SeqCst);
+                            async move {
+                                ran_tx.send(index).expect("accepted closure receiver");
+                                let mut release_rx = release_rx;
+                                let _ = release_rx.changed().await;
+                                context.complete(json!({"index": index}));
+                            }
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            start_gate.wait();
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().expect("start thread joined"))
+                .collect::<Vec<_>>()
+        });
+        let admitted = starts.iter().filter(|start| start["ok"] == true).count();
+        let rejected = starts
+            .iter()
+            .filter(|start| start["code"] == "job_capacity_exceeded")
+            .count();
+        let first_ran = tokio::time::timeout(Duration::from_secs(1), ran_rx.recv())
+            .await
+            .expect("first accepted closure started");
+        let second_ran = tokio::time::timeout(Duration::from_secs(1), ran_rx.recv())
+            .await
+            .expect("second accepted closure started");
+        drop(release_guard);
+        for job_id in starts.iter().filter_map(|start| start["job_id"].as_str()) {
+            wait_for_terminal_result(&manager, job_id, Duration::from_secs(1)).await;
+        }
+        assert_eq!(admitted, 2);
+        assert_eq!(rejected, 2);
+        assert_eq!(closure_invocations.load(Ordering::SeqCst), 2);
+        assert_ne!(first_ran, second_ran);
+        assert!(ran_rx.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn retained_capacity_evicts_oldest_finished_entry_without_changing_survivor_output() {
+    let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+        jobs_enabled: true,
+        output_buffer_limit_bytes: 5,
+        retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 2,
+        max_retained_jobs: 2,
+        allowed_commands: vec![],
+    });
+    let (first_tx, first_rx) = oneshot::channel();
+    let (second_tx, second_rx) = oneshot::channel();
+    let (first_done_tx, first_done_rx) = oneshot::channel();
+    let (second_done_tx, second_done_rx) = oneshot::channel();
+
+    let first = manager.spawn_job("first", move |context| async move {
+        let _worker_exit = FutureExitSignal(Some(first_done_tx));
+        let _ = first_rx.await;
+        context.push_stdout("éé");
+        context.push_stderr("🙂");
+        context.push_stdout("a");
+        context.complete(json!({"summary": "survivor"}));
+    });
+    let second = manager.spawn_job("second", move |context| async move {
+        let _worker_exit = FutureExitSignal(Some(second_done_tx));
+        let _ = second_rx.await;
+        context.complete(json!({"summary": "evicted"}));
+    });
+    let first_id = first["job_id"].as_str().expect("first id").to_string();
+    let second_id = second["job_id"].as_str().expect("second id").to_string();
+
+    let _ = second_tx.send(());
+    second_done_rx.await.expect("second worker exited");
+    let _ = first_tx.send(());
+    first_done_rx.await.expect("first worker exited");
+
+    assert_eq!(manager.read_output_json(&second_id, 0)["next_offset"], 0);
+
+    let third = manager.spawn_job("third", |context| async move {
+        context.complete(json!({"summary": "third"}));
+    });
+    assert_eq!(third["ok"], true);
+    assert_eq!(manager.poll_json(&second_id)["code"], "job_not_found");
+    let surviving_output = manager.read_output_json(&first_id, 0);
+    assert_eq!(surviving_output["truncated_before"], 4);
+    assert_eq!(surviving_output["next_offset"], 9);
+    assert_eq!(
+        surviving_output["items"],
+        json!([
+            {"offset": 4, "stream": "stderr", "text": "🙂"},
+            {"offset": 8, "stream": "stdout", "text": "a"},
+        ])
+    );
+    let survivor_result = manager.get_result_json(&first_id);
+    assert_eq!(survivor_result["status"], "completed");
+    assert_eq!(survivor_result["result"]["summary"], "survivor");
+}
+
+#[tokio::test]
+async fn zero_active_or_retained_capacity_rejects_new_admissions() {
+    for (max_active_jobs, max_retained_jobs) in [(0, 1), (1, 0), (0, 0)] {
+        let manager = ThreadlineJobManager::new(ThreadlineJobManagerConfig {
+            jobs_enabled: true,
+            output_buffer_limit_bytes: 1024,
+            retention_ttl: Duration::from_secs(60),
+            max_active_jobs,
+            max_retained_jobs,
+            allowed_commands: vec![],
+        });
+        let rejected = manager.spawn_job("zero-capacity", |_| async move {});
+        assert_eq!(rejected["code"], "job_capacity_exceeded");
+    }
 }
 
 #[tokio::test]
@@ -288,6 +555,8 @@ async fn disabled_jobs_and_disallowed_commands_are_rejected_with_stable_json() {
         jobs_enabled: false,
         output_buffer_limit_bytes: 1024,
         retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec![],
     });
 
@@ -305,6 +574,8 @@ async fn disabled_jobs_and_disallowed_commands_are_rejected_with_stable_json() {
         jobs_enabled: true,
         output_buffer_limit_bytes: 1024,
         retention_ttl: Duration::from_secs(60),
+        max_active_jobs: 16,
+        max_retained_jobs: 128,
         allowed_commands: vec!["allowed".to_string()],
     });
 

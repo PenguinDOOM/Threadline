@@ -49,6 +49,7 @@ mod login_cli_tests {
     use serde_json::Value;
 
     use super::{ThreadlineCli, ThreadlineCliAction, ThreadlineCommand};
+    use crate::config::THREADLINE_ENV_LOCK;
 
     fn removed_model_flag() -> String {
         ["--", "model-id"].concat()
@@ -96,6 +97,7 @@ mod login_cli_tests {
 
     #[test]
     fn server_starts_by_default_without_subcommand() {
+        let _env_lock = THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let cli = ThreadlineCli::try_parse_from(["threadline"]).expect("cli should parse");
 
         assert!(cli.command.is_none());
@@ -107,6 +109,7 @@ mod login_cli_tests {
 
     #[test]
     fn config_server_flags_survive_subcommand_refactor() {
+        let _env_lock = THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let cli = ThreadlineCli::try_parse_from([
             "threadline",
             "--host",
@@ -133,6 +136,7 @@ mod login_cli_tests {
 
     #[test]
     fn removed_model_id_flag_is_rejected() {
+        let _env_lock = THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let removed_flag = removed_model_flag();
 
         ThreadlineCli::try_parse_from(["threadline", removed_flag.as_str(), "gpt-5.4"])
@@ -332,6 +336,16 @@ mod login_cli_tests {
                 Some("300"),
             ),
             (
+                "--job-max-active-jobs",
+                "THREADLINE_JOB_MAX_ACTIVE_JOBS",
+                Some("16"),
+            ),
+            (
+                "--job-max-retained-jobs",
+                "THREADLINE_JOB_MAX_RETAINED_JOBS",
+                Some("128"),
+            ),
+            (
                 "--job-allowed-commands",
                 "THREADLINE_JOB_ALLOWED_COMMANDS",
                 None,
@@ -472,6 +486,7 @@ mod login_cli_tests {
 
     #[test]
     fn login_command_accepts_bare_login_only() {
+        let _env_lock = THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let cli =
             ThreadlineCli::try_parse_from(["threadline", "login"]).expect("login should parse");
 
@@ -481,6 +496,7 @@ mod login_cli_tests {
 
     #[test]
     fn login_command_rejects_removed_nested_subcommands() {
+        let _env_lock = THREADLINE_ENV_LOCK.lock().expect("environment lock");
         for command in [
             ["threadline", "login", "store"],
             ["threadline", "login", "status"],

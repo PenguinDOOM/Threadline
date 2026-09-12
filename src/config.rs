@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser};
 
-use crate::jobs::ThreadlineJobManagerConfig;
+use crate::jobs::{DEFAULT_MAX_ACTIVE_JOBS, DEFAULT_MAX_RETAINED_JOBS, ThreadlineJobManagerConfig};
 use crate::models::RouteProfile;
 use crate::ws_pump::{
     DEFAULT_UPSTREAM_INBOUND_MAX_BYTES, DEFAULT_UPSTREAM_INBOUND_MAX_MESSAGES,
@@ -24,6 +24,9 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 
 static ACTIVE_JOB_MANAGER_CONFIG: LazyLock<Mutex<ThreadlineJobManagerConfig>> =
     LazyLock::new(|| Mutex::new(ThreadlineJobManagerConfig::default()));
+
+#[cfg(test)]
+pub(crate) static THREADLINE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct ThreadlineConfig {
@@ -149,6 +152,26 @@ pub struct ThreadlineConfig {
 
     #[arg(
         long,
+        env = "THREADLINE_JOB_MAX_ACTIVE_JOBS",
+        default_value_t = DEFAULT_MAX_ACTIVE_JOBS,
+        value_name = "COUNT",
+        help = "Maximum concurrently executing managed jobs.",
+        long_help = "Maximum concurrently executing managed jobs. Zero rejects every new job admission."
+    )]
+    pub job_max_active_jobs: usize,
+
+    #[arg(
+        long,
+        env = "THREADLINE_JOB_MAX_RETAINED_JOBS",
+        default_value_t = DEFAULT_MAX_RETAINED_JOBS,
+        value_name = "COUNT",
+        help = "Maximum total retained job registry entries.",
+        long_help = "Maximum total retained job registry entries, including active jobs. Zero rejects every new job admission."
+    )]
+    pub job_max_retained_jobs: usize,
+
+    #[arg(
+        long,
         env = "THREADLINE_JOB_ALLOWED_COMMANDS",
         value_name = "PROGRAMS",
         help = "Comma-separated exact program names allowed for jobs.",
@@ -182,6 +205,8 @@ impl Default for ThreadlineConfig {
             persistent_reasoning_enabled: DEFAULT_PERSISTENT_REASONING_ENABLED,
             job_output_buffer_limit_bytes: DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,
             job_retention_ttl_secs: DEFAULT_JOB_RETENTION_TTL_SECS,
+            job_max_active_jobs: DEFAULT_MAX_ACTIVE_JOBS,
+            job_max_retained_jobs: DEFAULT_MAX_RETAINED_JOBS,
             job_allowed_commands: None,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
         };
@@ -218,6 +243,8 @@ impl ThreadlineConfig {
             jobs_enabled: self.jobs_enabled,
             output_buffer_limit_bytes: self.job_output_buffer_limit_bytes,
             retention_ttl: Duration::from_secs(self.job_retention_ttl_secs),
+            max_active_jobs: self.job_max_active_jobs,
+            max_retained_jobs: self.job_max_retained_jobs,
             allowed_commands: split_allowed_commands(self.job_allowed_commands.as_deref()),
         }
     }
@@ -234,6 +261,11 @@ pub fn job_manager_config_from_environment() -> ThreadlineJobManagerConfig {
             "THREADLINE_JOB_RETENTION_TTL_SECS",
             DEFAULT_JOB_RETENTION_TTL_SECS,
         )),
+        max_active_jobs: read_usize_env("THREADLINE_JOB_MAX_ACTIVE_JOBS", DEFAULT_MAX_ACTIVE_JOBS),
+        max_retained_jobs: read_usize_env(
+            "THREADLINE_JOB_MAX_RETAINED_JOBS",
+            DEFAULT_MAX_RETAINED_JOBS,
+        ),
         allowed_commands: split_allowed_commands(
             std::env::var("THREADLINE_JOB_ALLOWED_COMMANDS")
                 .ok()
@@ -257,8 +289,12 @@ fn read_bool_env(name: &str, default: bool) -> bool {
 }
 
 fn read_usize_env(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
+    let value = std::env::var(name).ok();
+    parse_usize_env_value(value.as_deref(), default)
+}
+
+fn parse_usize_env_value(value: Option<&str>, default: usize) -> usize {
+    value
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
 }
@@ -308,19 +344,16 @@ fn set_active_job_manager_config(config: ThreadlineJobManagerConfig) {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::sync::Mutex;
 
     use clap::{Arg, Command, CommandFactory, Parser};
 
     use crate::cli::ThreadlineCli;
     use crate::models::RouteProfile;
 
-    use super::{DEFAULT_CODEX_CLIENT_VERSION, ThreadlineConfig, UpstreamInboundLimits};
-
-    static THREADLINE_PROFILE_ENV_LOCK: Mutex<()> = Mutex::new(());
-    static THREADLINE_PERSISTENT_REASONING_ENABLED_ENV_LOCK: Mutex<()> = Mutex::new(());
-    static THREADLINE_UTILITY_PORT_ENV_LOCK: Mutex<()> = Mutex::new(());
-    static THREADLINE_UPSTREAM_INBOUND_LIMITS_ENV_LOCK: Mutex<()> = Mutex::new(());
+    use super::{
+        DEFAULT_CODEX_CLIENT_VERSION, DEFAULT_MAX_ACTIVE_JOBS, DEFAULT_MAX_RETAINED_JOBS,
+        ThreadlineConfig, UpstreamInboundLimits, job_manager_config_from_environment,
+    };
 
     struct ProfileEnvGuard {
         original: Option<OsString>,
@@ -390,6 +423,27 @@ mod tests {
     struct UpstreamInboundLimitsEnvGuard {
         messages: Option<OsString>,
         bytes: Option<OsString>,
+    }
+
+    struct JobCapacityEnvGuard {
+        active: Option<OsString>,
+        retained: Option<OsString>,
+    }
+
+    impl JobCapacityEnvGuard {
+        fn acquire() -> Self {
+            Self {
+                active: std::env::var_os("THREADLINE_JOB_MAX_ACTIVE_JOBS"),
+                retained: std::env::var_os("THREADLINE_JOB_MAX_RETAINED_JOBS"),
+            }
+        }
+    }
+
+    impl Drop for JobCapacityEnvGuard {
+        fn drop(&mut self) {
+            restore_env_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", self.active.take());
+            restore_env_var("THREADLINE_JOB_MAX_RETAINED_JOBS", self.retained.take());
+        }
     }
 
     impl UpstreamInboundLimitsEnvGuard {
@@ -465,6 +519,7 @@ mod tests {
 
     #[test]
     fn codex_client_version_defaults_to_installed_version() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let config = ThreadlineCli::parse_from(["threadline"]).server;
         let command = ThreadlineCli::command();
         let argument = command
@@ -483,6 +538,7 @@ mod tests {
 
     #[test]
     fn codex_client_version_cli_override_wins() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let config =
             ThreadlineCli::try_parse_from(["threadline", "--codex-client-version", "9.9.9"])
                 .expect("threadline config should accept a codex client version cli override")
@@ -493,9 +549,7 @@ mod tests {
 
     #[test]
     fn upstream_inbound_limits_default_override_and_reject_invalid_ranges() {
-        let _lock = THREADLINE_UPSTREAM_INBOUND_LIMITS_ENV_LOCK
-            .lock()
-            .expect("inbound limits env lock");
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let default_config = ThreadlineCli::parse_from(["threadline"]).server;
         assert_eq!(default_config.upstream_inbound_max_messages, 256);
         assert_eq!(default_config.upstream_inbound_max_bytes, 16 * 1024 * 1024);
@@ -544,9 +598,7 @@ mod tests {
 
     #[test]
     fn upstream_inbound_limits_read_environment_overrides() {
-        let _lock = THREADLINE_UPSTREAM_INBOUND_LIMITS_ENV_LOCK
-            .lock()
-            .expect("inbound limits env lock");
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let _guard = UpstreamInboundLimitsEnvGuard::acquire();
         unsafe {
             std::env::set_var("THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES", "7");
@@ -557,6 +609,148 @@ mod tests {
 
         assert_eq!(config.upstream_inbound_max_messages, 7);
         assert_eq!(config.upstream_inbound_max_bytes, 11);
+    }
+
+    #[test]
+    fn job_capacity_defaults_cli_values_and_zero_are_preserved() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        let _guard = JobCapacityEnvGuard::acquire();
+        unsafe {
+            std::env::remove_var("THREADLINE_JOB_MAX_ACTIVE_JOBS");
+            std::env::remove_var("THREADLINE_JOB_MAX_RETAINED_JOBS");
+        }
+        let default_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(default_config.job_max_active_jobs, 16);
+        assert_eq!(default_config.job_max_retained_jobs, 128);
+
+        let configured = ThreadlineCli::try_parse_from([
+            "threadline",
+            "--job-max-active-jobs",
+            "0",
+            "--job-max-retained-jobs",
+            "0",
+        ])
+        .expect("capacity values should parse")
+        .server;
+        assert_eq!(configured.job_max_active_jobs, 0);
+        assert_eq!(configured.job_max_retained_jobs, 0);
+        assert_eq!(configured.job_manager_config().max_active_jobs, 0);
+        assert_eq!(configured.job_manager_config().max_retained_jobs, 0);
+
+        let small_config = ThreadlineCli::try_parse_from([
+            "threadline",
+            "--job-max-active-jobs",
+            "2",
+            "--job-max-retained-jobs",
+            "3",
+        ])
+        .expect("small capacity values should parse")
+        .server;
+        assert_eq!(small_config.job_max_active_jobs, 2);
+        assert_eq!(small_config.job_max_retained_jobs, 3);
+
+        for flag in ["--job-max-active-jobs", "--job-max-retained-jobs"] {
+            for invalid in ["-1", "not-a-number", "999999999999999999999999999999999999"] {
+                assert!(
+                    ThreadlineCli::try_parse_from(["threadline", flag, invalid,]).is_err(),
+                    "{flag} should reject {invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn job_capacity_cli_overrides_environment_values() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        let _guard = JobCapacityEnvGuard::acquire();
+        unsafe {
+            std::env::set_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", "0");
+            std::env::set_var("THREADLINE_JOB_MAX_RETAINED_JOBS", "0");
+        }
+
+        let environment_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(environment_config.job_max_active_jobs, 0);
+        assert_eq!(environment_config.job_max_retained_jobs, 0);
+
+        unsafe {
+            std::env::set_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", "2");
+            std::env::set_var("THREADLINE_JOB_MAX_RETAINED_JOBS", "3");
+        }
+        let small_environment_config = ThreadlineCli::parse_from(["threadline"]).server;
+        assert_eq!(small_environment_config.job_max_active_jobs, 2);
+        assert_eq!(small_environment_config.job_max_retained_jobs, 3);
+
+        let cli_config = ThreadlineCli::try_parse_from([
+            "threadline",
+            "--job-max-active-jobs",
+            "4",
+            "--job-max-retained-jobs",
+            "1",
+        ])
+        .expect("CLI values should override environment")
+        .server;
+        assert_eq!(cli_config.job_max_active_jobs, 4);
+        assert_eq!(cli_config.job_max_retained_jobs, 1);
+
+        for (name, other_name) in [
+            (
+                "THREADLINE_JOB_MAX_ACTIVE_JOBS",
+                "THREADLINE_JOB_MAX_RETAINED_JOBS",
+            ),
+            (
+                "THREADLINE_JOB_MAX_RETAINED_JOBS",
+                "THREADLINE_JOB_MAX_ACTIVE_JOBS",
+            ),
+        ] {
+            for invalid in ["-1", "not-a-number", "999999999999999999999999999999999999"] {
+                unsafe {
+                    std::env::set_var(name, invalid);
+                    std::env::set_var(other_name, "3");
+                }
+                assert!(
+                    ThreadlineCli::try_parse_from(["threadline"]).is_err(),
+                    "{name} should reject {invalid:?} during startup parsing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_job_capacity_environment_helper_preserves_zero_and_falls_back() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        let _guard = JobCapacityEnvGuard::acquire();
+        unsafe {
+            std::env::set_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", "0");
+            std::env::set_var("THREADLINE_JOB_MAX_RETAINED_JOBS", "0");
+        }
+        let configured = job_manager_config_from_environment();
+        assert_eq!(configured.max_active_jobs, 0);
+        assert_eq!(configured.max_retained_jobs, 0);
+
+        for (active, retained) in [
+            ("invalid", "3"),
+            ("-1", "3"),
+            ("999999999999999999999999999999999999", "3"),
+            ("2", "invalid"),
+            ("2", "-1"),
+            ("2", "999999999999999999999999999999999999"),
+        ] {
+            unsafe {
+                std::env::set_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", active);
+                std::env::set_var("THREADLINE_JOB_MAX_RETAINED_JOBS", retained);
+            }
+            let fallback = job_manager_config_from_environment();
+            assert_eq!(
+                fallback.max_active_jobs,
+                active.parse::<usize>().unwrap_or(DEFAULT_MAX_ACTIVE_JOBS)
+            );
+            assert_eq!(
+                fallback.max_retained_jobs,
+                retained
+                    .parse::<usize>()
+                    .unwrap_or(DEFAULT_MAX_RETAINED_JOBS)
+            );
+        }
     }
 
     #[test]
@@ -602,6 +796,11 @@ mod tests {
                 "job-retention-ttl-secs",
                 &["job", "retention", "seconds"][..],
             ),
+            ("job-max-active-jobs", &["concurrently", "job", "zero"][..]),
+            (
+                "job-max-retained-jobs",
+                &["retained", "registry", "zero"][..],
+            ),
             (
                 "job-allowed-commands",
                 &["comma-separated", "exact", "program"][..],
@@ -615,9 +814,7 @@ mod tests {
 
     #[test]
     fn profile_defaults_to_main() {
-        let _lock = THREADLINE_PROFILE_ENV_LOCK
-            .lock()
-            .expect("profile env lock");
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let _guard = ProfileEnvGuard::acquire();
         unsafe { std::env::remove_var("THREADLINE_PROFILE") };
 
@@ -636,6 +833,7 @@ mod tests {
 
     #[test]
     fn profile_accepts_explicit_utility_value() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let config = ThreadlineCli::try_parse_from(["threadline", "--profile", "utility"])
             .expect("threadline config should accept utility profile")
             .server;
@@ -645,15 +843,14 @@ mod tests {
 
     #[test]
     fn profile_rejects_invalid_value() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         ThreadlineCli::try_parse_from(["threadline", "--profile", "invalid"])
             .expect_err("threadline config should reject invalid profiles");
     }
 
     #[test]
     fn profile_reads_threadline_profile_env_var() {
-        let _lock = THREADLINE_PROFILE_ENV_LOCK
-            .lock()
-            .expect("profile env lock");
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let _guard = ProfileEnvGuard::acquire();
         unsafe { std::env::set_var("THREADLINE_PROFILE", "utility") };
 
@@ -664,9 +861,7 @@ mod tests {
 
     #[test]
     fn persistent_reasoning_enabled_defaults_to_false() {
-        let _lock = THREADLINE_PERSISTENT_REASONING_ENABLED_ENV_LOCK
-            .lock()
-            .expect("persistent reasoning env lock");
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let _guard = PersistentReasoningEnabledEnvGuard::acquire();
         unsafe { std::env::remove_var("THREADLINE_PERSISTENT_REASONING_ENABLED") };
 
@@ -693,6 +888,7 @@ mod tests {
 
     #[test]
     fn persistent_reasoning_enabled_accepts_cli_flag() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let config =
             ThreadlineCli::try_parse_from(["threadline", "--persistent-reasoning-enabled"])
                 .expect("threadline config should accept the persistent reasoning cli flag")
@@ -703,9 +899,7 @@ mod tests {
 
     #[test]
     fn persistent_reasoning_enabled_reads_true_and_false_env_values() {
-        let _lock = THREADLINE_PERSISTENT_REASONING_ENABLED_ENV_LOCK
-            .lock()
-            .expect("persistent reasoning env lock");
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let _guard = PersistentReasoningEnabledEnvGuard::acquire();
 
         unsafe { std::env::set_var("THREADLINE_PERSISTENT_REASONING_ENABLED", "true") };
@@ -727,6 +921,7 @@ mod tests {
 
     #[test]
     fn utility_port_accepts_cli_value() {
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let config = ThreadlineCli::try_parse_from(["threadline", "--utility-port", "8101"])
             .expect("threadline config should accept a utility port cli override")
             .server;
@@ -736,9 +931,7 @@ mod tests {
 
     #[test]
     fn utility_port_reads_threadline_utility_port_env_var() {
-        let _lock = THREADLINE_UTILITY_PORT_ENV_LOCK
-            .lock()
-            .expect("utility port env lock");
+        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let _guard = UtilityPortEnvGuard::acquire();
         unsafe { std::env::set_var("THREADLINE_UTILITY_PORT", "8101") };
 
