@@ -1110,6 +1110,64 @@ async fn astra_visible_and_raw_ids_emit_expected_upstream_payload_with_persisten
 }
 
 #[tokio::test]
+async fn gpt_6_sol_luna_visible_and_raw_ids_emit_expected_upstream_payload_with_persistent_reasoning() {
+    for (model_id, upstream_model_id) in [
+        ("threadline-main-gpt-6-sol", "gpt-6-sol"),
+        ("gpt-6-sol", "gpt-6-sol"),
+        ("threadline-main-gpt-6-luna", "gpt-6-luna"),
+        ("gpt-6-luna", "gpt-6-luna"),
+    ] {
+        let request_payload = completed_response_create_payload(
+            ThreadlineConfig {
+                persistent_reasoning_enabled: true,
+                ..ThreadlineConfig::default()
+            },
+            json!({
+                "model": model_id,
+                "input": "gpt-6 reasoning contract",
+                "reasoning": {
+                    "effort": "high",
+                    "summary": "detailed"
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(request_payload["type"], "response.create");
+        assert_eq!(request_payload["model"], upstream_model_id);
+        assert_eq!(request_payload["reasoning"]["effort"], "high");
+        assert_eq!(request_payload["reasoning"]["summary"], "detailed");
+        assert_eq!(request_payload["reasoning"]["context"], "all_turns");
+    }
+}
+
+#[tokio::test]
+async fn gpt_6_luna_utility_alias_rewrites_upstream_and_preserves_explicit_reasoning() {
+    let request_payload = completed_response_create_payload(
+        ThreadlineConfig {
+            profile: RouteProfile::Utility,
+            ..ThreadlineConfig::default()
+        },
+        json!({
+            "model": "threadline-utility-gpt-6-luna",
+            "input": "gpt-6 luna utility contract",
+            "reasoning": {
+                "context": "all_turns",
+                "effort": "high"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(request_payload["type"], "response.create");
+    assert_eq!(request_payload["model"], "gpt-6-luna");
+    assert_eq!(
+        request_payload["reasoning"],
+        json!({"context":"all_turns","effort":"high"})
+    );
+}
+
+#[tokio::test]
 async fn context_management_compaction_does_not_override_stale_marker_semantics() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let second_server = Arc::new(ScriptedWebSocketServer::start().await);

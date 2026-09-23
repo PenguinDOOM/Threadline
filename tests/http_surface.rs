@@ -96,19 +96,41 @@ impl UpstreamAuthProvider for AvailableAuthProvider {
     }
 }
 
-const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 4] = [
+const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 6] = [
+    "threadline-main-gpt-6-astra",
+    "threadline-main-gpt-6-sol",
+    "threadline-main-gpt-6-luna",
+    "threadline-main-gpt-5.6-sol",
+    "threadline-main-gpt-5.6-terra",
+    "threadline-main-gpt-5.6-luna",
+]; 4] = [
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-5.6-sol",
     "threadline-main-gpt-5.6-terra",
     "threadline-main-gpt-5.6-luna",
 ];
 
-const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 3] =
+const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 5] = [
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+]; 3] =
     ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 
 const ASTRA_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-6-astra", "gpt-6-astra"];
 
-const ADVERTISED_MAIN_MODEL_IDS: [&str; 6] = [
+const ADVERTISED_MAIN_MODEL_IDS: [&str; 8] = [
+    "threadline-main-gpt-6-astra",
+    "threadline-main-gpt-6-sol",
+    "threadline-main-gpt-6-luna",
+    "threadline-main-gpt-5.6-sol",
+    "threadline-main-gpt-5.6-terra",
+    "threadline-main-gpt-5.6-luna",
+    "threadline-main-gpt-5.5",
+    "threadline-main-gpt-5.4",
+]; 6] = [
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-5.6-sol",
     "threadline-main-gpt-5.6-terra",
@@ -117,13 +139,37 @@ const ADVERTISED_MAIN_MODEL_IDS: [&str; 6] = [
     "threadline-main-gpt-5.4",
 ];
 
-const ADVERTISED_UTILITY_MODEL_IDS: [&str; 3] = [
+const ADVERTISED_UTILITY_MODEL_IDS: [&str; 4] = [
+    "threadline-utility-gpt-6-luna",
+    "threadline-utility-gpt-5.6-luna",
+    "threadline-utility-gpt-5.4-mini",
+    "threadline-utility-gpt-5.3-codex-spark",
+]; 3] = [
     "threadline-utility-gpt-5.6-luna",
     "threadline-utility-gpt-5.4-mini",
     "threadline-utility-gpt-5.3-codex-spark",
 ];
 
-const ACCEPTED_MAIN_MODEL_IDS: [&str; 14] = [
+const ACCEPTED_MAIN_MODEL_IDS: [&str; 18] = [
+    "threadline-main-gpt-6-astra",
+    "threadline-main-gpt-6-sol",
+    "threadline-main-gpt-6-luna",
+    "threadline-main-gpt-5.6-sol",
+    "threadline-main-gpt-5.6-terra",
+    "threadline-main-gpt-5.6-luna",
+    "threadline-main-gpt-5.5",
+    "threadline-main-gpt-5.4",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+]; 14] = [
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-5.6-sol",
     "threadline-main-gpt-5.6-terra",
@@ -140,7 +186,16 @@ const ACCEPTED_MAIN_MODEL_IDS: [&str; 14] = [
     "gpt-5.3-codex-spark",
 ];
 
-const UNSUPPORTED_MODEL_IDS: [&str; 5] = [
+const UNSUPPORTED_MODEL_IDS: [&str; 8] = [
+    "threadline-utility-gpt-6-luna",
+    "threadline-utility-gpt-5.6-luna",
+    "threadline-utility-gpt-5.4-mini",
+    "threadline-utility-gpt-5.3-codex-spark",
+    "threadline-main-gpt-6-terra",
+    "gpt-6-terra",
+    "codex-mini-latest",
+    "threadline-test-unsupported",
+]; 5] = [
     "threadline-utility-gpt-5.6-luna",
     "threadline-utility-gpt-5.4-mini",
     "threadline-utility-gpt-5.3-codex-spark",
@@ -148,7 +203,17 @@ const UNSUPPORTED_MODEL_IDS: [&str; 5] = [
     "threadline-test-unsupported",
 ];
 
-const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 7] = [
+const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 9] = [
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+]; 7] = [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -1046,7 +1111,7 @@ async fn responses_endpoint_rejects_unsupported_reasoning_all_turns_before_retai
 }
 
 #[tokio::test]
-async fn responses_endpoint_allows_raw_gpt_5_6_main_compatibility_ids_for_reasoning_all_turns_to_reach_existing_auth_path()
+async fn responses_endpoint_allows_reasoning_capable_raw_main_compatibility_ids_for_reasoning_all_turns_to_reach_existing_auth_path()
  {
     for model_id in NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS {
         let app = build_router_with_services(
