@@ -296,16 +296,9 @@ mod tests {
     const GPT_6_FAMILY_MAIN_ALIAS_IDS: [&str; 2] = [
         "threadline-main-gpt-6-sol",
         "threadline-main-gpt-6-luna",
-    ]; 3] = [
-        "threadline-main-gpt-6-sol",
-        "threadline-main-gpt-6-terra",
-        "threadline-main-gpt-6-luna",
     ];
 
-    const GPT_6_FAMILY_RAW_IDS: [&str; 2] = [
-        "gpt-6-sol",
-        "gpt-6-luna",
-    ]; 3] = ["gpt-6-sol", "gpt-6-terra", "gpt-6-luna"];
+    const GPT_6_FAMILY_RAW_IDS: [&str; 2] = ["gpt-6-sol", "gpt-6-luna"];
 
     #[test]
     fn supported_model_ids_match_main_public_contract() {
