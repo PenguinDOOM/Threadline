@@ -96,7 +96,8 @@ impl UpstreamAuthProvider for AvailableAuthProvider {
     }
 }
 
-const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 6] = [
+const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 7] = [
+    "threadline-main-gpt-6.1-sol",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
@@ -105,7 +106,8 @@ const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 6] = [
     "threadline-main-gpt-5.6-luna",
 ];
 
-const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 5] = [
+const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 6] = [
+    "gpt-6.1-sol",
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-5.6-sol",
@@ -115,7 +117,8 @@ const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 5] = [
 
 const ASTRA_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-6-astra", "gpt-6-astra"];
 
-const ADVERTISED_MAIN_MODEL_IDS: [&str; 8] = [
+const ADVERTISED_MAIN_MODEL_IDS: [&str; 9] = [
+    "threadline-main-gpt-6.1-sol",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
@@ -133,7 +136,8 @@ const ADVERTISED_UTILITY_MODEL_IDS: [&str; 4] = [
     "threadline-utility-gpt-5.3-codex-spark",
 ];
 
-const ACCEPTED_MAIN_MODEL_IDS: [&str; 18] = [
+const ACCEPTED_MAIN_MODEL_IDS: [&str; 20] = [
+    "threadline-main-gpt-6.1-sol",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
@@ -142,6 +146,7 @@ const ACCEPTED_MAIN_MODEL_IDS: [&str; 18] = [
     "threadline-main-gpt-5.6-luna",
     "threadline-main-gpt-5.5",
     "threadline-main-gpt-5.4",
+    "gpt-6.1-sol",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -165,7 +170,8 @@ const UNSUPPORTED_MODEL_IDS: [&str; 8] = [
     "threadline-test-unsupported",
 ];
 
-const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 9] = [
+const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 10] = [
+    "gpt-6.1-sol",
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-5.6-sol",

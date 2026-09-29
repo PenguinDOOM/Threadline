@@ -32,7 +32,15 @@ pub struct ModelAlias {
     pub supports_reasoning_all_turns: bool,
 }
 
-const MODEL_ALIAS_CATALOG: [ModelAlias; 22] = [
+const MODEL_ALIAS_CATALOG: [ModelAlias; 24] = [
+    ModelAlias {
+        alias_id: "threadline-main-gpt-6.1-sol",
+        upstream_model_id: "gpt-6.1-sol",
+        profile: RouteProfile::Main,
+        advertised: true,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
+    },
     ModelAlias {
         alias_id: "threadline-main-gpt-6-astra",
         upstream_model_id: "gpt-6-astra",
@@ -128,6 +136,14 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 22] = [
         advertised: true,
         persistent_reasoning_eligible: false,
         supports_reasoning_all_turns: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-6.1-sol",
+        upstream_model_id: "gpt-6.1-sol",
+        profile: RouteProfile::Main,
+        advertised: false,
+        persistent_reasoning_eligible: true,
+        supports_reasoning_all_turns: true,
     },
     ModelAlias {
         alias_id: "gpt-6-astra",
@@ -293,18 +309,20 @@ mod tests {
 
     const ASTRA_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-6-astra", "gpt-6-astra"];
 
-    const GPT_6_FAMILY_MAIN_ALIAS_IDS: [&str; 2] = [
+    const GPT_6_FAMILY_MAIN_ALIAS_IDS: [&str; 3] = [
+        "threadline-main-gpt-6.1-sol",
         "threadline-main-gpt-6-sol",
         "threadline-main-gpt-6-luna",
     ];
 
-    const GPT_6_FAMILY_RAW_IDS: [&str; 2] = ["gpt-6-sol", "gpt-6-luna"];
+    const GPT_6_FAMILY_RAW_IDS: [&str; 3] = ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"];
 
     #[test]
     fn supported_model_ids_match_main_public_contract() {
         assert_eq!(
             supported_model_ids(),
             &[
+                "threadline-main-gpt-6.1-sol",
                 "threadline-main-gpt-6-astra",
                 "threadline-main-gpt-6-sol",
                 "threadline-main-gpt-6-luna",
@@ -322,6 +340,7 @@ mod tests {
         assert_eq!(
             advertised_model_ids_for_profile(RouteProfile::Main),
             &[
+                "threadline-main-gpt-6.1-sol",
                 "threadline-main-gpt-6-astra",
                 "threadline-main-gpt-6-sol",
                 "threadline-main-gpt-6-luna",
@@ -457,6 +476,7 @@ mod tests {
     #[test]
     fn gpt_6_main_routes_are_advertised_and_support_persistent_reasoning() {
         for (alias_id, upstream_model_id) in [
+            ("threadline-main-gpt-6.1-sol", "gpt-6.1-sol"),
             ("threadline-main-gpt-6-sol", "gpt-6-sol"),
             ("threadline-main-gpt-6-luna", "gpt-6-luna"),
         ] {

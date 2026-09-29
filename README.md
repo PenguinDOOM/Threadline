@@ -163,6 +163,7 @@ Use the two-process form when startup isolation or process-by-process debugging 
 These are the visible model ids that Threadline advertises from `/v1/models`.
 
 Main profile aliases:
+- `threadline-main-gpt-6.1-sol`
 - `threadline-main-gpt-6-astra`
 - `threadline-main-gpt-6-sol`
 - `threadline-main-gpt-6-luna`
@@ -178,19 +179,19 @@ Utility profile aliases:
 - `threadline-utility-gpt-5.4-mini`
 - `threadline-utility-gpt-5.3-codex-spark`
 
-GPT-6 Sol and GPT-6 Luna are supported for live upstream use. The visible Main aliases resolve to `gpt-6-sol` and `gpt-6-luna`, and the matching raw ids remain accepted as hidden Main compatibility inputs. The Utility Luna alias resolves to `gpt-6-luna`. Threadline does not define a GPT-6 Terra alias or compatibility id.
+GPT-6.1 Sol, GPT-6 Sol, and GPT-6 Luna are supported for live upstream use. The visible Main aliases resolve to `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-6-luna`, and the matching raw ids remain accepted as hidden Main compatibility inputs. The Utility Luna alias resolves to `gpt-6-luna`. Threadline does not define a GPT-6 Terra alias or compatibility id.
 
 The GPT-5.6 Sol, Terra, and Luna models remain supported for live upstream use. Threadline covers advertisement, validation, `model`-field rewriting, and the existing reasoning policy for those ids.
 
-These visible ids are aliases for VS Code selection and routing. The upstream model ids sent to Codex remain `gpt-*` ids such as `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`.
+These visible ids are aliases for VS Code selection and routing. The upstream model ids sent to Codex remain `gpt-*` ids such as `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`.
 
-For Main compatibility, Threadline still accepts direct `gpt-*` ids on the Main profile even though `/v1/models` advertises only the `threadline-main-*` aliases. The GPT-6 Astra, Sol, and Luna visible aliases and their raw compatibility inputs resolve upstream to the exact corresponding `gpt-6-*` ids, are valid only for Main, and are rejected by Utility. Raw compatibility ids are not advertised through `/v1/models`.
+For Main compatibility, Threadline still accepts direct `gpt-*` ids on the Main profile even though `/v1/models` advertises only the `threadline-main-*` aliases. The GPT-6.1 Sol, GPT-6 Astra, Sol, and Luna visible aliases and their raw compatibility inputs resolve upstream to the exact corresponding `gpt-6*` ids, are valid only for Main, and are rejected by Utility. Raw compatibility ids are not advertised through `/v1/models`.
 
-Astra, Sol, and Luna GPT-6 support covers local advertisement, profile validation, model rewriting, reasoning policy, scripted upstream serialization contracts, and live upstream use.
+GPT-6.1 Sol and the GPT-6 Astra, Sol, and Luna models cover local advertisement, profile validation, model rewriting, reasoning policy, scripted upstream serialization contracts, and live upstream use.
 
 ## Persistent Reasoning
 
-The previous experimental unconditional injection is now default-off. Users who need server-side automatic injection must opt in with `--persistent-reasoning-enabled` or `THREADLINE_PERSISTENT_REASONING_ENABLED=true`. With the setting enabled, Threadline automatically adds `reasoning.context=all_turns` to eligible Main requests using the GPT-6 Astra, Sol, and Luna aliases or raw compatibility ids, and the GPT-5.6 Sol, Terra, and Luna aliases or raw compatibility ids. The advertised `threadline-main-gpt-5.5` and `threadline-main-gpt-5.4` aliases, raw compatibility ids `gpt-5.5` and `gpt-5.4`, and Utility requests are not automatically eligible.
+The previous experimental unconditional injection is now default-off. Users who need server-side automatic injection must opt in with `--persistent-reasoning-enabled` or `THREADLINE_PERSISTENT_REASONING_ENABLED=true`. With the setting enabled, Threadline automatically adds `reasoning.context=all_turns` to eligible Main requests using the GPT-6.1 Sol, GPT-6 Astra, Sol, and Luna aliases or raw compatibility ids, and the GPT-5.6 Sol, Terra, and Luna aliases or raw compatibility ids. The advertised `threadline-main-gpt-5.5` and `threadline-main-gpt-5.4` aliases, raw compatibility ids `gpt-5.5` and `gpt-5.4`, and Utility requests are not automatically eligible.
 
 Threadline's server-side setting is independent of VS Code's `github.copilot.chat.responsesApi.persistentCoT.enabled` setting. Threadline `false` does not remove a client-explicit `reasoning.context=all_turns`; eligible GPT-6 and GPT-5.6 Main aliases and raw compatibility ids support that client-explicit value and are also eligible for server-side injection when Threadline is `true`. Threadline `true` injects it for eligible Main requests even when the VS Code setting is `false`. The raw compatibility ids `gpt-5.5` and `gpt-5.4` remain excluded from automatic injection and continue to reject client-explicit `reasoning.context=all_turns`. Utility requests remain excluded from automatic injection, while supporting Utility aliases, including GPT-6 Luna and GPT-5.6 Luna, preserve client-explicit `reasoning.context=all_turns` under the existing capability policy.
 
@@ -204,6 +205,10 @@ Use distinct visible ids and distinct profile-specific URLs so VS Code can keep 
 		{
 			"uri": "http://127.0.0.1:8100/v1",
 			"models": [
+				{
+					"id": "threadline-main-gpt-6.1-sol",
+					"name": "Threadline Main GPT-6.1 Sol"
+				},
 				{
 					"id": "threadline-main-gpt-6-astra",
 					"name": "Threadline Main GPT-6 Astra"
@@ -270,7 +275,7 @@ Use distinct visible ids and distinct profile-specific URLs so VS Code can keep 
 
 The visible ids in this JSON are aliases only. VS Code uses `customendpoint/threadline-main-gpt-5.5` and `customendpoint/threadline-utility-gpt-5.4-mini` as local model selectors, while Threadline rewrites the upstream `model` field to the matching `gpt-*` id.
 
-When a GPT-6 or GPT-5.6-specific prompt selection needs a raw compatibility model, a Main Custom Endpoint configuration can use `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, or one of the raw GPT-5.6 ids `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna` as a compatibility option. These raw GPT-6 ids are Main-only compatibility inputs and are not advertised through `/v1/models`. This documents a compatibility option; it does not claim or guarantee how VS Code selects internal prompts.
+When a GPT-6 or GPT-5.6-specific prompt selection needs a raw compatibility model, a Main Custom Endpoint configuration can use `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, or one of the raw GPT-5.6 ids `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna` as a compatibility option. These raw GPT-6 ids are Main-only compatibility inputs and are not advertised through `/v1/models`. This documents a compatibility option; it does not claim or guarantee how VS Code selects internal prompts.
 
 Utility preserves `reasoning.effort` by default when the client sends it. The `supportsReasoningEffort` model setting only controls whether VS Code shows the effort picker for that visible model id.
 

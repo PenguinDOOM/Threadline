@@ -1110,8 +1110,10 @@ async fn astra_visible_and_raw_ids_emit_expected_upstream_payload_with_persisten
 }
 
 #[tokio::test]
-async fn gpt_6_sol_luna_visible_and_raw_ids_emit_expected_upstream_payload_with_persistent_reasoning() {
+async fn gpt_6_sol_family_visible_and_raw_ids_emit_expected_upstream_payload_with_persistent_reasoning() {
     for (model_id, upstream_model_id) in [
+        ("threadline-main-gpt-6.1-sol", "gpt-6.1-sol"),
+        ("gpt-6.1-sol", "gpt-6.1-sol"),
         ("threadline-main-gpt-6-sol", "gpt-6-sol"),
         ("gpt-6-sol", "gpt-6-sol"),
         ("threadline-main-gpt-6-luna", "gpt-6-luna"),
