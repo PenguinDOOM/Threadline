@@ -78,6 +78,7 @@ fn default_upstream_connector(config: &ThreadlineConfig) -> DefaultUpstreamConne
         watchdog_policy: config
             .upstream_watchdog_policy()
             .expect("clap validates upstream watchdog timeouts"),
+        ws_close_diagnostics: config.ws_close_diagnostics,
     }
 }
 
@@ -174,6 +175,7 @@ struct DefaultUpstreamConnector {
     inbound_limits: UpstreamInboundLimits,
     connect_timeout: Duration,
     watchdog_policy: UpstreamWatchdogPolicy,
+    ws_close_diagnostics: bool,
 }
 
 impl DefaultUpstreamConnector {
@@ -240,6 +242,7 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
         let inbound_limits = self.inbound_limits;
         let connect_timeout = self.connect_timeout;
         let watchdog_policy = self.watchdog_policy;
+        let ws_close_diagnostics = self.ws_close_diagnostics;
 
         Box::pin(async move {
             let upstream_url = Self::upstream_url();
@@ -267,13 +270,12 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
                 .map(ToString::to_string);
 
             Ok(ConnectedUpstream {
-                websocket: Arc::new(
-                    LiveUpstreamWebSocket::from_stream_with_watchdog_policy_and_limits(
-                        stream,
-                        watchdog_policy,
-                        inbound_limits,
-                    ),
-                ),
+                websocket: Arc::new(LiveUpstreamWebSocket::from_stream_with_close_diagnostics(
+                    stream,
+                    watchdog_policy,
+                    inbound_limits,
+                    ws_close_diagnostics,
+                )),
                 session: handshake.session,
                 turn_state,
             })
@@ -312,6 +314,20 @@ mod tests {
     }
 
     #[test]
+    fn production_connector_uses_ws_close_diagnostics_from_config() {
+        for enabled in [false, true] {
+            let config = ThreadlineConfig {
+                ws_close_diagnostics: enabled,
+                ..ThreadlineConfig::default()
+            };
+            assert_eq!(
+                default_upstream_connector(&config).ws_close_diagnostics,
+                enabled
+            );
+        }
+    }
+
+    #[test]
     fn production_connector_uses_watchdog_policy_from_config() {
         let config = ThreadlineConfig {
             upstream_pong_timeout_secs: 17,
@@ -345,6 +361,7 @@ mod tests {
             inbound_limits: UpstreamInboundLimits::DEFAULT,
             connect_timeout,
             watchdog_policy: UpstreamWatchdogPolicy::DEFAULT,
+            ws_close_diagnostics: false,
         }
     }
 

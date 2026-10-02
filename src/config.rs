@@ -238,6 +238,14 @@ pub struct ThreadlineConfig {
         long_help = "Log verbosity for Threadline diagnostics. Use standard Rust tracing levels such as error, warn, info, debug, or trace."
     )]
     pub log_level: String,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Write safe upstream websocket terminal diagnostics to stderr.",
+        long_help = "Write one safe upstream websocket terminal diagnostic to stderr per connection, independently of tracing and --log-level. Disabled by default; CLI-only with no environment variable."
+    )]
+    pub ws_close_diagnostics: bool,
 }
 
 impl Default for ThreadlineConfig {
@@ -255,6 +263,7 @@ impl Default for ThreadlineConfig {
             upstream_connect_timeout_secs: DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS,
             upstream_pong_timeout_secs: DEFAULT_UPSTREAM_PONG_TIMEOUT_SECS,
             upstream_write_timeout_secs: DEFAULT_UPSTREAM_WRITE_TIMEOUT_SECS,
+            ws_close_diagnostics: false,
             jobs_enabled: DEFAULT_JOBS_ENABLED,
             persistent_reasoning_enabled: DEFAULT_PERSISTENT_REASONING_ENABLED,
             job_output_buffer_limit_bytes: DEFAULT_JOB_OUTPUT_BUFFER_LIMIT_BYTES,

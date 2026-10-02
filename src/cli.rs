@@ -96,6 +96,37 @@ mod login_cli_tests {
     }
 
     #[test]
+    fn ws_close_diagnostics_is_default_off_and_cli_only() {
+        let _env_lock = THREADLINE_ENV_LOCK.lock().expect("environment lock");
+        assert!(!crate::config::ThreadlineConfig::default().ws_close_diagnostics);
+        assert!(
+            !ThreadlineCli::try_parse_from(["threadline"])
+                .expect("default cli")
+                .server
+                .ws_close_diagnostics
+        );
+        let enabled = ThreadlineCli::try_parse_from(["threadline", "--ws-close-diagnostics"])
+            .expect("bare diagnostic flag");
+        assert!(enabled.server.ws_close_diagnostics);
+        let off = ThreadlineCli::try_parse_from([
+            "threadline",
+            "--log-level",
+            "off",
+            "--ws-close-diagnostics",
+        ])
+        .expect("diagnostics with tracing off");
+        assert!(off.server.ws_close_diagnostics);
+        assert_eq!(off.server.log_level, "off");
+        let command = ThreadlineCli::command();
+        let flag = command
+            .get_arguments()
+            .find(|argument| argument.get_long() == Some("ws-close-diagnostics"))
+            .expect("diagnostic argument");
+        assert!(flag.get_env().is_none());
+        assert!(flag.get_long_help().unwrap().to_string().contains("stderr"));
+    }
+
+    #[test]
     fn server_starts_by_default_without_subcommand() {
         let _env_lock = THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let cli = ThreadlineCli::try_parse_from(["threadline"]).expect("cli should parse");

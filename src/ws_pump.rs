@@ -15,6 +15,285 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::error::CapacityError;
 use tracing::debug;
 
+#[derive(Clone, Copy)]
+enum UpstreamCloseSource {
+    PeerCloseFrame,
+    ReadError,
+    WriteError,
+    StreamEof,
+    OutboundChannelClosed,
+    PumpExitFallback,
+}
+
+impl UpstreamCloseSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerCloseFrame => "peer_close_frame",
+            Self::ReadError => "read_error",
+            Self::WriteError => "write_error",
+            Self::StreamEof => "stream_eof",
+            Self::OutboundChannelClosed => "outbound_channel_closed",
+            Self::PumpExitFallback => "pump_exit_fallback",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CloseDiagnostics {
+    started_at: Option<Instant>,
+    #[cfg(test)]
+    capture: Option<Arc<StdMutex<TestDiagnosticWriter>>>,
+}
+
+impl CloseDiagnostics {
+    #[cfg(test)]
+    const DISABLED: Self = Self {
+        started_at: None,
+        #[cfg(test)]
+        capture: None,
+    };
+
+    fn new(enabled: bool) -> Self {
+        Self {
+            started_at: enabled.then(Instant::now),
+            #[cfg(test)]
+            capture: Some(Arc::new(StdMutex::new(TestDiagnosticWriter::default()))),
+        }
+    }
+
+    #[cfg(test)]
+    fn capture(&self) -> std::sync::MutexGuard<'_, TestDiagnosticWriter> {
+        self.capture
+            .as_ref()
+            .expect("test diagnostic capture")
+            .lock()
+            .expect("diagnostic capture lock")
+    }
+
+    fn emit(&self, diagnostic: &SafeTerminalDiagnostic, age_ms: u128) {
+        #[cfg(test)]
+        write_terminal_diagnostic(&mut *self.capture(), diagnostic, age_ms);
+        #[cfg(not(test))]
+        write_terminal_diagnostic(&mut std::io::stderr().lock(), diagnostic, age_ms);
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestDiagnosticWriter {
+    calls: usize,
+    bytes: Vec<u8>,
+    fail: bool,
+    terminal_state: Option<Arc<StdMutex<UpstreamTerminalState>>>,
+}
+
+#[cfg(test)]
+impl std::io::Write for TestDiagnosticWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if let Some(state) = &self.terminal_state {
+            assert!(
+                state.try_lock().is_ok(),
+                "writer must not hold terminal lock"
+            );
+        }
+        if self.fail {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        panic!("diagnostics must not flush or retry")
+    }
+}
+
+struct SafeTransportError {
+    kind: &'static str,
+    io_kind: Option<&'static str>,
+    raw_os_error: Option<i32>,
+}
+
+fn safe_transport_error(error: &TungsteniteError) -> SafeTransportError {
+    let kind = match error {
+        TungsteniteError::ConnectionClosed => "connection_closed",
+        TungsteniteError::AlreadyClosed => "already_closed",
+        TungsteniteError::Io(_) => "io",
+        TungsteniteError::Tls(_) => "tls",
+        TungsteniteError::Capacity(_) => "capacity",
+        TungsteniteError::Protocol(_) => "protocol",
+        TungsteniteError::WriteBufferFull(_) => "write_buffer_full",
+        TungsteniteError::Utf8 => "utf8",
+        TungsteniteError::AttackAttempt => "attack_attempt",
+        TungsteniteError::Url(_) => "url",
+        TungsteniteError::Http(_) => "http",
+        TungsteniteError::HttpFormat(_) => "http_format",
+    };
+    let (io_kind, raw_os_error) = if let TungsteniteError::Io(error) = error {
+        use std::io::ErrorKind;
+        let kind = match error.kind() {
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::PermissionDenied => "permission_denied",
+            ErrorKind::ConnectionRefused => "connection_refused",
+            ErrorKind::ConnectionReset => "connection_reset",
+            ErrorKind::HostUnreachable => "host_unreachable",
+            ErrorKind::NetworkUnreachable => "network_unreachable",
+            ErrorKind::ConnectionAborted => "connection_aborted",
+            ErrorKind::NotConnected => "not_connected",
+            ErrorKind::AddrInUse => "addr_in_use",
+            ErrorKind::AddrNotAvailable => "addr_not_available",
+            ErrorKind::NetworkDown => "network_down",
+            ErrorKind::BrokenPipe => "broken_pipe",
+            ErrorKind::AlreadyExists => "already_exists",
+            ErrorKind::WouldBlock => "would_block",
+            ErrorKind::InvalidInput => "invalid_input",
+            ErrorKind::InvalidData => "invalid_data",
+            ErrorKind::TimedOut => "timed_out",
+            ErrorKind::WriteZero => "write_zero",
+            ErrorKind::Interrupted => "interrupted",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::UnexpectedEof => "unexpected_eof",
+            ErrorKind::OutOfMemory => "out_of_memory",
+            _ => "other",
+        };
+        (Some(kind), error.raw_os_error())
+    } else {
+        (None, None)
+    };
+    SafeTransportError {
+        kind,
+        io_kind,
+        raw_os_error,
+    }
+}
+
+fn safe_close_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        None => "-",
+        Some("") => "",
+        Some("going away") => "going away",
+        Some("normal closure") => "normal closure",
+        Some(_) => "[redacted]",
+    }
+}
+
+enum SafeTerminalDiagnostic {
+    Closed {
+        source: UpstreamCloseSource,
+        code: Option<u16>,
+        reason: &'static str,
+        error: Option<SafeTransportError>,
+    },
+    LivenessTimeout(UpstreamLivenessTimeout),
+    InboundBufferOverflow(InboundBufferOverflow),
+}
+
+fn write_terminal_diagnostic(
+    writer: &mut impl std::io::Write,
+    diagnostic: &SafeTerminalDiagnostic,
+    age_ms: u128,
+) {
+    let line = match diagnostic {
+        SafeTerminalDiagnostic::Closed {
+            source,
+            code,
+            reason,
+            error,
+        } => {
+            let code = code.map_or_else(|| "-".to_string(), |code| code.to_string());
+            let kind = error.as_ref().map_or("-", |error| error.kind);
+            let io_kind = error
+                .as_ref()
+                .and_then(|error| error.io_kind)
+                .unwrap_or("-");
+            let raw_os_error = error
+                .as_ref()
+                .and_then(|error| error.raw_os_error)
+                .map_or_else(|| "-".to_string(), |code| code.to_string());
+            format!(
+                "[threadline] websocket closed source={} code={code} reason={reason} error={kind} connection_age_ms={age_ms} io_kind={io_kind} raw_os_error={raw_os_error}\n",
+                source.as_str()
+            )
+        }
+        SafeTerminalDiagnostic::LivenessTimeout(metadata) => {
+            let cause = match metadata.cause {
+                UpstreamLivenessTimeoutCause::PongDeadline => "pong_deadline",
+                UpstreamLivenessTimeoutCause::WriteDeadline => "write_deadline",
+            };
+            let outbound_kind = match metadata.outbound_kind {
+                None => "-",
+                Some(UpstreamOutboundKind::Text) => "text",
+                Some(UpstreamOutboundKind::Ping) => "ping",
+                Some(UpstreamOutboundKind::ControlFlush) => "control_flush",
+            };
+            format!(
+                "[threadline] websocket terminal terminal=liveness_timeout connection_age_ms={age_ms} cause={cause} timeout_ms={} elapsed_ms={} outbound_kind={outbound_kind}\n",
+                metadata.timeout.as_millis(),
+                metadata.elapsed.as_millis()
+            )
+        }
+        SafeTerminalDiagnostic::InboundBufferOverflow(metadata) => {
+            let cause = match metadata.cause {
+                InboundBufferOverflowCause::MessageCount => "message_count",
+                InboundBufferOverflowCause::PayloadBytes => "payload_bytes",
+                InboundBufferOverflowCause::TransportSize => "transport_size",
+            };
+            format!(
+                "[threadline] websocket terminal terminal=inbound_buffer_overflow connection_age_ms={age_ms} cause={cause} queued_messages={} queued_bytes={} incoming_bytes={} max_messages={} max_bytes={}\n",
+                metadata.queued_messages,
+                metadata.queued_bytes,
+                metadata.incoming_bytes,
+                metadata.max_messages,
+                metadata.max_bytes
+            )
+        }
+    };
+    let _ = writer.write(line.as_bytes());
+}
+
+fn commit_terminal(
+    target: &Arc<StdMutex<UpstreamTerminalState>>,
+    next: UpstreamTerminalState,
+    diagnostics: &CloseDiagnostics,
+    source: Option<UpstreamCloseSource>,
+    error: Option<SafeTransportError>,
+) -> bool {
+    let mut state = target.lock().expect("terminal state lock");
+    if !matches!(*state, UpstreamTerminalState::Open) {
+        return false;
+    }
+    *state = next;
+    let diagnostic = diagnostics.started_at.map(|started_at| {
+        let age_ms = Instant::now()
+            .saturating_duration_since(started_at)
+            .as_millis();
+        let diagnostic = match &*state {
+            UpstreamTerminalState::Closed(metadata) => SafeTerminalDiagnostic::Closed {
+                source: source.expect("ordinary close has an observation source"),
+                code: metadata.code,
+                reason: safe_close_reason(metadata.reason.as_deref()),
+                error,
+            },
+            UpstreamTerminalState::LivenessTimeout(metadata) => {
+                SafeTerminalDiagnostic::LivenessTimeout(metadata.clone())
+            }
+            UpstreamTerminalState::InboundBufferOverflow(metadata) => {
+                SafeTerminalDiagnostic::InboundBufferOverflow(metadata.clone())
+            }
+            UpstreamTerminalState::Open => {
+                unreachable!("terminal commit requires a terminal state")
+            }
+        };
+        (diagnostic, age_ms)
+    });
+    drop(state);
+    if let Some((diagnostic, age_ms)) = diagnostic {
+        diagnostics.emit(&diagnostic, age_ms);
+    }
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamCloseMetadata {
     pub code: Option<u16>,
@@ -163,6 +442,8 @@ pub struct LiveUpstreamWebSocket {
     after_text_send: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     pending_text_send: Option<Arc<TestPendingTextSendState>>,
+    #[cfg(test)]
+    diagnostics: CloseDiagnostics,
 }
 
 enum OutboundCommand {
@@ -219,6 +500,7 @@ impl TestPendingTextSend {
             Duration::from_millis(1),
             Duration::from_millis(1),
             Some(UpstreamOutboundKind::Text),
+            &CloseDiagnostics::new(false),
         );
         self.state.outbound_rx.lock().await.take();
     }
@@ -246,6 +528,7 @@ struct PumpState<'a> {
     limits: UpstreamInboundLimits,
     terminal_state: &'a Arc<StdMutex<UpstreamTerminalState>>,
     watchdog_policy: UpstreamWatchdogPolicy,
+    diagnostics: &'a CloseDiagnostics,
 }
 
 struct PumpLivenessState<'a> {
@@ -275,6 +558,7 @@ impl LiveUpstreamWebSocket {
             UPSTREAM_PING_INTERVAL,
             UpstreamWatchdogPolicy::DEFAULT,
             limits,
+            CloseDiagnostics::new(false),
         )
     }
 
@@ -291,6 +575,26 @@ impl LiveUpstreamWebSocket {
             UPSTREAM_PING_INTERVAL,
             watchdog_policy,
             limits,
+            CloseDiagnostics::new(false),
+        )
+    }
+
+    pub(crate) fn from_stream_with_close_diagnostics<S>(
+        stream: WebSocketStream<S>,
+        watchdog_policy: UpstreamWatchdogPolicy,
+        limits: UpstreamInboundLimits,
+        enabled: bool,
+    ) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let diagnostics = CloseDiagnostics::new(enabled);
+        Self::from_stream_with_policy_and_limits(
+            stream,
+            UPSTREAM_PING_INTERVAL,
+            watchdog_policy,
+            limits,
+            diagnostics,
         )
     }
 
@@ -307,6 +611,7 @@ impl LiveUpstreamWebSocket {
             ping_interval,
             UpstreamWatchdogPolicy::DEFAULT,
             UpstreamInboundLimits::DEFAULT,
+            CloseDiagnostics::new(false),
         )
     }
 
@@ -323,6 +628,7 @@ impl LiveUpstreamWebSocket {
             ping_interval,
             watchdog_policy,
             UpstreamInboundLimits::DEFAULT,
+            CloseDiagnostics::new(false),
         )
     }
 
@@ -331,6 +637,7 @@ impl LiveUpstreamWebSocket {
         ping_interval: Duration,
         watchdog_policy: UpstreamWatchdogPolicy,
         limits: UpstreamInboundLimits,
+        diagnostics: CloseDiagnostics,
     ) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -341,6 +648,8 @@ impl LiveUpstreamWebSocket {
         let byte_budget = Arc::new(Semaphore::new(limits.max_bytes()));
         let terminal_state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
         let task_terminal_state = Arc::clone(&terminal_state);
+        #[cfg(test)]
+        let test_diagnostics = diagnostics.clone();
 
         let task = tokio::spawn(async move {
             let mut next_ping_due = Instant::now() + ping_interval;
@@ -360,6 +669,7 @@ impl LiveUpstreamWebSocket {
                 limits,
                 terminal_state: &task_terminal_state,
                 watchdog_policy,
+                diagnostics: &diagnostics,
             };
             loop {
                 if !check_liveness_deadline(
@@ -367,6 +677,7 @@ impl LiveUpstreamWebSocket {
                     pending_challenge.as_ref(),
                     None,
                     pump_state.watchdog_policy,
+                    pump_state.diagnostics,
                 ) {
                     break;
                 }
@@ -467,7 +778,7 @@ impl LiveUpstreamWebSocket {
                                 }
                             }
                             None => {
-                                record_close(pump_state.terminal_state, outbound_channel_closed_metadata());
+                                record_close(pump_state.terminal_state, outbound_channel_closed_metadata(), UpstreamCloseSource::OutboundChannelClosed, pump_state.diagnostics);
                                 break;
                             }
                         },
@@ -497,7 +808,7 @@ impl LiveUpstreamWebSocket {
                                 }
                             }
                             None => {
-                                record_close(pump_state.terminal_state, outbound_channel_closed_metadata());
+                                record_close(pump_state.terminal_state, outbound_channel_closed_metadata(), UpstreamCloseSource::OutboundChannelClosed, pump_state.diagnostics);
                                 break;
                             }
                         },
@@ -522,6 +833,8 @@ impl LiveUpstreamWebSocket {
                     reason: None,
                     error: None,
                 },
+                UpstreamCloseSource::PumpExitFallback,
+                &diagnostics,
             );
         });
 
@@ -534,6 +847,8 @@ impl LiveUpstreamWebSocket {
             after_text_send: None,
             #[cfg(test)]
             pending_text_send: None,
+            #[cfg(test)]
+            diagnostics: test_diagnostics,
         }
     }
 
@@ -555,6 +870,7 @@ impl LiveUpstreamWebSocket {
                 Duration::from_millis(1),
                 Duration::from_millis(1),
                 Some(UpstreamOutboundKind::Text),
+                &CloseDiagnostics::new(false),
             );
         });
 
@@ -568,6 +884,7 @@ impl LiveUpstreamWebSocket {
             }),
             after_text_send: Some(after_text_send),
             pending_text_send: None,
+            diagnostics: CloseDiagnostics::new(false),
         }
     }
 
@@ -602,6 +919,7 @@ impl LiveUpstreamWebSocket {
                 task: tokio::spawn(std::future::pending()),
                 after_text_send: None,
                 pending_text_send: Some(state),
+                diagnostics: CloseDiagnostics::new(false),
             },
             fixture,
         )
@@ -720,6 +1038,7 @@ where
             liveness_state.pending_challenge.as_ref(),
             Some((operation_started, outbound_kind)),
             pump_state.watchdog_policy,
+            pump_state.diagnostics,
         ) {
             return false;
         }
@@ -739,6 +1058,7 @@ where
                     liveness_state.pending_challenge.as_ref(),
                     Some((operation_started, outbound_kind)),
                     pump_state.watchdog_policy,
+                    pump_state.diagnostics,
                 ) {
                     return false;
                 }
@@ -746,7 +1066,7 @@ where
             result = &mut send => match result {
                 Ok(()) => return true,
                 Err(error) => {
-                    record_error(pump_state.terminal_state, error.to_string());
+                    record_error(pump_state.terminal_state, &error, UpstreamCloseSource::WriteError, pump_state.diagnostics);
                     return false;
                 }
             },
@@ -787,6 +1107,7 @@ fn handle_inbound_message(
             pump_state.limits,
             text.to_string(),
             pump_state.terminal_state,
+            pump_state.diagnostics,
         ),
         Some(Ok(Message::Binary(bytes))) => try_enqueue_inbound(
             pump_state.inbound_tx,
@@ -794,6 +1115,7 @@ fn handle_inbound_message(
             pump_state.limits,
             String::from_utf8_lossy(bytes.as_ref()).into_owned(),
             pump_state.terminal_state,
+            pump_state.diagnostics,
         ),
         Some(Ok(Message::Ping(payload))) => {
             *control_flush_needed = true;
@@ -827,6 +1149,8 @@ fn handle_inbound_message(
                     reason: frame.as_ref().map(|frame| frame.reason.to_string()),
                     error: None,
                 },
+                UpstreamCloseSource::PeerCloseFrame,
+                pump_state.diagnostics,
             );
             false
         }
@@ -838,12 +1162,30 @@ fn handle_inbound_message(
                 pump_state.byte_budget,
                 pump_state.limits,
                 &error,
+                pump_state.diagnostics,
             ) {
-                record_error(pump_state.terminal_state, error.to_string());
+                record_error(
+                    pump_state.terminal_state,
+                    &error,
+                    UpstreamCloseSource::ReadError,
+                    pump_state.diagnostics,
+                );
             }
             false
         }
-        None => false,
+        None => {
+            record_close(
+                pump_state.terminal_state,
+                UpstreamCloseMetadata {
+                    code: None,
+                    reason: None,
+                    error: None,
+                },
+                UpstreamCloseSource::StreamEof,
+                pump_state.diagnostics,
+            );
+            false
+        }
     }
 }
 
@@ -852,6 +1194,7 @@ fn check_liveness_deadline(
     pending_challenge: Option<&PendingPongChallenge>,
     operation: Option<(Instant, UpstreamOutboundKind)>,
     watchdog_policy: UpstreamWatchdogPolicy,
+    diagnostics: &CloseDiagnostics,
 ) -> bool {
     let now = Instant::now();
     let pong_expired = pending_challenge
@@ -879,6 +1222,7 @@ fn check_liveness_deadline(
                 watchdog_policy.pong_timeout(),
                 now.saturating_duration_since(sent_at),
                 None,
+                diagnostics,
             );
             false
         }
@@ -889,6 +1233,7 @@ fn check_liveness_deadline(
                 watchdog_policy.write_timeout(),
                 now.saturating_duration_since(started_at),
                 Some(kind),
+                diagnostics,
             );
             false
         }
@@ -899,6 +1244,7 @@ fn check_liveness_deadline(
                 watchdog_policy.pong_timeout(),
                 now.saturating_duration_since(sent_at),
                 None,
+                diagnostics,
             );
             false
         }
@@ -911,6 +1257,7 @@ fn record_liveness_timeout(
     timeout: Duration,
     elapsed: Duration,
     outbound_kind: Option<UpstreamOutboundKind>,
+    diagnostics: &CloseDiagnostics,
 ) {
     let metadata = UpstreamLivenessTimeout {
         cause,
@@ -918,12 +1265,15 @@ fn record_liveness_timeout(
         elapsed,
         outbound_kind,
     };
-    let mut state = terminal_state.lock().expect("terminal state lock");
-    if !matches!(*state, UpstreamTerminalState::Open) {
+    if !commit_terminal(
+        terminal_state,
+        UpstreamTerminalState::LivenessTimeout(metadata.clone()),
+        diagnostics,
+        None,
+        None,
+    ) {
         return;
     }
-    *state = UpstreamTerminalState::LivenessTimeout(metadata.clone());
-    drop(state);
     tracing::warn!(
         cause = ?metadata.cause,
         timeout_ms = metadata.timeout.as_millis() as u64,
@@ -947,6 +1297,7 @@ fn try_enqueue_inbound(
     limits: UpstreamInboundLimits,
     payload: String,
     terminal_state: &Arc<StdMutex<UpstreamTerminalState>>,
+    diagnostics: &CloseDiagnostics,
 ) -> bool {
     let incoming_bytes = payload.len();
     if !payload_fits_inbound_byte_limit(incoming_bytes, limits) {
@@ -959,6 +1310,7 @@ fn try_enqueue_inbound(
                 limits,
                 incoming_bytes,
             ),
+            diagnostics,
         );
         return false;
     }
@@ -979,6 +1331,7 @@ fn try_enqueue_inbound(
     record_inbound_overflow(
         terminal_state,
         inbound_overflow(cause, sender, byte_budget, limits, incoming_bytes),
+        diagnostics,
     );
     false
 }
@@ -1009,13 +1362,17 @@ fn inbound_overflow(
 fn record_inbound_overflow(
     terminal_state: &Arc<StdMutex<UpstreamTerminalState>>,
     overflow: InboundBufferOverflow,
+    diagnostics: &CloseDiagnostics,
 ) {
-    let mut state = terminal_state.lock().expect("terminal state lock");
-    if !matches!(*state, UpstreamTerminalState::Open) {
+    if !commit_terminal(
+        terminal_state,
+        UpstreamTerminalState::InboundBufferOverflow(overflow.clone()),
+        diagnostics,
+        None,
+        None,
+    ) {
         return;
     }
-    *state = UpstreamTerminalState::InboundBufferOverflow(overflow.clone());
-    drop(state);
     tracing::warn!(
         overflow_cause = ?overflow.cause,
         queued_messages = overflow.queued_messages,
@@ -1028,21 +1385,38 @@ fn record_inbound_overflow(
     );
 }
 
-fn record_close(target: &Arc<StdMutex<UpstreamTerminalState>>, metadata: UpstreamCloseMetadata) {
-    let mut state = target.lock().expect("terminal state lock");
-    if matches!(*state, UpstreamTerminalState::Open) {
-        *state = UpstreamTerminalState::Closed(metadata);
-    }
+fn record_close(
+    target: &Arc<StdMutex<UpstreamTerminalState>>,
+    metadata: UpstreamCloseMetadata,
+    source: UpstreamCloseSource,
+    diagnostics: &CloseDiagnostics,
+) {
+    commit_terminal(
+        target,
+        UpstreamTerminalState::Closed(metadata),
+        diagnostics,
+        Some(source),
+        None,
+    );
 }
 
-fn record_error(target: &Arc<StdMutex<UpstreamTerminalState>>, error: String) {
-    record_close(
+fn record_error(
+    target: &Arc<StdMutex<UpstreamTerminalState>>,
+    error: &TungsteniteError,
+    source: UpstreamCloseSource,
+    diagnostics: &CloseDiagnostics,
+) {
+    let safe_error = diagnostics.started_at.map(|_| safe_transport_error(error));
+    commit_terminal(
         target,
-        UpstreamCloseMetadata {
+        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
             code: None,
             reason: None,
-            error: Some(error),
-        },
+            error: Some(error.to_string()),
+        }),
+        diagnostics,
+        Some(source),
+        safe_error,
     );
 }
 
@@ -1052,6 +1426,7 @@ fn record_transport_overflow(
     byte_budget: &Arc<Semaphore>,
     limits: UpstreamInboundLimits,
     error: &TungsteniteError,
+    diagnostics: &CloseDiagnostics,
 ) -> bool {
     let TungsteniteError::Capacity(CapacityError::MessageTooLong { size, .. }) = error else {
         return false;
@@ -1065,6 +1440,7 @@ fn record_transport_overflow(
             limits,
             *size,
         ),
+        diagnostics,
     );
     true
 }
@@ -1099,6 +1475,588 @@ mod tests {
     use tracing_subscriber::layer::Context;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::registry::LookupSpan;
+
+    fn handle_test_inbound(
+        inbound: Option<Result<Message, TungsteniteError>>,
+        state: &Arc<StdMutex<UpstreamTerminalState>>,
+        diagnostics: &CloseDiagnostics,
+    ) -> bool {
+        let limits = UpstreamInboundLimits::DEFAULT;
+        let (inbound_tx, _inbound_rx) = mpsc::channel(limits.max_messages());
+        let byte_budget = Arc::new(Semaphore::new(limits.max_bytes()));
+        let pump_state = PumpState {
+            inbound_tx: &inbound_tx,
+            byte_budget: &byte_budget,
+            limits,
+            terminal_state: state,
+            watchdog_policy: UpstreamWatchdogPolicy::DEFAULT,
+            diagnostics,
+        };
+        handle_inbound_message(inbound, &pump_state, &mut None, &mut false)
+    }
+
+    fn empty_close_metadata() -> UpstreamCloseMetadata {
+        UpstreamCloseMetadata {
+            code: None,
+            reason: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn close_diagnostics_eof_and_fallback_keep_the_first_observed_source() {
+        for (inbound, source) in [
+            (None, "stream_eof"),
+            (Some(Ok(Message::Close(None))), "peer_close_frame"),
+        ] {
+            let diagnostics = CloseDiagnostics::new(true);
+            let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+            assert!(!handle_test_inbound(inbound, &state, &diagnostics));
+            assert!(!handle_test_inbound(None, &state, &diagnostics));
+            record_close(
+                &state,
+                empty_close_metadata(),
+                UpstreamCloseSource::PumpExitFallback,
+                &diagnostics,
+            );
+            assert_eq!(
+                *state.lock().unwrap(),
+                UpstreamTerminalState::Closed(empty_close_metadata())
+            );
+            let capture = diagnostics.capture();
+            assert_eq!(capture.calls, 1);
+            let output = String::from_utf8(capture.bytes.clone()).unwrap();
+            assert!(output.starts_with(&format!("[threadline] websocket closed source={source} code=- reason=- error=- connection_age_ms=")));
+        }
+        let diagnostics = CloseDiagnostics::new(true);
+        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        record_close(
+            &state,
+            empty_close_metadata(),
+            UpstreamCloseSource::PumpExitFallback,
+            &diagnostics,
+        );
+        assert_eq!(
+            *state.lock().unwrap(),
+            UpstreamTerminalState::Closed(empty_close_metadata())
+        );
+        let capture = diagnostics.capture();
+        assert_eq!(capture.calls, 1);
+        assert!(
+            String::from_utf8(capture.bytes.clone())
+                .unwrap()
+                .contains("source=pump_exit_fallback")
+        );
+    }
+
+    #[test]
+    fn close_diagnostics_read_errors_use_typed_fields_and_preserve_original_metadata() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+        for (error, expected) in [
+            (
+                TungsteniteError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "io-secret\r\n\x1b[31mBearer secret",
+                )),
+                "error=io",
+            ),
+            (
+                TungsteniteError::Io(std::io::Error::from_raw_os_error(10054)),
+                "raw_os_error=10054",
+            ),
+            (
+                TungsteniteError::Protocol(ProtocolError::InvalidHeader(
+                    "x-protocol-secret".parse().unwrap(),
+                )),
+                "error=protocol",
+            ),
+        ] {
+            let original = error.to_string();
+            let diagnostics = CloseDiagnostics::new(true);
+            let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+            assert!(!handle_test_inbound(Some(Err(error)), &state, &diagnostics));
+            record_close(
+                &state,
+                empty_close_metadata(),
+                UpstreamCloseSource::PumpExitFallback,
+                &diagnostics,
+            );
+            assert_eq!(
+                *state.lock().unwrap(),
+                UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+                    code: None,
+                    reason: None,
+                    error: Some(original),
+                })
+            );
+            let capture = diagnostics.capture();
+            assert_eq!(capture.calls, 1);
+            let output = String::from_utf8(capture.bytes.clone()).unwrap();
+            assert!(output.contains("source=read_error"));
+            assert!(output.contains(expected));
+            assert!(!output.contains("secret"));
+            assert!(!output.contains(['\r', '\x1b']));
+            assert_eq!(output.lines().count(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_diagnostics_timeout_and_overflow_remain_sticky_and_warn_once() {
+        let events = OverflowLogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        for overflow_first in [false, true] {
+            let diagnostics = CloseDiagnostics::new(true);
+            let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+            let limits = UpstreamInboundLimits::new(1, 4).unwrap();
+            let (sender, _receiver) = mpsc::channel(1);
+            let budget = Arc::new(Semaphore::new(4));
+            let overflow = || {
+                assert!(record_transport_overflow(
+                    &state,
+                    &sender,
+                    &budget,
+                    limits,
+                    &TungsteniteError::Capacity(CapacityError::MessageTooLong {
+                        size: 126,
+                        max_size: 125
+                    }),
+                    &diagnostics
+                ));
+            };
+            let liveness_timeout = || {
+                record_liveness_timeout(
+                    &state,
+                    UpstreamLivenessTimeoutCause::WriteDeadline,
+                    Duration::from_secs(7),
+                    Duration::from_secs(8),
+                    Some(UpstreamOutboundKind::Text),
+                    &diagnostics,
+                );
+            };
+            advance(Duration::from_millis(1500)).await;
+            if overflow_first {
+                overflow();
+            } else {
+                liveness_timeout();
+            }
+            let first = state.lock().unwrap().clone();
+            assert_eq!(
+                matches!(first, UpstreamTerminalState::InboundBufferOverflow(_)),
+                overflow_first
+            );
+            advance(Duration::from_secs(2)).await;
+            overflow();
+            liveness_timeout();
+            record_close(
+                &state,
+                empty_close_metadata(),
+                UpstreamCloseSource::PumpExitFallback,
+                &diagnostics,
+            );
+            assert_eq!(*state.lock().unwrap(), first);
+            let capture = diagnostics.capture();
+            assert_eq!(capture.calls, 1);
+            let output = String::from_utf8(capture.bytes.clone()).unwrap();
+            assert!(output.contains("connection_age_ms=1500"));
+            assert!(!output.contains("source="));
+            if overflow_first {
+                assert!(output.contains("terminal=inbound_buffer_overflow"));
+                assert!(output.contains("cause=transport_size queued_messages=0 queued_bytes=0 incoming_bytes=126 max_messages=1 max_bytes=4"));
+            } else {
+                assert!(output.contains("terminal=liveness_timeout"));
+                assert!(output.contains(
+                    "cause=write_deadline timeout_ms=7000 elapsed_ms=8000 outbound_kind=text"
+                ));
+            }
+        }
+        let events = events.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].get("cause"), Some(&"WriteDeadline".to_string()));
+        assert_eq!(events[0].get("timeout_ms"), Some(&"7000".to_string()));
+        assert_eq!(events[0].get("elapsed_ms"), Some(&"8000".to_string()));
+        assert_eq!(
+            events[0].get("outbound_kind"),
+            Some(&"Some(Text)".to_string())
+        );
+        assert_eq!(
+            events[1].get("overflow_cause"),
+            Some(&"TransportSize".to_string())
+        );
+        assert_eq!(events[1].get("incoming_bytes"), Some(&"126".to_string()));
+        assert_eq!(events[1].get("recoverable"), Some(&"false".to_string()));
+    }
+
+    #[test]
+    fn close_diagnostics_redact_hostile_reasons_frames_and_error_payloads() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let hostile = "Authorization: Bearer frame-secret account-secret session-secret thread-secret response-secret https://secret.invalid prompt-secret tool-secret reasoning-secret\r\n\x1b[31m";
+        for reason in [
+            hostile,
+            "going away ",
+            " normal closure",
+            "",
+            "going away",
+            "normal closure",
+        ] {
+            let diagnostics = CloseDiagnostics::new(true);
+            let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+            for frame in [
+                Message::Text(hostile.to_string()),
+                Message::Binary(hostile.as_bytes().to_vec()),
+                Message::Ping(hostile.as_bytes().to_vec()),
+                Message::Pong(hostile.as_bytes().to_vec()),
+            ] {
+                assert!(handle_test_inbound(Some(Ok(frame)), &state, &diagnostics));
+                assert_eq!(diagnostics.capture().calls, 0);
+            }
+            assert!(!handle_test_inbound(
+                Some(Ok(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Away,
+                    reason: reason.into()
+                })))),
+                &state,
+                &diagnostics
+            ));
+            assert_eq!(
+                *state.lock().unwrap(),
+                UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+                    code: Some(1001),
+                    reason: Some(reason.to_string()),
+                    error: None,
+                })
+            );
+            let capture = diagnostics.capture();
+            assert_eq!(capture.calls, 1);
+            let output = String::from_utf8(capture.bytes.clone()).unwrap();
+            let expected = match reason {
+                "" | "going away" | "normal closure" => reason,
+                _ => "[redacted]",
+            };
+            assert!(output.contains(&format!("reason={expected} error=-")));
+            assert!(!output.contains("secret"));
+            assert!(!output.contains(['\r', '\x1b']));
+            assert_eq!(output.lines().count(), 1);
+        }
+        for frame in [
+            Message::Text(hostile.to_string()),
+            Message::Binary(hostile.as_bytes().to_vec()),
+            Message::Ping(hostile.as_bytes().to_vec()),
+        ] {
+            let diagnostics = CloseDiagnostics::new(true);
+            let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+            let error = TungsteniteError::WriteBufferFull(frame);
+            let original = error.to_string();
+            record_error(
+                &state,
+                &error,
+                UpstreamCloseSource::WriteError,
+                &diagnostics,
+            );
+            record_close(
+                &state,
+                empty_close_metadata(),
+                UpstreamCloseSource::PumpExitFallback,
+                &diagnostics,
+            );
+            assert_eq!(
+                *state.lock().unwrap(),
+                UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+                    code: None,
+                    reason: None,
+                    error: Some(original)
+                })
+            );
+            let capture = diagnostics.capture();
+            assert_eq!(capture.calls, 1);
+            let output = String::from_utf8(capture.bytes.clone()).unwrap();
+            assert!(output.contains("source=write_error"));
+            assert!(output.contains("error=write_buffer_full"));
+            assert!(!output.contains("secret"));
+            assert!(!output.contains(['\r', '\x1b']));
+            assert_eq!(output.lines().count(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_diagnostics_constructor_peer_close_is_independent_of_off_subscriber() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let events = OverflowLogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(events.clone())
+            .with(tracing_subscriber::filter::LevelFilter::OFF);
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        for enabled in [true, false] {
+            let (client_io, server_io) = duplex(1024);
+            let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            let mut pump = LiveUpstreamWebSocket::from_stream_with_close_diagnostics(
+                client,
+                UpstreamWatchdogPolicy::DEFAULT,
+                UpstreamInboundLimits::DEFAULT,
+                enabled,
+            );
+            advance(Duration::from_millis(1234)).await;
+            server
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "going away".into(),
+                })))
+                .await
+                .expect("send peer close");
+            assert_eq!(pump.recv_text().await.expect("ordinary close"), None);
+            (&mut pump.task).await.expect("pump task completes");
+            assert_eq!(
+                pump.terminal_state(),
+                UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+                    code: Some(1001),
+                    reason: Some("going away".to_string()),
+                    error: None,
+                })
+            );
+            let capture = pump.diagnostics.capture();
+            assert_eq!(capture.calls, usize::from(enabled));
+            if enabled {
+                assert_eq!(
+                    String::from_utf8(capture.bytes.clone()).unwrap(),
+                    "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- connection_age_ms=1234 io_kind=- raw_os_error=-\n"
+                );
+            } else {
+                assert!(capture.bytes.is_empty());
+            }
+        }
+        assert!(events.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_diagnostics_constructor_channel_close_records_once_in_both_dispatch_branches() {
+        for prefer_inbound in [false, true] {
+            let (client_io, server_io) = duplex(1024);
+            let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            let mut pump = LiveUpstreamWebSocket::from_stream_with_close_diagnostics(
+                client,
+                UpstreamWatchdogPolicy::DEFAULT,
+                UpstreamInboundLimits::DEFAULT,
+                true,
+            );
+            if prefer_inbound {
+                pump.send_text("dispatch-barrier")
+                    .await
+                    .expect("queue Text");
+                assert_eq!(
+                    server.next().await.unwrap().unwrap(),
+                    Message::Text("dispatch-barrier".to_string())
+                );
+            }
+            let (replacement_tx, replacement_rx) = mpsc::channel(1);
+            drop(replacement_rx);
+            drop(std::mem::replace(&mut pump.outbound_tx, replacement_tx));
+            assert_eq!(
+                timeout(Duration::from_secs(2), pump.recv_text())
+                    .await
+                    .expect("pump releases receiver")
+                    .expect("ordinary close"),
+                None
+            );
+            (&mut pump.task).await.expect("pump task completes");
+            assert_eq!(
+                pump.terminal_state(),
+                UpstreamTerminalState::Closed(outbound_channel_closed_metadata())
+            );
+            let capture = pump.diagnostics.capture();
+            assert_eq!(capture.calls, 1);
+            let output = String::from_utf8(capture.bytes.clone()).unwrap();
+            assert!(output.starts_with("[threadline] websocket closed source=outbound_channel_closed code=- reason=[redacted] error=- connection_age_ms="));
+            assert_eq!(output.lines().count(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_diagnostics_first_commit_freezes_lifetime_and_unlocks_before_writing() {
+        let diagnostics = CloseDiagnostics::new(true);
+        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        diagnostics.capture().terminal_state = Some(Arc::clone(&state));
+        advance(Duration::from_millis(1234)).await;
+        let metadata = UpstreamCloseMetadata {
+            code: Some(1001),
+            reason: Some("going away".to_string()),
+            error: None,
+        };
+        assert!(commit_terminal(
+            &state,
+            UpstreamTerminalState::Closed(metadata.clone()),
+            &diagnostics,
+            Some(UpstreamCloseSource::PeerCloseFrame),
+            None
+        ));
+        advance(Duration::from_secs(10)).await;
+        assert!(!commit_terminal(
+            &state,
+            UpstreamTerminalState::Closed(outbound_channel_closed_metadata()),
+            &diagnostics,
+            Some(UpstreamCloseSource::PumpExitFallback),
+            None
+        ));
+        assert_eq!(
+            *state.lock().unwrap(),
+            UpstreamTerminalState::Closed(metadata)
+        );
+        let capture = diagnostics.capture();
+        assert_eq!(capture.calls, 1);
+        assert_eq!(
+            String::from_utf8(capture.bytes.clone()).unwrap(),
+            "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- connection_age_ms=1234 io_kind=- raw_os_error=-\n"
+        );
+    }
+
+    #[test]
+    fn close_diagnostics_disabled_never_calls_writer_and_preserves_metadata() {
+        let diagnostics = CloseDiagnostics::new(false);
+        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        let metadata = UpstreamCloseMetadata {
+            code: Some(1001),
+            reason: Some("private-reason".to_string()),
+            error: Some("private-error".to_string()),
+        };
+        assert!(commit_terminal(
+            &state,
+            UpstreamTerminalState::Closed(metadata.clone()),
+            &diagnostics,
+            Some(UpstreamCloseSource::ReadError),
+            None
+        ));
+        assert_eq!(
+            *state.lock().unwrap(),
+            UpstreamTerminalState::Closed(metadata)
+        );
+        let capture = diagnostics.capture();
+        assert_eq!(capture.calls, 0);
+        assert!(capture.bytes.is_empty());
+    }
+
+    #[test]
+    fn close_diagnostics_failing_writer_does_not_retry_log_or_change_terminal() {
+        let diagnostics = CloseDiagnostics::new(true);
+        diagnostics.capture().fail = true;
+        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        let capture = OverflowLogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let metadata = UpstreamCloseMetadata {
+            code: None,
+            reason: None,
+            error: None,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(commit_terminal(
+                &state,
+                UpstreamTerminalState::Closed(metadata.clone()),
+                &diagnostics,
+                Some(UpstreamCloseSource::PumpExitFallback),
+                None
+            ));
+            assert!(!commit_terminal(
+                &state,
+                UpstreamTerminalState::Closed(metadata.clone()),
+                &diagnostics,
+                Some(UpstreamCloseSource::StreamEof),
+                None
+            ));
+        });
+        assert_eq!(
+            *state.lock().unwrap(),
+            UpstreamTerminalState::Closed(metadata)
+        );
+        assert!(capture.0.lock().unwrap().is_empty());
+        let writer = diagnostics.capture();
+        assert_eq!(writer.calls, 1);
+        assert!(writer.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_diagnostics_write_failure_uses_send_and_flush_paths_with_pending_reader() {
+        for outbound_kind in [
+            UpstreamOutboundKind::Text,
+            UpstreamOutboundKind::ControlFlush,
+        ] {
+            let (client_io, _server_io) = duplex(1024);
+            let client_io = FlushGateIo {
+                inner: client_io,
+                flush_started: Arc::new(Notify::new()),
+                flush_open: Arc::new(AtomicBool::new(true)),
+                flush_waker: Arc::new(AtomicWaker::new()),
+                fail_on_flush: true,
+            };
+            let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let (mut writer, mut reader) = client.split();
+            {
+                let read = reader.next();
+                pin_mut!(read);
+                assert!(
+                    futures_util::poll!(read).is_pending(),
+                    "read must be pending before the write error"
+                );
+            }
+            let limits = UpstreamInboundLimits::DEFAULT;
+            let (inbound_tx, _inbound_rx) = mpsc::channel(limits.max_messages());
+            let byte_budget = Arc::new(Semaphore::new(limits.max_bytes()));
+            let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+            let diagnostics = CloseDiagnostics::new(true);
+            let pump_state = PumpState {
+                inbound_tx: &inbound_tx,
+                byte_budget: &byte_budget,
+                limits,
+                terminal_state: &state,
+                watchdog_policy: UpstreamWatchdogPolicy::DEFAULT,
+                diagnostics: &diagnostics,
+            };
+            let mut next_ping_due = Instant::now() + UPSTREAM_PING_INTERVAL;
+            assert!(
+                !timeout(
+                    Duration::from_secs(2),
+                    drive_write_operation(
+                        &mut writer,
+                        &mut reader,
+                        &pump_state,
+                        Message::Text("frame-secret".to_string()),
+                        outbound_kind,
+                        PumpLivenessState {
+                            pending_challenge: &mut None,
+                            control_flush_needed: &mut false,
+                            next_ping_due: &mut next_ping_due,
+                            ping_interval: UPSTREAM_PING_INTERVAL,
+                        },
+                    )
+                )
+                .await
+                .expect("write fails without waiting for a deadline")
+            );
+            let first = state.lock().unwrap().clone();
+            assert!(
+                matches!(&first, UpstreamTerminalState::Closed(UpstreamCloseMetadata { code: None, reason: None, error: Some(error) }) if error.contains("write-secret"))
+            );
+            record_close(
+                &state,
+                empty_close_metadata(),
+                UpstreamCloseSource::PumpExitFallback,
+                &diagnostics,
+            );
+            assert_eq!(*state.lock().unwrap(), first);
+            let capture = diagnostics.capture();
+            assert_eq!(capture.calls, 1);
+            let output = String::from_utf8(capture.bytes.clone()).unwrap();
+            assert!(output.contains("source=write_error code=- reason=- error=io"));
+            assert!(output.contains("io_kind=broken_pipe raw_os_error=-"));
+            assert!(!output.contains("secret"));
+            assert!(!output.contains(['\r', '\x1b']));
+            assert_eq!(output.lines().count(), 1);
+        }
+    }
 
     async fn connect_test_pump() -> LiveUpstreamWebSocket {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1177,6 +2135,7 @@ mod tests {
         flush_started: Arc<Notify>,
         flush_open: Arc<AtomicBool>,
         flush_waker: Arc<AtomicWaker>,
+        fail_on_flush: bool,
     }
 
     impl AsyncRead for FlushGateIo {
@@ -1202,6 +2161,12 @@ mod tests {
             mut self: Pin<&mut Self>,
             context: &mut TaskContext<'_>,
         ) -> Poll<std::io::Result<()>> {
+            if self.fail_on_flush {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "write-secret\r\n\x1b[31m",
+                )));
+            }
             self.flush_started.notify_waiters();
             if !self.flush_open.load(Ordering::SeqCst) {
                 self.flush_waker.register(context.waker());
@@ -1689,6 +2654,7 @@ mod tests {
             limits,
             terminal_state: &terminal_state,
             watchdog_policy: policy,
+            diagnostics: &CloseDiagnostics::DISABLED,
         };
         let sent_at = Instant::now();
         let mut challenge = Some(PendingPongChallenge {
@@ -1737,6 +2703,7 @@ mod tests {
             challenge.as_ref(),
             None,
             policy,
+            &CloseDiagnostics::DISABLED,
         ));
         assert!(matches!(
             *terminal_state.lock().expect("terminal state lock"),
@@ -2098,6 +3065,7 @@ mod tests {
             limits,
             terminal_state: &terminal_state,
             watchdog_policy: policy,
+            diagnostics: &CloseDiagnostics::DISABLED,
         };
         let mut challenge = Some(PendingPongChallenge {
             nonce: b"current-challenge".to_vec(),
@@ -2119,6 +3087,7 @@ mod tests {
             challenge.as_ref(),
             None,
             policy,
+            &CloseDiagnostics::DISABLED,
         ));
         assert!(matches!(
             *terminal_state.lock().expect("terminal state lock"),
@@ -2143,6 +3112,7 @@ mod tests {
             limits,
             terminal_state: &terminal_state,
             watchdog_policy: policy,
+            diagnostics: &CloseDiagnostics::DISABLED,
         };
         let mut challenge = Some(PendingPongChallenge {
             nonce: b"current-challenge".to_vec(),
@@ -2180,6 +3150,7 @@ mod tests {
             flush_started: Arc::clone(&flush_started),
             flush_open: Arc::clone(&flush_open),
             flush_waker: Arc::clone(&flush_waker),
+            fail_on_flush: false,
         };
         let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
         let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
@@ -2313,6 +3284,7 @@ mod tests {
                 Duration::from_secs(7),
                 Duration::from_secs(8),
                 Some(UpstreamOutboundKind::Text),
+                &CloseDiagnostics::DISABLED,
             );
             record_liveness_timeout(
                 &terminal_state,
@@ -2320,6 +3292,7 @@ mod tests {
                 Duration::from_secs(1),
                 Duration::from_secs(2),
                 None,
+                &CloseDiagnostics::DISABLED,
             );
         });
 
@@ -2362,6 +3335,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             None,
+            &CloseDiagnostics::DISABLED,
         );
 
         assert!(matches!(
@@ -2408,6 +3382,7 @@ mod tests {
             task: tokio::spawn(std::future::pending()),
             after_text_send: None,
             pending_text_send: None,
+            diagnostics: CloseDiagnostics::DISABLED,
         });
         let (started_tx, started_rx) = oneshot::channel();
         let pending_recv = {
@@ -2433,6 +3408,7 @@ mod tests {
             limits,
             "four".to_string(),
             &terminal_state,
+            &CloseDiagnostics::DISABLED,
         ));
         assert_eq!(budget.available_permits(), 0);
         drop(inbound_tx);
@@ -2455,6 +3431,7 @@ mod tests {
             task: tokio::spawn(std::future::pending()),
             after_text_send: None,
             pending_text_send: None,
+            diagnostics: CloseDiagnostics::DISABLED,
         });
         let (started_tx, started_rx) = oneshot::channel();
         let waiting_send = {
@@ -2498,6 +3475,7 @@ mod tests {
             task: tokio::spawn(std::future::pending()),
             after_text_send: None,
             pending_text_send: None,
+            diagnostics: CloseDiagnostics::DISABLED,
         });
         let (started_tx, started_rx) = oneshot::channel();
         let waiting_send = {
@@ -2515,6 +3493,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             Some(UpstreamOutboundKind::Text),
+            &CloseDiagnostics::DISABLED,
         );
         drop(outbound_rx);
 
@@ -2610,6 +3589,7 @@ mod tests {
             limits,
             "four".to_string(),
             &terminal_state,
+            &CloseDiagnostics::DISABLED,
         ));
         assert_eq!(budget.available_permits(), 0);
 
@@ -2619,6 +3599,7 @@ mod tests {
             limits,
             "next".to_string(),
             &terminal_state,
+            &CloseDiagnostics::DISABLED,
         ));
         assert_eq!(budget.available_permits(), 0);
         assert!(matches!(
@@ -2640,6 +3621,7 @@ mod tests {
             limits,
             "four".to_string(),
             &terminal_state,
+            &CloseDiagnostics::DISABLED,
         ));
         assert_eq!(budget.available_permits(), limits.max_bytes());
         assert!(matches!(
@@ -2679,6 +3661,7 @@ mod tests {
             &budget,
             limits,
             &TungsteniteError::Capacity(CapacityError::TooManyHeaders),
+            &CloseDiagnostics::DISABLED,
         ));
         assert!(matches!(
             *state.lock().expect("terminal state lock"),
@@ -2690,6 +3673,7 @@ mod tests {
             &budget,
             limits,
             &TungsteniteError::WriteBufferFull(Message::Text("queued".to_string())),
+            &CloseDiagnostics::DISABLED,
         ));
         assert!(matches!(
             *state.lock().expect("terminal state lock"),
@@ -2709,6 +3693,7 @@ mod tests {
             limits,
             "four".to_string(),
             &state,
+            &CloseDiagnostics::DISABLED,
         ));
         let overflow_error = TungsteniteError::Capacity(CapacityError::MessageTooLong {
             size: 126,
@@ -2724,6 +3709,7 @@ mod tests {
                 &budget,
                 limits,
                 &overflow_error,
+                &CloseDiagnostics::DISABLED,
             ));
             assert!(record_transport_overflow(
                 &state,
@@ -2731,6 +3717,7 @@ mod tests {
                 &budget,
                 limits,
                 &overflow_error,
+                &CloseDiagnostics::DISABLED,
             ));
         });
 
@@ -2810,6 +3797,7 @@ mod tests {
                 limits,
                 "diagnostic-payload-sentinel".to_string(),
                 &terminal_state,
+                &CloseDiagnostics::DISABLED,
             ));
         });
 
