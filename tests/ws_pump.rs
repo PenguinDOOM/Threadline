@@ -14,10 +14,25 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{connect_async, connect_async_with_config};
 
 async fn connect_pump(server: &ScriptedWebSocketServer) -> LiveUpstreamWebSocket {
+    connect_pump_with_limits(server, UpstreamInboundLimits::DEFAULT).await
+}
+
+async fn connect_pump_with_limits(
+    server: &ScriptedWebSocketServer,
+    limits: UpstreamInboundLimits,
+) -> LiveUpstreamWebSocket {
     let (stream, _) = connect_async(server.url())
         .await
         .expect("connect client websocket");
-    LiveUpstreamWebSocket::from_stream(stream)
+    LiveUpstreamWebSocket::from_stream_with_limits(stream, limits)
+}
+
+async fn transport_pump_fixture(
+    limits: UpstreamInboundLimits,
+) -> (ScriptedWebSocketServer, LiveUpstreamWebSocket) {
+    let server = ScriptedWebSocketServer::start().await;
+    let pump = connect_pump_with_transport_limits(&server, limits).await;
+    (server, pump)
 }
 
 async fn connect_pump_with_transport_limits(
@@ -157,12 +172,8 @@ async fn websocket_pump_keeps_ping_alive_at_exact_bound_then_overflows_on_next_d
 
 #[tokio::test]
 async fn websocket_pump_transport_limits_accept_exact_frames_and_reject_oversized_frames() {
-    let exact_server = ScriptedWebSocketServer::start().await;
-    let exact_pump = connect_pump_with_transport_limits(
-        &exact_server,
-        UpstreamInboundLimits::new(2, 125).expect("valid limits"),
-    )
-    .await;
+    let (exact_server, exact_pump) =
+        transport_pump_fixture(UpstreamInboundLimits::new(2, 125).expect("valid limits")).await;
     exact_server.send_text_frame(&[b'a'; 125]).await;
     assert_eq!(
         exact_pump
@@ -172,12 +183,8 @@ async fn websocket_pump_transport_limits_accept_exact_frames_and_reject_oversize
         Some("a".repeat(125))
     );
 
-    let oversized_server = ScriptedWebSocketServer::start().await;
-    let oversized_pump = connect_pump_with_transport_limits(
-        &oversized_server,
-        UpstreamInboundLimits::new(2, 125).expect("valid limits"),
-    )
-    .await;
+    let (oversized_server, oversized_pump) =
+        transport_pump_fixture(UpstreamInboundLimits::new(2, 125).expect("valid limits")).await;
     oversized_server.send_text_frame(&[b'b'; 126]).await;
 
     wait_for_transport_overflow(&oversized_pump).await;
@@ -270,34 +277,28 @@ async fn websocket_pump_preserves_text_binary_fifo_and_releases_bytes_after_dequ
 #[tokio::test]
 async fn websocket_pump_reports_independent_count_byte_and_lossy_binary_overflows() {
     let count_server = ScriptedWebSocketServer::start().await;
-    let (count_stream, _) = connect_async(count_server.url())
-        .await
-        .expect("connect count client websocket");
-    let count_pump = LiveUpstreamWebSocket::from_stream_with_limits(
-        count_stream,
+    let count_pump = connect_pump_with_limits(
+        &count_server,
         UpstreamInboundLimits::new(1, 16).expect("valid limits"),
-    );
+    )
+    .await;
     count_server.send_text("one").await;
     count_server.send_text("two").await;
 
     let byte_server = ScriptedWebSocketServer::start().await;
-    let (byte_stream, _) = connect_async(byte_server.url())
-        .await
-        .expect("connect byte client websocket");
-    let byte_pump = LiveUpstreamWebSocket::from_stream_with_limits(
-        byte_stream,
+    let byte_pump = connect_pump_with_limits(
+        &byte_server,
         UpstreamInboundLimits::new(2, 2).expect("valid limits"),
-    );
+    )
+    .await;
     byte_server.send_text("abc").await;
 
     let binary_server = ScriptedWebSocketServer::start().await;
-    let (binary_stream, _) = connect_async(binary_server.url())
-        .await
-        .expect("connect binary client websocket");
-    let binary_pump = LiveUpstreamWebSocket::from_stream_with_limits(
-        binary_stream,
+    let binary_pump = connect_pump_with_limits(
+        &binary_server,
         UpstreamInboundLimits::new(2, 2).expect("valid limits"),
-    );
+    )
+    .await;
     binary_server.send_binary(vec![0xFF]).await;
 
     for (pump, expected_cause) in [
