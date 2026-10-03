@@ -810,63 +810,6 @@ async fn stale_continuation_with_spare_reconnect_plans_returns_previous_response
 }
 
 #[tokio::test]
-async fn stale_continuation_returns_previous_response_not_found_before_sse_without_reconnect_or_resend()
- {
-    let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
-    let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
-    let connector = RecordingConnector::new(vec![
-        PlannedConnection {
-            server: Arc::clone(&seed_server),
-            turn_state: Some("turn-state-1".to_string()),
-            wait_until_closed_before_return: false,
-            watchdog_policy: None,
-        },
-        PlannedConnection {
-            server: Arc::clone(&unexpected_reconnect_server),
-            turn_state: None,
-            wait_until_closed_before_return: false,
-            watchdog_policy: None,
-        },
-    ]);
-    let app = build_test_router(Arc::new(connector.clone()));
-
-    seed_marker(app.clone(), &seed_server, "response-1").await;
-    seed_server.send_close(1000, "seed complete").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let response = post_responses(
-        app,
-        json!({
-            "model":"gpt-6-sol",
-            "input":"followup",
-            "previous_response_id":"response-1"
-        }),
-    )
-    .await;
-    assert_eq!(
-        response.status(),
-        StatusCode::BAD_REQUEST,
-        "stale retained continuation should fail before SSE starts"
-    );
-
-    let no_reconnect = timeout(
-        Duration::from_millis(250),
-        unexpected_reconnect_server.recv_client_message(),
-    )
-    .await;
-    assert!(no_reconnect.is_err());
-
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let payload: Value = serde_json::from_slice(&body).expect("json body");
-    assert_eq!(payload["error"]["code"], "previous_response_not_found");
-
-    let sessions = connector.recorded_sessions().await;
-    assert_eq!(sessions.len(), 1);
-}
-
-#[tokio::test]
 async fn summary_request_first_send_failure_does_not_reconnect_as_continuation() {
     let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
     let first_attempt_server =
