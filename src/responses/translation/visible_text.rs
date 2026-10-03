@@ -339,10 +339,10 @@ pub(super) fn record_visible_delta_event(
     record_forwarded_observable_output(
         &mut state.observable_output,
         "response.output_text.delta",
-        &parsed,
+        parsed,
     );
     state.downstream_visible_text_delta_count += 1;
-    trace_diagnostics.response_id = response_id_from_event(&parsed).map(ToString::to_string);
+    trace_diagnostics.response_id = response_id_from_event(parsed).map(ToString::to_string);
     trace_diagnostics.visible_text_delta_count = Some(1);
 
     trace_diagnostics

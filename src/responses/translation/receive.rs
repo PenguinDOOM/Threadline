@@ -38,9 +38,9 @@ pub(super) async fn receive_overflow_terminal(
     state.lease.mark_upstream_terminal().await;
     state.lease.release();
     state.final_done_pending = true;
-    return Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
+    Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
         &failed_payload,
-    )));
+    )))
 }
 
 pub(super) async fn receive_timeout_terminal(
@@ -70,9 +70,9 @@ pub(super) async fn receive_timeout_terminal(
         }
     }
     state.final_done_pending = true;
-    return Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
+    Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
         &failed_payload,
-    )));
+    )))
 }
 
 pub(super) async fn receive_closed_transport(
@@ -81,7 +81,7 @@ pub(super) async fn receive_closed_transport(
     match try_reconnect_or_terminal_error(state).await {
         Ok(Some(reconnected)) => {
             state.upstream = Some(reconnected);
-            return Ok(None);
+            Ok(None)
         }
         Ok(None) => {
             let failed_payload = terminal_failed_payload_from_error(
@@ -98,9 +98,9 @@ pub(super) async fn receive_closed_transport(
             state.lease.finalize_recoverable_turn();
             state.lease.release();
             state.final_done_pending = true;
-            return Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
+            Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
                 &failed_payload,
-            )));
+            )))
         }
         Err(error) => {
             let failed_payload = terminal_failed_payload_from_error(None, None, &error);
@@ -113,9 +113,9 @@ pub(super) async fn receive_closed_transport(
             state.lease.mark_upstream_terminal().await;
             state.lease.release();
             state.final_done_pending = true;
-            return Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
+            Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
                 &failed_payload,
-            )));
+            )))
         }
     }
 }

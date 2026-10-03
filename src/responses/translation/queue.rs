@@ -170,7 +170,7 @@ pub(super) async fn reject_no_observable_output(
     debug!(response_id, event_type, "translation_event_forwarded");
     debug!(response_id, "terminal_response_forwarded");
     debug!(response_id, "final_done_queued");
-    return StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload));
+    StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload))
 }
 
 pub(super) async fn reject_final_completion(
@@ -190,7 +190,7 @@ pub(super) async fn reject_final_completion(
     }
     state.lease.release();
     state.final_done_pending = true;
-    return StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload));
+    StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload))
 }
 
 pub(super) fn accept_final_completion(

@@ -56,7 +56,7 @@ pub(super) async fn parse_upstream_event(
         )));
     }
 
-    let parsed = match serde_json::from_str::<Value>(&next) {
+    let parsed = match serde_json::from_str::<Value>(next) {
         Ok(parsed) => parsed,
         Err(_) => {
             state.upstream = None;
@@ -165,7 +165,7 @@ pub(super) fn handle_failed_event(
     state.final_done_pending = true;
     debug!(event_type, "terminal_response_forwarded");
     debug!(event_type, "final_done_queued");
-    return StreamProgress::Yield(sse_terminal_response_failed_chunk(parsed));
+    StreamProgress::Yield(sse_terminal_response_failed_chunk(parsed))
 }
 
 pub(super) async fn handle_incomplete_event(
@@ -184,7 +184,7 @@ pub(super) async fn handle_incomplete_event(
     state.final_done_pending = true;
     debug!(event_type, "terminal_response_forwarded");
     debug!(event_type, "final_done_queued");
-    return StreamProgress::Yield(sse_terminal_response_incomplete_chunk(parsed));
+    StreamProgress::Yield(sse_terminal_response_incomplete_chunk(parsed))
 }
 
 pub(super) async fn handle_error_event(
@@ -203,7 +203,7 @@ pub(super) async fn handle_error_event(
     }
     state.lease.release();
     state.final_done_pending = true;
-    return StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload));
+    StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload))
 }
 
 pub(super) fn handle_visible_event(
@@ -220,12 +220,12 @@ pub(super) fn handle_visible_event(
         }
         DownstreamTraceDiagnostics::default()
     };
-    record_forwarded_observable_output(&mut state.observable_output, &event_type, &parsed);
+    record_forwarded_observable_output(&mut state.observable_output, event_type, &parsed);
     trace_downstream_sse_event(&downstream_sse_trace_metadata(
         &parsed,
         DownstreamTraceAction::Forwarded,
         Some(&trace_diagnostics),
     ));
     debug!(event_type, "translation_event_forwarded");
-    return StreamProgress::Yield(sse_json_chunk(&event_type, &parsed));
+    StreamProgress::Yield(sse_json_chunk(event_type, &parsed))
 }

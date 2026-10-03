@@ -68,7 +68,7 @@ pub(super) async fn prepare_response_route(
     if state.profile == RouteProfile::Utility {
         maybe_inject_virtual_tool_summarizer_instruction(
             model_alias.upstream_model_id,
-            &routing_diagnostics,
+            routing_diagnostics,
             &mut base_request,
         );
         start_transient_route(

@@ -130,7 +130,7 @@ pub(super) async fn execute_internal_tool_event(
                 "internal_tool_executed"
             );
             trace_suppressed_event(trace_metadata);
-            return StreamProgress::Continue;
+            StreamProgress::Continue
         }
         Err(error) => reject_internal_tool_execution(state, parsed, error).await,
     }
@@ -175,7 +175,7 @@ pub(super) async fn handle_intermediate_completion(
         previous_response_id = state.previous_response_id.as_deref(),
         "internal_tool_followup_sent"
     );
-    return StreamProgress::Continue;
+    StreamProgress::Continue
 }
 
 pub(super) async fn reject_internal_tool_transport(
@@ -199,7 +199,7 @@ pub(super) async fn reject_internal_tool_transport(
     }
     state.lease.release();
     state.final_done_pending = true;
-    return StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload));
+    StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload))
 }
 
 pub(super) async fn reject_internal_tool_execution(
@@ -221,7 +221,7 @@ pub(super) async fn reject_internal_tool_execution(
     state.lease.mark_upstream_terminal().await;
     state.lease.release();
     state.final_done_pending = true;
-    return StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload));
+    StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload))
 }
 
 pub(super) async fn reject_internal_tool_output(
@@ -241,7 +241,7 @@ pub(super) async fn reject_internal_tool_output(
     state.lease.mark_upstream_terminal().await;
     state.lease.release();
     state.final_done_pending = true;
-    return StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload));
+    StreamProgress::Yield(sse_terminal_response_failed_chunk(&failed_payload))
 }
 
 pub(super) async fn send_internal_tool_followup(
@@ -274,7 +274,7 @@ pub(super) async fn send_internal_tool_followup(
     None
 }
 
-pub(super) fn reset_followup_visible_output(state: &mut ResponseStreamState) -> () {
+pub(super) fn reset_followup_visible_output(state: &mut ResponseStreamState) {
     state.downstream_visible_text_sources.clear();
     state.downstream_visible_text_delta_count = 0;
     state.visible_assistant_text.clear();
