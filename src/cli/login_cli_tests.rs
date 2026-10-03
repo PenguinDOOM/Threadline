@@ -34,6 +34,25 @@ fn readme_section_containing(readme: &str, needle: &str) -> Option<String> {
     Some(readme[section_start..section_end].to_string())
 }
 
+fn readme_list_containing(readme: &str, label: &str) -> Option<String> {
+    let label_start = readme.find(label)?;
+    let after_label = readme[label_start..].find('\n')? + label_start + 1;
+    let list_start = readme[after_label..]
+        .split_inclusive('\n')
+        .take_while(|line| line.trim().is_empty())
+        .map(str::len)
+        .sum::<usize>()
+        + after_label;
+    let list_end = readme[list_start..]
+        .split_inclusive('\n')
+        .take_while(|line| line.trim_end_matches('\n').starts_with("- "))
+        .map(str::len)
+        .sum::<usize>()
+        + list_start;
+
+    (list_end > list_start).then(|| readme[list_start..list_end].to_string())
+}
+
 fn login_subcommand(command: &Command) -> &Command {
     command
         .find_subcommand("login")

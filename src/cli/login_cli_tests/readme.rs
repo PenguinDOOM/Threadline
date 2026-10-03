@@ -15,7 +15,7 @@ fn readme_lists_only_supported_model_ids_without_model_configuration() {
 
 fn readme_custom_endpoint_example(readme: &str) -> (String, Value) {
     let custom_endpoint_section =
-        readme_section_containing(&readme, "\"id\": \"threadline-main-gpt-6-sol\"")
+        readme_section_containing(readme, "\"id\": \"threadline-main-gpt-6-sol\"")
             .expect("README should include the VS Code custom endpoint JSON example");
     let custom_endpoint_json = custom_endpoint_section
         .split_once("```json")
@@ -85,9 +85,9 @@ fn endpoint_model_ids<'model>(
 }
 
 fn assert_readme_visible_aliases(readme: &str, custom_endpoint_json: &str) {
-    let supported_aliases_section = readme_section_containing(&readme, "Main profile aliases:")
+    let supported_aliases_section = readme_list_containing(readme, "Main profile aliases:")
         .expect("README should document the supported model alias list");
-    let utility_aliases_section = readme_section_containing(&readme, "Utility profile aliases:")
+    let utility_aliases_section = readme_list_containing(readme, "Utility profile aliases:")
         .expect("README should document the supported Utility model alias list");
     for visible_alias in [
         "threadline-main-gpt-6.1-sol",
@@ -147,12 +147,12 @@ fn assert_readme_utility_model(document: &Value, custom_endpoint_json: &str) {
 
 fn assert_readme_model_policies(readme: &str) {
     let raw_upstream_ids_section = readme_section_containing(
-        &readme,
+        readme,
         "These visible ids are aliases for VS Code selection and routing.",
     )
     .expect("README should explain visible aliases and raw upstream model ids");
     let persistent_reasoning_scope =
-        readme_section_containing(&readme, "Persistent reasoning is opt-in")
+        readme_section_containing(readme, "Persistent reasoning is opt-in")
             .expect("README should document persistent reasoning eligibility");
     for raw_model_id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
         assert!(
@@ -282,7 +282,7 @@ fn assert_readme_configuration_flags(readme: &str) {
 }
 
 fn assert_main_only_reasoning_scope(readme: &str) {
-    let main_utility_scope = readme_section_containing(&readme, "The setting is Main-only.")
+    let main_utility_scope = readme_section_containing(readme, "The setting is Main-only.")
         .expect("README should document persistent reasoning as Main-only");
     assert!(
         main_utility_scope.contains("Utility listener does not receive persistent reasoning"),
@@ -297,7 +297,7 @@ fn assert_main_only_reasoning_scope(readme: &str) {
 
 fn assert_eligible_reasoning_scope(readme: &str) {
     let persistent_reasoning_scope =
-        readme_section_containing(&readme, "Persistent reasoning is opt-in")
+        readme_section_containing(readme, "Persistent reasoning is opt-in")
             .expect("README should document persistent reasoning eligibility");
     assert!(
         persistent_reasoning_scope.contains("reasoning.context=all_turns")
@@ -314,10 +314,10 @@ fn assert_eligible_reasoning_scope(readme: &str) {
 
 fn assert_client_explicit_reasoning_scope(readme: &str) {
     let persistent_reasoning_scope =
-        readme_section_containing(&readme, "Persistent reasoning is opt-in")
+        readme_section_containing(readme, "Persistent reasoning is opt-in")
             .expect("README should document persistent reasoning eligibility");
     let client_explicit_scope = readme_section_containing(
-        &readme,
+        readme,
         "Threadline's server-side setting is independent of VS Code's",
     )
     .expect("README should document client-explicit persistent reasoning");
@@ -354,7 +354,7 @@ fn assert_job_command_policy(readme: &str) {
         readme.contains("exact program names"),
         "README should describe --job-allowed-commands as exact program names"
     );
-    let job_allowed_section = readme_section_containing(&readme, "--job-allowed-commands")
+    let job_allowed_section = readme_section_containing(readme, "--job-allowed-commands")
         .expect("README should describe --job-allowed-commands in one section");
     let normalized_job_allowed_section = job_allowed_section.to_ascii_lowercase();
     assert!(

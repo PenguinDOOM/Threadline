@@ -132,7 +132,7 @@ async fn retained_capacity_evicts_oldest_finished_entry_without_changing_survivo
 }
 
 fn assert_surviving_output(manager: &ThreadlineJobManager, first_id: &str) {
-    let surviving_output = manager.read_output_json(&first_id, 0);
+    let surviving_output = manager.read_output_json(first_id, 0);
     assert_eq!(surviving_output["truncated_before"], 4);
     assert_eq!(surviving_output["next_offset"], 9);
     assert_eq!(

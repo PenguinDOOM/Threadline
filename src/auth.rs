@@ -228,10 +228,10 @@ fn load_upstream_auth_with_store(
     options: &AuthDiscoveryOptions,
     store: &impl CredentialStore,
 ) -> Result<LoadedUpstreamAuth, AuthLoadError> {
-    if let Some(codex_home) = non_empty_path(options.codex_home.as_ref()) {
-        if let Ok(Some(auth)) = load_codex_keyring_auth(store, codex_home) {
-            return Ok(auth);
-        }
+    if let Some(codex_home) = non_empty_path(options.codex_home.as_ref())
+        && let Ok(Some(auth)) = load_codex_keyring_auth(store, codex_home)
+    {
+        return Ok(auth);
     }
 
     for (source, root) in auth_search_roots(options) {
