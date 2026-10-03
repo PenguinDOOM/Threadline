@@ -5,10 +5,12 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+
+#[path = "scripted_ws/startup.rs"]
+mod startup;
 
 type ServerSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
@@ -72,129 +74,21 @@ impl ScriptedWebSocketServer {
             .expect("bind listener");
         let address = listener.local_addr().expect("local addr");
         let url = format!("ws://{address}");
-        let writer = Arc::new(Mutex::new(None));
-        let reader_task = Arc::new(Mutex::new(None));
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let connected = Arc::new(Notify::new());
-        let is_connected = Arc::new(AtomicBool::new(false));
-        let client_disconnected = Arc::new(Notify::new());
-        let is_client_disconnected = Arc::new(AtomicBool::new(false));
-        let reader_stop_requested = Arc::new(AtomicBool::new(false));
-        let reader_stop = Arc::new(Notify::new());
-
-        let accept_writer = Arc::clone(&writer);
-        let accept_reader_task = Arc::clone(&reader_task);
-        let accept_connected = Arc::clone(&connected);
-        let accept_is_connected = Arc::clone(&is_connected);
-        let accept_client_disconnected = Arc::clone(&client_disconnected);
-        let accept_is_client_disconnected = Arc::clone(&is_client_disconnected);
-        let accept_reader_stop_requested = Arc::clone(&reader_stop_requested);
-        let accept_reader_stop = Arc::clone(&reader_stop);
-        let accept_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept client");
-            if matches!(startup_behavior, StartupBehavior::KeepAliveWithNodelay) {
-                stream
-                    .set_nodelay(true)
-                    .expect("set accepted socket NODELAY");
-            }
-            let websocket = accept_async(stream).await.expect("accept websocket");
-
-            if matches!(startup_behavior, StartupBehavior::DisconnectAfterHandshake) {
-                accept_is_connected.store(true, Ordering::SeqCst);
-                accept_connected.notify_waiters();
-                drop(websocket);
-                return;
-            }
-
-            if matches!(startup_behavior, StartupBehavior::KeepAliveWithoutReader) {
-                let (sink, stream) = websocket.split();
-                *accept_writer.lock().await = Some(sink);
-                accept_is_connected.store(true, Ordering::SeqCst);
-                accept_connected.notify_waiters();
-                let reader = tokio::spawn(async move {
-                    let _stream = stream;
-                    std::future::pending::<()>().await;
-                });
-                *accept_reader_task.lock().await = Some(reader);
-                return;
-            }
-
-            let (sink, mut stream) = websocket.split();
-            *accept_writer.lock().await = Some(sink);
-            accept_is_connected.store(true, Ordering::SeqCst);
-            accept_connected.notify_waiters();
-
-            if matches!(
-                startup_behavior,
-                StartupBehavior::KeepAliveAfterFirstClientMessageWithoutReader
-            ) {
-                let reader = tokio::spawn(async move {
-                    if let Some(Ok(message)) = stream.next().await {
-                        let _ = incoming_tx.send(message);
-                    }
-                    std::future::pending::<()>().await;
-                });
-                *accept_reader_task.lock().await = Some(reader);
-                return;
-            }
-
-            if matches!(
-                startup_behavior,
-                StartupBehavior::KeepAliveUntilReaderStopped
-            ) {
-                let reader = tokio::spawn(async move {
-                    loop {
-                        if accept_reader_stop_requested.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        tokio::select! {
-                            _ = accept_reader_stop.notified() => {}
-                            message = stream.next() => match message {
-                                Some(Ok(message)) => {
-                                    if incoming_tx.send(message).is_err() {
-                                        break;
-                                    }
-                                }
-                                Some(Err(_)) | None => break,
-                            }
-                        }
-                    }
-                    accept_is_client_disconnected.store(true, Ordering::SeqCst);
-                    accept_client_disconnected.notify_waiters();
-                });
-                *accept_reader_task.lock().await = Some(reader);
-                return;
-            }
-
-            let reader = tokio::spawn(async move {
-                while let Some(message) = stream.next().await {
-                    match message {
-                        Ok(message) => {
-                            if incoming_tx.send(message).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                accept_is_client_disconnected.store(true, Ordering::SeqCst);
-                accept_client_disconnected.notify_waiters();
-            });
-            *accept_reader_task.lock().await = Some(reader);
-        });
-
+        let (startup, incoming_rx) = startup::StartupState::new();
+        let accept_state = startup.clone();
+        let accept_task = tokio::spawn(accept_state.accept(listener, startup_behavior));
         Self {
             url,
-            writer,
+            writer: startup.writer,
             incoming_rx: Mutex::new(Some(incoming_rx)),
-            connected,
-            is_connected,
-            client_disconnected,
-            is_client_disconnected,
-            reader_stop_requested,
-            reader_stop,
+            connected: startup.connected,
+            is_connected: startup.is_connected,
+            client_disconnected: startup.reader.client_disconnected,
+            is_client_disconnected: startup.reader.is_client_disconnected,
+            reader_stop_requested: startup.reader.reader_stop_requested,
+            reader_stop: startup.reader.reader_stop,
             accept_task,
-            reader_task,
+            reader_task: startup.reader_task,
         }
     }
 

@@ -339,35 +339,7 @@ mod tests {
 
     #[test]
     fn build_response_create_payload_converts_system_input_roles_to_developer() {
-        let payload = build_response_create_payload(json!({
-            "model": "gpt-test",
-            "input": [
-                {
-                    "id": "msg_system_1",
-                    "type": "message",
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Follow project instructions."
-                        }
-                    ],
-                    "custom_field": {
-                        "preserve": true
-                    }
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": "Hello"
-                        }
-                    ]
-                }
-            ]
-        }))
-        .expect("response.create payload");
+        let payload = system_role_payload();
 
         assert_eq!(payload["type"], "response.create");
         assert_eq!(payload["store"], false);
@@ -414,39 +386,7 @@ mod tests {
         assert_eq!(payload["store"], false);
         assert_eq!(payload["input"], non_array_input);
 
-        let mixed_input = json!([
-            "raw text item",
-            17,
-            {
-                "role": 99,
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "numeric roles must stay untouched"
-                    }
-                ]
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "user stays user"
-                    }
-                ],
-                "custom_field": {
-                    "preserve": true
-                }
-            },
-            {
-                "role": "assistant",
-                "content": []
-            },
-            {
-                "role": "developer",
-                "content": []
-            }
-        ]);
+        let mixed_input = mixed_role_input();
         let payload = build_response_create_payload(json!({
             "model": "gpt-test",
             "input": mixed_input.clone()
@@ -489,5 +429,73 @@ mod tests {
         assert_eq!(payload["input"][0]["output"], "done");
         assert!(payload.get("prompt_cache_options").is_none());
         assert!(payload.get("truncation").is_none());
+    }
+
+    fn system_role_payload() -> Value {
+        build_response_create_payload(json!({
+            "model": "gpt-test",
+            "input": [
+                {
+                    "id": "msg_system_1",
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Follow project instructions."
+                        }
+                    ],
+                    "custom_field": {
+                        "preserve": true
+                    }
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Hello"
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("response.create payload")
+    }
+
+    fn mixed_role_input() -> Value {
+        json!([
+            "raw text item",
+            17,
+            {
+                "role": 99,
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "numeric roles must stay untouched"
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "user stays user"
+                    }
+                ],
+                "custom_field": {
+                    "preserve": true
+                }
+            },
+            {
+                "role": "assistant",
+                "content": []
+            },
+            {
+                "role": "developer",
+                "content": []
+            }
+        ])
     }
 }
