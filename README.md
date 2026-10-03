@@ -174,12 +174,14 @@ Use the two-process form when startup isolation or process-by-process debugging 
 These are the visible model ids that Threadline advertises from `/v1/models`.
 
 Main profile aliases:
+
 - `threadline-main-gpt-6.1-sol`
 - `threadline-main-gpt-6-astra`
 - `threadline-main-gpt-6-sol`
 - `threadline-main-gpt-6-luna`
 
 Utility profile aliases:
+
 - `threadline-utility-gpt-6-luna`
 
 Each visible alias is profile-specific and resolves to the corresponding upstream `gpt-*` model id. Main advertises these four aliases; Utility advertises only `threadline-utility-gpt-6-luna`.
@@ -202,41 +204,41 @@ Use distinct visible ids and distinct profile-specific URLs so VS Code can keep 
 
 ```json
 {
-	"chat.customEndpoints": [
-		{
-			"uri": "http://127.0.0.1:8100/v1",
-			"models": [
-				{
-					"id": "threadline-main-gpt-6.1-sol",
-					"name": "Threadline Main GPT-6.1 Sol"
-				},
-				{
-					"id": "threadline-main-gpt-6-astra",
-					"name": "Threadline Main GPT-6 Astra"
-				},
-				{
-					"id": "threadline-main-gpt-6-sol",
-					"name": "Threadline Main GPT-6 Sol"
-				},
-				{
-					"id": "threadline-main-gpt-6-luna",
-					"name": "Threadline Main GPT-6 Luna"
-			}
-			]
-		},
-		{
-			"uri": "http://127.0.0.1:8101/v1",
-			"models": [
-				{
-					"id": "threadline-utility-gpt-6-luna",
-					"name": "Threadline Utility GPT-6 Luna",
-					"supportsReasoningEffort": true
-				}
-			]
-		}
-	],
-	"chat.utilityModel": "customendpoint/threadline-utility-gpt-6-luna",
-	"chat.utilitySmallModel": "customendpoint/threadline-utility-gpt-6-luna"
+  "chat.customEndpoints": [
+    {
+      "uri": "http://127.0.0.1:8100/v1",
+      "models": [
+        {
+          "id": "threadline-main-gpt-6.1-sol",
+          "name": "Threadline Main GPT-6.1 Sol"
+        },
+        {
+          "id": "threadline-main-gpt-6-astra",
+          "name": "Threadline Main GPT-6 Astra"
+        },
+        {
+          "id": "threadline-main-gpt-6-sol",
+          "name": "Threadline Main GPT-6 Sol"
+        },
+        {
+          "id": "threadline-main-gpt-6-luna",
+          "name": "Threadline Main GPT-6 Luna"
+        }
+      ]
+    },
+    {
+      "uri": "http://127.0.0.1:8101/v1",
+      "models": [
+        {
+          "id": "threadline-utility-gpt-6-luna",
+          "name": "Threadline Utility GPT-6 Luna",
+          "supportsReasoningEffort": true
+        }
+      ]
+    }
+  ],
+  "chat.utilityModel": "customendpoint/threadline-utility-gpt-6-luna",
+  "chat.utilitySmallModel": "customendpoint/threadline-utility-gpt-6-luna"
 }
 ```
 

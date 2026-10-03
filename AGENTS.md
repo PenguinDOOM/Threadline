@@ -2,7 +2,7 @@
 
 ## Project
 
-Threadline is a full-Rust bridge between VSCode Copilot BYOK Custom Endpoint requests and the Codex backend WebSocket protocol.
+Threadline is a full-Rust bridge between VSCode Copilot Bring Your Own Key (BYOK) Custom Endpoint requests and the Codex backend WebSocket protocol.
 
 Threadline is informed by lessons from ChatMock experiments, but it must not copy, port, translate, or preserve ChatMock source code, internal names, comments, tests, or implementation structure.
 
@@ -22,7 +22,7 @@ Do not turn Threadline into a general-purpose OpenAI-compatible proxy.
 
 Do not add unrelated providers, historical ChatMock behavior, prompt-file injection, or Python ChatMock behavior unless explicitly requested.
 
-Do not implement `/v1/chat/completions` unless it is needed for VSCode BYOK compatibility. `/v1/responses` is the primary API.
+Do not implement `/v1/chat/completions` unless it is required to meet an actual VSCode BYOK compatibility requirement. `/v1/responses` is the primary API.
 
 ## Rule priority
 
@@ -145,7 +145,7 @@ Threadline internal tools must use the `threadline_*` prefix.
 
 Internal tool calls must never be forwarded downstream to VSCode.
 
-When an upstream response emits a Threadline internal tool call, execute it locally, store the output as pending, wait for the intermediate response to complete, send a follow-up `response.create` with `function_call_output`, continue reading the follow-up response, and forward only the final assistant output downstream.
+When an upstream response emits a Threadline internal tool call, execute it locally and store the output as pending. Wait for the intermediate response to complete. Send a follow-up `response.create` with `function_call_output`. Continue reading the follow-up response. Forward only the final assistant output downstream.
 
 Do not send follow-up tool outputs before the intermediate response completes.
 
