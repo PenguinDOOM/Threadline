@@ -64,6 +64,7 @@ struct PlannedConnection {
 struct RecordingConnector {
     plans: Arc<Mutex<VecDeque<PlannedConnection>>>,
     websockets: Arc<Mutex<Vec<Weak<LiveUpstreamWebSocket>>>>,
+    sessions: Arc<Mutex<Vec<UpstreamSessionDescriptor>>>,
     inbound_limits: UpstreamInboundLimits,
     watchdog_policy: Option<UpstreamWatchdogPolicy>,
 }
@@ -73,6 +74,7 @@ impl RecordingConnector {
         Self {
             plans: Arc::new(Mutex::new(plans.into())),
             websockets: Arc::new(Mutex::new(Vec::new())),
+            sessions: Arc::new(Mutex::new(Vec::new())),
             inbound_limits: UpstreamInboundLimits::DEFAULT,
             watchdog_policy: None,
         }
@@ -111,6 +113,7 @@ impl UpstreamConnector for RecordingConnector {
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
         let plans = Arc::clone(&self.plans);
         let websockets = Arc::clone(&self.websockets);
+        let sessions = Arc::clone(&self.sessions);
         let inbound_limits = self.inbound_limits;
         let watchdog_policy = self.watchdog_policy;
         Box::pin(async move {
@@ -136,6 +139,7 @@ impl UpstreamConnector for RecordingConnector {
                 None => LiveUpstreamWebSocket::from_stream_with_limits(stream, inbound_limits),
             });
             websockets.lock().await.push(Arc::downgrade(&websocket));
+            sessions.lock().await.push(session.clone());
 
             Ok(ConnectedUpstream {
                 websocket,
@@ -3588,6 +3592,7 @@ async fn overflow_after_internal_tool_execution_skips_followup_and_hides_interme
         }],
         UpstreamInboundLimits::new(1, 4096).expect("valid limits"),
     );
+    let connector_observer = connector.clone();
     let app = build_test_router(Arc::new(connector));
 
     let response = post_responses(
@@ -3597,6 +3602,13 @@ async fn overflow_after_internal_tool_execution_skips_followup_and_hides_interme
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("initial request");
+    let upstream = connector_observer
+        .recorded_websockets()
+        .await
+        .into_iter()
+        .next()
+        .and_then(|websocket| websocket.upgrade())
+        .expect("upstream observer");
 
     server
         .send_text(
@@ -3611,19 +3623,24 @@ async fn overflow_after_internal_tool_execution_skips_followup_and_hides_interme
 
     let pending = Arc::new(Notify::new());
     let pending_for_task = Arc::clone(&pending);
+    let resume_body = Arc::new(Notify::new());
+    let resume_body_for_task = Arc::clone(&resume_body);
     let body_task = tokio::spawn(async move {
         let mut body_stream = response.into_body().into_data_stream();
-        let failed = poll_fn(
+        poll_fn(
             |context| match Pin::new(&mut body_stream).poll_next(context) {
-                Poll::Pending => {
-                    pending_for_task.notify_one();
-                    Poll::Pending
-                }
-                Poll::Ready(Some(chunk)) => Poll::Ready(chunk.expect("failed SSE chunk")),
-                Poll::Ready(None) => panic!("expected terminal failure frame"),
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("internal tool events must remain hidden"),
             },
         )
         .await;
+        pending_for_task.notify_one();
+        resume_body_for_task.notified().await;
+        let failed = body_stream
+            .next()
+            .await
+            .expect("terminal failure frame")
+            .expect("failed SSE chunk");
         let done = body_stream
             .next()
             .await
@@ -3632,7 +3649,9 @@ async fn overflow_after_internal_tool_execution_skips_followup_and_hides_interme
         assert!(body_stream.next().await.is_none());
         (failed, done)
     });
-    pending.notified().await;
+    timeout(Duration::from_secs(1), pending.notified())
+        .await
+        .expect("body should wait after internal tool execution");
 
     server
         .send_text_burst(&[
@@ -3643,10 +3662,18 @@ async fn overflow_after_internal_tool_execution_skips_followup_and_hides_interme
     timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
         .await
         .expect("overflow should close the pump before the internal follow-up");
+    assert!(matches!(
+        upstream.terminal_state(),
+        threadline::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_)
+    ));
+    resume_body.notify_one();
 
-    let (failed, done) = body_task.await.expect("body task");
+    let (failed, done) = timeout(Duration::from_secs(1), body_task)
+        .await
+        .expect("overflow body timeout")
+        .expect("body task");
     let failed_text = String::from_utf8(failed.to_vec()).expect("failure utf8");
-    assert!(failed_text.contains("event: response.failed"));
+    assert_eq!(failed_text.matches("event: response.failed").count(), 1);
     assert!(failed_text.contains("upstream_inbound_buffer_overflow"));
     assert!(!failed_text.contains("response-intermediate"));
     assert!(!failed_text.contains("threadline_echo"));
@@ -3717,14 +3744,17 @@ async fn overflow_while_internal_tool_execution_is_pending_skips_followup_and_la
 
 #[tokio::test]
 async fn paused_internal_tool_execution_stays_live_across_matching_pongs_before_followup() {
-    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let server = Arc::new(ScriptedWebSocketServer::start_with_nodelay().await);
+    let pong_timeout = Duration::from_millis(250);
     let connector = RecordingConnector::with_watchdog_policy(
         vec![PlannedConnection {
             server: Arc::clone(&server),
             turn_state: None,
         }],
-        short_watchdog_policy(),
+        UpstreamWatchdogPolicy::new(pong_timeout, Duration::from_secs(1))
+            .expect("valid watchdog policy"),
     );
+    let connector_observer = connector.clone();
     let executor = Arc::new(PausedInternalToolExecutor::new());
     let app = build_test_router_with_internal_tool_executor(
         Arc::new(connector),
@@ -3738,6 +3768,13 @@ async fn paused_internal_tool_execution_stays_live_across_matching_pongs_before_
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("initial request");
+    let upstream = connector_observer
+        .recorded_websockets()
+        .await
+        .into_iter()
+        .next()
+        .and_then(|websocket| websocket.upgrade())
+        .expect("upstream observer");
     server
         .send_text(
             r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
@@ -3757,19 +3794,33 @@ async fn paused_internal_tool_execution_stays_live_across_matching_pongs_before_
         .await;
 
     let liveness_started = Instant::now();
-    for _ in 0..12 {
-        let ping = timeout(Duration::from_secs(1), server.recv_client_message())
-            .await
-            .expect("watchdog ping should arrive")
-            .expect("client should remain connected");
-        let Message::Ping(payload) = ping else {
-            panic!("expected watchdog ping, got {ping:?}");
-        };
-        server.send_pong(payload).await;
-    }
+    let matching_exchanges = timeout(Duration::from_secs(2), async {
+        let mut matching_exchanges = 0;
+        while liveness_started.elapsed() < pong_timeout * 2 {
+            let ping = server.recv_client_message().await.unwrap_or_else(|| {
+                panic!(
+                    "client should remain connected: {:?}",
+                    upstream.terminal_state()
+                )
+            });
+            let Message::Ping(payload) = ping else {
+                panic!("expected watchdog ping, got {ping:?}");
+            };
+            server.send_pong(payload).await;
+            matching_exchanges += 1;
+        }
+        matching_exchanges
+    })
+    .await
+    .expect("matching Pong exchanges must finish within the liveness test bound");
+    assert!(matching_exchanges >= 2);
     assert!(
-        liveness_started.elapsed() >= Duration::from_millis(60),
+        liveness_started.elapsed() >= pong_timeout * 2,
         "matching Pongs must keep the paused tool alive for at least two Pong deadlines"
+    );
+    assert_eq!(
+        upstream.terminal_state(),
+        threadline::ws_pump::UpstreamTerminalState::Open
     );
     assert!(
         !body_task.is_finished(),
@@ -3777,13 +3828,23 @@ async fn paused_internal_tool_execution_stays_live_across_matching_pongs_before_
     );
 
     executor.resume.notify_one();
-    let followup: Value = serde_json::from_str(&message_text(
-        timeout(Duration::from_secs(1), server.recv_client_message())
-            .await
-            .expect("followup request should arrive")
-            .expect("followup request"),
-    ))
-    .expect("followup request json");
+    let followup: Value = timeout(Duration::from_secs(1), async {
+        loop {
+            match server.recv_client_message().await {
+                Some(Message::Ping(payload)) => server.send_pong(payload).await,
+                Some(Message::Text(text)) => {
+                    let request: Value =
+                        serde_json::from_str(&text).expect("followup request json");
+                    assert_eq!(request["type"], "response.create");
+                    assert_eq!(request["previous_response_id"], "response-intermediate");
+                    return request;
+                }
+                message => panic!("expected followup request or Ping, got {message:?}"),
+            }
+        }
+    })
+    .await
+    .expect("followup request should arrive within the receive bound");
     assert_eq!(followup["type"], "response.create");
     assert_eq!(followup["previous_response_id"], "response-intermediate");
     server
@@ -3800,6 +3861,8 @@ async fn paused_internal_tool_execution_stays_live_across_matching_pongs_before_
     assert_eq!(body_text.matches("event: response.completed").count(), 1);
     assert_eq!(body_text.matches("data: [DONE]").count(), 1);
     assert!(!body_text.contains("event: response.failed"));
+    assert!(!body_text.contains("response-intermediate"));
+    assert!(!body_text.contains("threadline_echo"));
     assert!(body_text.contains("final answer"));
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
 
@@ -4171,6 +4234,31 @@ async fn liveness_timeout_after_internal_tool_followup_starts_invalidates_retain
 
 #[tokio::test]
 async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_aliases() {
+    async fn receive_create(
+        server: &ScriptedWebSocketServer,
+        upstream: &LiveUpstreamWebSocket,
+    ) -> Value {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match server.recv_client_message().await {
+                    Some(Message::Ping(payload)) => server.send_pong(payload).await,
+                    Some(Message::Text(text)) => {
+                        let request: Value = serde_json::from_str(&text).expect("request json");
+                        assert_eq!(request["type"], "response.create");
+                        return request;
+                    }
+                    message => panic!(
+                        "expected request or Ping, got {message:?}: {:?}",
+                        upstream.terminal_state()
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("response.create must arrive within the receive bound")
+    }
+
+    let trace_capture = TraceCaptureGuard::begin().await;
     let server = Arc::new(ScriptedWebSocketServer::start_with_stoppable_reader().await);
     let connector = RecordingConnector::with_watchdog_policy(
         vec![PlannedConnection {
@@ -4184,7 +4272,18 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
 
     let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
-    let _ = server.recv_client_message().await.expect("seed request");
+    let websocket = connector_observer
+        .recorded_websockets()
+        .await
+        .into_iter()
+        .next()
+        .expect("seed connection observer");
+    let observed_upstream = websocket.upgrade().expect("live seed upstream");
+    let session_id = connector_observer.sessions.lock().await[0]
+        .session_id
+        .clone();
+    let seed_request = receive_create(&server, &observed_upstream).await;
+    assert!(seed_request.get("previous_response_id").is_none());
     server
         .send_text(
             r#"{"type":"response.completed","response":{"id":"response-accepted","output":[{"id":"msg-seed","type":"message","role":"assistant","content":[{"type":"output_text","text":"seed answer"}]}]}}"#,
@@ -4193,13 +4292,6 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
     let _ = to_bytes(seed.into_body(), usize::MAX)
         .await
         .expect("seed body");
-    let websocket = connector_observer
-        .recorded_websockets()
-        .await
-        .into_iter()
-        .next()
-        .expect("seed connection observer");
-
     let active = post_responses(
         app.clone(),
         json!({
@@ -4210,6 +4302,8 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
     )
     .await;
     assert_eq!(active.status(), StatusCode::OK);
+    let active_request = receive_create(&server, &observed_upstream).await;
+    assert_eq!(active_request["previous_response_id"], "response-accepted");
     let body_task = tokio::spawn(async move {
         to_bytes(active.into_body(), usize::MAX)
             .await
@@ -4224,15 +4318,16 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
         .send_text(r#"{"type":"response.completed","response":{"id":"response-intermediate"}}"#)
         .await;
 
-    let followup: Value = serde_json::from_str(&message_text(
-        timeout(Duration::from_secs(1), server.recv_client_message())
-            .await
-            .expect("followup request should arrive")
-            .expect("followup request"),
-    ))
-    .expect("followup request json");
-    assert_eq!(followup["type"], "response.create");
-    assert_eq!(followup["previous_response_id"], "response-accepted");
+    let followup = receive_create(&server, &observed_upstream).await;
+    assert_eq!(followup["previous_response_id"], "response-intermediate");
+    assert_eq!(
+        followup["input"],
+        json!([{
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "alpha"
+        }])
+    );
 
     server
         .send_text(r#"{"type":"response.created","response":{"id":"response-failed"}}"#)
@@ -4250,23 +4345,29 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
     assert!(body_text.contains("upstream_liveness_timeout"));
     assert!(!body_text.contains("event: response.completed"));
     assert!(!body_text.contains("response-intermediate"));
+    assert!(!body_text.contains("threadline_echo"));
 
-    timeout(Duration::from_secs(1), async {
-        loop {
-            let Some(upstream) = websocket.upgrade() else {
-                return;
-            };
-            if matches!(
-                upstream.terminal_state(),
-                threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(_)
-            ) {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("same upstream should record a liveness timeout");
+    let threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(expired) =
+        observed_upstream.terminal_state()
+    else {
+        panic!("same upstream must record a typed liveness timeout");
+    };
+    assert_eq!(
+        expired.cause,
+        threadline::ws_pump::UpstreamLivenessTimeoutCause::PongDeadline
+    );
+    assert_eq!(expired.timeout, Duration::from_millis(30));
+    assert!(expired.elapsed >= expired.timeout);
+    let logs = trace_capture.logs();
+    assert_eq!(
+        logs.lines()
+            .filter(|line| line.contains("retained_session_released")
+                && line.contains(&format!("session_id={session_id}")))
+            .count(),
+        2,
+        "seed and recoverably finalized continuation must release the retained entry, not delete it"
+    );
+    drop(observed_upstream);
     assert_eq!(connector_observer.recorded_websockets().await.len(), 1);
 
     for marker in [

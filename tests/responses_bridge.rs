@@ -8766,9 +8766,10 @@ async fn utility_overflow_is_transient_and_does_not_retry_the_connection() {
 
 #[tokio::test]
 async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker() {
-    let main_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let main_server = Arc::new(ScriptedWebSocketServer::start_with_nodelay().await);
     let missed_pong_server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
-    let healthy_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let healthy_server = Arc::new(ScriptedWebSocketServer::start_with_nodelay().await);
+    let pong_timeout = Duration::from_millis(250);
     let connector = RecordingConnector::with_watchdog_policy(
         vec![
             PlannedConnection {
@@ -8784,7 +8785,8 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
                 turn_state: None,
             },
         ],
-        short_watchdog_policy(),
+        UpstreamWatchdogPolicy::new(pong_timeout, Duration::from_secs(1))
+            .expect("valid watchdog policy"),
     );
     let app = build_test_router(
         ThreadlineConfig {
@@ -8807,6 +8809,9 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
         .await
         .expect("seed body");
 
+    let main_upstream = connector.recorded_websockets().await[0]
+        .upgrade()
+        .expect("main upstream observer");
     let (main_requests_tx, mut main_requests_rx) = mpsc::unbounded_channel();
     let main_pong_server = Arc::clone(&main_server);
     tokio::spawn(async move {
@@ -8827,6 +8832,20 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
     .await;
     assert_eq!(missed.status(), StatusCode::OK);
     wait_for_liveness_timeout(&connector, 1).await;
+    let threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(expired) =
+        connector.recorded_websockets().await[1]
+            .upgrade()
+            .expect("missed summary upstream")
+            .terminal_state()
+    else {
+        panic!("missed summary Pong must record a typed timeout");
+    };
+    assert_eq!(
+        expired.cause,
+        threadline::ws_pump::UpstreamLivenessTimeoutCause::PongDeadline
+    );
+    assert_eq!(expired.timeout, pong_timeout);
+    assert!(expired.elapsed >= expired.timeout);
     let missed_text = String::from_utf8(
         to_bytes(missed.into_body(), usize::MAX)
             .await
@@ -8846,6 +8865,9 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
     )
     .await;
     assert_eq!(healthy.status(), StatusCode::OK);
+    let healthy_upstream = connector.recorded_websockets().await[2]
+        .upgrade()
+        .expect("healthy summary upstream observer");
     let healthy_request: Value = serde_json::from_str(&message_text(
         healthy_server
             .recv_client_message()
@@ -8855,19 +8877,40 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
     .expect("summary request json");
     assert!(healthy_request.get("previous_response_id").is_none());
     let healthy_liveness_started = Instant::now();
-    for _ in 0..12 {
-        let ping = healthy_server
-            .recv_client_message()
-            .await
-            .expect("summary ping");
-        let Message::Ping(payload) = ping else {
-            panic!("expected watchdog ping, got {ping:?}");
-        };
-        healthy_server.send_pong(payload.to_vec()).await;
-    }
+    let matching_exchanges = timeout(Duration::from_secs(2), async {
+        let mut matching_exchanges = 0;
+        while healthy_liveness_started.elapsed() < pong_timeout * 2 {
+            let ping = healthy_server
+                .recv_client_message()
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "summary must stay connected: {:?}",
+                        healthy_upstream.terminal_state()
+                    )
+                });
+            let Message::Ping(payload) = ping else {
+                panic!("expected watchdog ping, got {ping:?}");
+            };
+            healthy_server.send_pong(payload.to_vec()).await;
+            matching_exchanges += 1;
+        }
+        matching_exchanges
+    })
+    .await
+    .expect("summary matching Pong exchanges must finish within the liveness bound");
+    assert!(matching_exchanges >= 2);
     assert!(
-        healthy_liveness_started.elapsed() >= Duration::from_millis(60),
+        healthy_liveness_started.elapsed() >= pong_timeout * 2,
         "matching Pongs must keep the auxiliary summary alive for at least two Pong deadlines"
+    );
+    assert_eq!(
+        healthy_upstream.terminal_state(),
+        threadline::ws_pump::UpstreamTerminalState::Open
+    );
+    assert_eq!(
+        main_upstream.terminal_state(),
+        threadline::ws_pump::UpstreamTerminalState::Open
     );
     healthy_server
         .send_text(&assistant_text_completed_event("response-summary", "summary").to_string())
@@ -8882,6 +8925,7 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
     assert_eq!(healthy_text.matches("event: response.completed").count(), 1);
     assert_eq!(healthy_text.matches("data: [DONE]").count(), 1);
     assert!(!healthy_text.contains("response.failed"));
+    drop(healthy_upstream);
     wait_for_websocket_release(&connector, 2).await;
 
     let resumed = post_responses(
@@ -8916,7 +8960,8 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
 #[tokio::test]
 async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
     let missed_pong_server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
-    let healthy_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let healthy_server = Arc::new(ScriptedWebSocketServer::start_with_nodelay().await);
+    let pong_timeout = Duration::from_millis(250);
     let connector = RecordingConnector::with_watchdog_policy(
         vec![
             PlannedConnection {
@@ -8928,7 +8973,8 @@ async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
                 turn_state: None,
             },
         ],
-        short_watchdog_policy(),
+        UpstreamWatchdogPolicy::new(pong_timeout, Duration::from_secs(1))
+            .expect("valid watchdog policy"),
     );
     let app = build_test_router(
         ThreadlineConfig {
@@ -8942,6 +8988,20 @@ async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
     let missed = post_responses(app.clone(), json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility missed pong","previous_response_id":"response-main"})).await;
     assert_eq!(missed.status(), StatusCode::OK);
     wait_for_liveness_timeout(&connector, 0).await;
+    let threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(expired) =
+        connector.recorded_websockets().await[0]
+            .upgrade()
+            .expect("missed utility upstream")
+            .terminal_state()
+    else {
+        panic!("missed Utility Pong must record a typed timeout");
+    };
+    assert_eq!(
+        expired.cause,
+        threadline::ws_pump::UpstreamLivenessTimeoutCause::PongDeadline
+    );
+    assert_eq!(expired.timeout, pong_timeout);
+    assert!(expired.elapsed >= expired.timeout);
     let missed_text = String::from_utf8(
         to_bytes(missed.into_body(), usize::MAX)
             .await
@@ -8957,6 +9017,9 @@ async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
 
     let healthy = post_responses(app, json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility healthy","previous_response_id":"response-main"})).await;
     assert_eq!(healthy.status(), StatusCode::OK);
+    let healthy_upstream = connector.recorded_websockets().await[1]
+        .upgrade()
+        .expect("healthy utility upstream observer");
     let healthy_request: Value = serde_json::from_str(&message_text(
         healthy_server
             .recv_client_message()
@@ -8966,19 +9029,36 @@ async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
     .expect("utility request json");
     assert!(healthy_request.get("previous_response_id").is_none());
     let healthy_liveness_started = Instant::now();
-    for _ in 0..12 {
-        let ping = healthy_server
-            .recv_client_message()
-            .await
-            .expect("utility ping");
-        let Message::Ping(payload) = ping else {
-            panic!("expected watchdog ping, got {ping:?}");
-        };
-        healthy_server.send_pong(payload.to_vec()).await;
-    }
+    let matching_exchanges = timeout(Duration::from_secs(2), async {
+        let mut matching_exchanges = 0;
+        while healthy_liveness_started.elapsed() < pong_timeout * 2 {
+            let ping = healthy_server
+                .recv_client_message()
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "utility must stay connected: {:?}",
+                        healthy_upstream.terminal_state()
+                    )
+                });
+            let Message::Ping(payload) = ping else {
+                panic!("expected watchdog ping, got {ping:?}");
+            };
+            healthy_server.send_pong(payload.to_vec()).await;
+            matching_exchanges += 1;
+        }
+        matching_exchanges
+    })
+    .await
+    .expect("utility matching Pong exchanges must finish within the liveness bound");
+    assert!(matching_exchanges >= 2);
     assert!(
-        healthy_liveness_started.elapsed() >= Duration::from_millis(60),
+        healthy_liveness_started.elapsed() >= pong_timeout * 2,
         "matching Pongs must keep the Utility connection alive for at least two Pong deadlines"
+    );
+    assert_eq!(
+        healthy_upstream.terminal_state(),
+        threadline::ws_pump::UpstreamTerminalState::Open
     );
     healthy_server
         .send_text(&assistant_text_completed_event("response-utility", "utility").to_string())
@@ -8993,6 +9073,7 @@ async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
     assert_eq!(healthy_text.matches("event: response.completed").count(), 1);
     assert_eq!(healthy_text.matches("data: [DONE]").count(), 1);
     assert!(!healthy_text.contains("response.failed"));
+    drop(healthy_upstream);
     wait_for_websocket_release(&connector, 1).await;
 
     assert_eq!(connector.recorded_sessions().await.len(), 2);

@@ -18,6 +18,7 @@ type ServerSink = futures_util::stream::SplitSink<
 #[derive(Clone, Copy)]
 enum StartupBehavior {
     KeepAlive,
+    KeepAliveWithNodelay,
     KeepAliveWithoutReader,
     KeepAliveAfterFirstClientMessageWithoutReader,
     KeepAliveUntilReaderStopped,
@@ -42,6 +43,10 @@ pub struct ScriptedWebSocketServer {
 impl ScriptedWebSocketServer {
     pub async fn start() -> Self {
         Self::start_with_behavior(StartupBehavior::KeepAlive).await
+    }
+
+    pub async fn start_with_nodelay() -> Self {
+        Self::start_with_behavior(StartupBehavior::KeepAliveWithNodelay).await
     }
 
     pub async fn start_without_reader() -> Self {
@@ -87,6 +92,11 @@ impl ScriptedWebSocketServer {
         let accept_reader_stop = Arc::clone(&reader_stop);
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept client");
+            if matches!(startup_behavior, StartupBehavior::KeepAliveWithNodelay) {
+                stream
+                    .set_nodelay(true)
+                    .expect("set accepted socket NODELAY");
+            }
             let websocket = accept_async(stream).await.expect("accept websocket");
 
             if matches!(startup_behavior, StartupBehavior::DisconnectAfterHandshake) {
