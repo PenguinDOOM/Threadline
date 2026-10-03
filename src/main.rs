@@ -14,6 +14,9 @@ const UTILITY_PORT_REQUIRES_MAIN_PROFILE_MESSAGE: &str =
     "--utility-port can only be used with the main profile";
 const UTILITY_PORT_MUST_DIFFER_MESSAGE: &str = "--utility-port must differ from --port";
 
+#[cfg(test)]
+mod env_test_support;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -124,58 +127,10 @@ fn init_tracing(config: &ThreadlineConfig) {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::sync::Mutex;
-
     use clap::Parser;
     use threadline::models::RouteProfile;
 
     use super::*;
-
-    static THREADLINE_PROFILE_ENV_LOCK: Mutex<()> = Mutex::new(());
-    static THREADLINE_UTILITY_PORT_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct ProfileEnvGuard {
-        original: Option<OsString>,
-    }
-
-    impl ProfileEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                original: std::env::var_os("THREADLINE_PROFILE"),
-            }
-        }
-    }
-
-    impl Drop for ProfileEnvGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => unsafe { std::env::set_var("THREADLINE_PROFILE", value) },
-                None => unsafe { std::env::remove_var("THREADLINE_PROFILE") },
-            }
-        }
-    }
-
-    struct UtilityPortEnvGuard {
-        original: Option<OsString>,
-    }
-
-    impl UtilityPortEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                original: std::env::var_os("THREADLINE_UTILITY_PORT"),
-            }
-        }
-    }
-
-    impl Drop for UtilityPortEnvGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => unsafe { std::env::set_var("THREADLINE_UTILITY_PORT", value) },
-                None => unsafe { std::env::remove_var("THREADLINE_UTILITY_PORT") },
-            }
-        }
-    }
 
     fn utility_port_restricted_to_main_message() -> &'static str {
         "--utility-port can only be used with the main profile"
@@ -288,27 +243,27 @@ mod tests {
 
     #[test]
     fn split_main_and_utility_configs_rejects_env_derived_utility_profile() {
-        let _profile_lock = THREADLINE_PROFILE_ENV_LOCK
-            .lock()
-            .expect("profile env lock");
-        let _utility_port_lock = THREADLINE_UTILITY_PORT_ENV_LOCK
-            .lock()
-            .expect("utility port env lock");
-        let _profile_guard = ProfileEnvGuard::acquire();
-        let _utility_port_guard = UtilityPortEnvGuard::acquire();
+        env_test_support::run_cases(
+            "tests::split_main_and_utility_configs_rejects_env_derived_utility_profile",
+            &[(
+                "utility",
+                &[
+                    ("THREADLINE_PROFILE", "utility"),
+                    ("THREADLINE_UTILITY_PORT", "8101"),
+                ],
+            )],
+            |_| {
+                let config = ThreadlineCli::parse_from(["threadline"]).server;
+                let utility_port = config.utility_port.expect("utility port from env");
+                let error = split_main_and_utility_configs(config, utility_port)
+                    .expect_err("utility profile from env should be rejected");
 
-        unsafe { std::env::set_var("THREADLINE_PROFILE", "utility") };
-        unsafe { std::env::set_var("THREADLINE_UTILITY_PORT", "8101") };
-
-        let config = ThreadlineCli::parse_from(["threadline"]).server;
-        let utility_port = config.utility_port.expect("utility port from env");
-        let error = split_main_and_utility_configs(config, utility_port)
-            .expect_err("utility profile from env should be rejected");
-
-        assert!(matches!(
-            error,
-            ThreadlineError::InvalidServerConfiguration(message)
-                if message == utility_port_restricted_to_main_message()
-        ));
+                assert!(matches!(
+                    error,
+                    ThreadlineError::InvalidServerConfiguration(message)
+                        if message == utility_port_restricted_to_main_message()
+                ));
+            },
+        );
     }
 }

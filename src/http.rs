@@ -286,7 +286,6 @@ impl crate::responses::UpstreamConnector for DefaultUpstreamConnector {
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderValue, Response, StatusCode};
-    use std::ffi::OsString;
     use std::time::Instant;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -294,9 +293,8 @@ mod tests {
     use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 
     use super::*;
+    use crate::env_test_support::{acknowledge, child_case, run_cases, run_child};
     use crate::responses::DownstreamInteractionType;
-
-    static UPSTREAM_URL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn upstream_websocket_config_sets_message_limit_and_control_frame_floor() {
@@ -367,16 +365,28 @@ mod tests {
 
     #[tokio::test]
     async fn production_connector_times_out_stalled_http_upgrade_without_creating_a_pump() {
-        let _lock = UPSTREAM_URL_ENV_LOCK.lock().await;
+        const NAME: &str = "http::tests::production_connector_times_out_stalled_http_upgrade_without_creating_a_pump";
+        if let Some(case) = child_case(NAME, &["connect"]) {
+            let connector = test_connector(Duration::from_millis(50));
+            let started = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                crate::responses::UpstreamConnector::connect(&connector, test_auth(), None),
+            )
+            .await
+            .expect("connector safety timeout should not fire");
+
+            assert!(matches!(
+                result,
+                Err(ThreadlineError::UpstreamWebSocketConnectTimeout)
+            ));
+            assert!(started.elapsed() >= Duration::from_millis(40));
+            acknowledge(NAME, &case);
+            return;
+        }
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let _guard = UpstreamUrlEnvGuard::acquire();
-        unsafe {
-            std::env::set_var(
-                "THREADLINE_UPSTREAM_URL",
-                format!("ws://{address}/backend-api/codex/responses"),
-            )
-        };
+        let endpoint = format!("ws://{address}/backend-api/codex/responses");
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0; 1024];
@@ -384,20 +394,12 @@ mod tests {
             let mut discard = Vec::new();
             stream.read_to_end(&mut discard).await.unwrap();
         });
-        let connector = test_connector(Duration::from_millis(50));
-        let started = Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            crate::responses::UpstreamConnector::connect(&connector, test_auth(), None),
-        )
+        tokio::task::spawn_blocking(move || {
+            run_child(NAME, "connect", &[("THREADLINE_UPSTREAM_URL", &endpoint)])
+        })
         .await
-        .expect("connector safety timeout should not fire");
-
-        assert!(matches!(
-            result,
-            Err(ThreadlineError::UpstreamWebSocketConnectTimeout)
-        ));
-        assert!(started.elapsed() >= Duration::from_millis(40));
+        .expect("child waiter should join")
+        .expect("connector child should pass");
         tokio::time::timeout(Duration::from_secs(1), peer)
             .await
             .expect("peer cleanup should complete")
@@ -406,47 +408,34 @@ mod tests {
 
     #[tokio::test]
     async fn production_connector_completes_successful_handshake_before_deadline() {
-        let _lock = UPSTREAM_URL_ENV_LOCK.lock().await;
+        const NAME: &str =
+            "http::tests::production_connector_completes_successful_handshake_before_deadline";
+        if let Some(case) = child_case(NAME, &["connect"]) {
+            let connector = test_connector(Duration::from_secs(1));
+            let result =
+                crate::responses::UpstreamConnector::connect(&connector, test_auth(), None).await;
+            assert!(result.is_ok());
+            drop(result);
+            acknowledge(NAME, &case);
+            return;
+        }
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let _guard = UpstreamUrlEnvGuard::acquire();
-        unsafe {
-            std::env::set_var(
-                "THREADLINE_UPSTREAM_URL",
-                format!("ws://{address}/backend-api/codex/responses"),
-            )
-        };
+        let endpoint = format!("ws://{address}/backend-api/codex/responses");
         let peer = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let _websocket = accept_async(stream).await.unwrap();
         });
-        let connector = test_connector(Duration::from_secs(1));
-        let result =
-            crate::responses::UpstreamConnector::connect(&connector, test_auth(), None).await;
-
-        assert!(result.is_ok());
-        drop(result);
-        peer.await.unwrap();
-    }
-
-    struct UpstreamUrlEnvGuard {
-        original: Option<OsString>,
-    }
-
-    impl UpstreamUrlEnvGuard {
-        fn acquire() -> Self {
-            let original = std::env::var_os("THREADLINE_UPSTREAM_URL");
-            Self { original }
-        }
-    }
-
-    impl Drop for UpstreamUrlEnvGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => unsafe { std::env::set_var("THREADLINE_UPSTREAM_URL", value) },
-                None => unsafe { std::env::remove_var("THREADLINE_UPSTREAM_URL") },
-            }
-        }
+        tokio::task::spawn_blocking(move || {
+            run_child(NAME, "connect", &[("THREADLINE_UPSTREAM_URL", &endpoint)])
+        })
+        .await
+        .expect("child waiter should join")
+        .expect("connector child should pass");
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .expect("peer cleanup should complete")
+            .expect("peer task should join");
     }
 
     #[test]
@@ -497,30 +486,35 @@ mod tests {
 
     #[test]
     fn upstream_url_uses_default_when_env_is_unset() {
-        let _lock = UPSTREAM_URL_ENV_LOCK.blocking_lock();
-        let _guard = UpstreamUrlEnvGuard::acquire();
-        unsafe { std::env::remove_var("THREADLINE_UPSTREAM_URL") };
-
-        assert_eq!(
-            DefaultUpstreamConnector::upstream_url(),
-            DEFAULT_UPSTREAM_URL
+        run_cases(
+            "http::tests::upstream_url_uses_default_when_env_is_unset",
+            &[("default", &[])],
+            |_| {
+                assert_eq!(
+                    DefaultUpstreamConnector::upstream_url(),
+                    DEFAULT_UPSTREAM_URL
+                );
+            },
         );
     }
 
     #[test]
     fn upstream_url_prefers_env_override_when_present() {
-        let _lock = UPSTREAM_URL_ENV_LOCK.blocking_lock();
-        let _guard = UpstreamUrlEnvGuard::acquire();
-        unsafe {
-            std::env::set_var(
-                "THREADLINE_UPSTREAM_URL",
-                "wss://example.invalid/backend-api/codex/responses",
-            )
-        };
-
-        assert_eq!(
-            DefaultUpstreamConnector::upstream_url(),
-            "wss://example.invalid/backend-api/codex/responses"
+        run_cases(
+            "http::tests::upstream_url_prefers_env_override_when_present",
+            &[(
+                "override",
+                &[(
+                    "THREADLINE_UPSTREAM_URL",
+                    "wss://example.invalid/backend-api/codex/responses",
+                )],
+            )],
+            |_| {
+                assert_eq!(
+                    DefaultUpstreamConnector::upstream_url(),
+                    "wss://example.invalid/backend-api/codex/responses"
+                );
+            },
         );
     }
 

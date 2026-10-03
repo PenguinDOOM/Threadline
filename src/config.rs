@@ -444,11 +444,10 @@ fn set_active_job_manager_config(config: ThreadlineJobManagerConfig) {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-
     use clap::{Arg, Command, CommandFactory, Parser};
 
     use crate::cli::ThreadlineCli;
+    use crate::env_test_support::run_cases;
     use crate::models::RouteProfile;
 
     use super::{
@@ -456,186 +455,6 @@ mod tests {
         DEFAULT_MAX_RETAINED_JOBS, ThreadlineConfig, UpstreamInboundLimits, UpstreamWatchdogPolicy,
         job_manager_config_from_environment,
     };
-
-    struct ProfileEnvGuard {
-        original: Option<OsString>,
-    }
-
-    impl ProfileEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                original: std::env::var_os("THREADLINE_PROFILE"),
-            }
-        }
-    }
-
-    impl Drop for ProfileEnvGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => unsafe { std::env::set_var("THREADLINE_PROFILE", value) },
-                None => unsafe { std::env::remove_var("THREADLINE_PROFILE") },
-            }
-        }
-    }
-
-    struct PersistentReasoningEnabledEnvGuard {
-        original: Option<OsString>,
-    }
-
-    impl PersistentReasoningEnabledEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                original: std::env::var_os("THREADLINE_PERSISTENT_REASONING_ENABLED"),
-            }
-        }
-    }
-
-    impl Drop for PersistentReasoningEnabledEnvGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => unsafe {
-                    std::env::set_var("THREADLINE_PERSISTENT_REASONING_ENABLED", value)
-                },
-                None => unsafe { std::env::remove_var("THREADLINE_PERSISTENT_REASONING_ENABLED") },
-            }
-        }
-    }
-
-    struct UtilityPortEnvGuard {
-        original: Option<OsString>,
-    }
-
-    impl UtilityPortEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                original: std::env::var_os("THREADLINE_UTILITY_PORT"),
-            }
-        }
-    }
-
-    impl Drop for UtilityPortEnvGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => unsafe { std::env::set_var("THREADLINE_UTILITY_PORT", value) },
-                None => unsafe { std::env::remove_var("THREADLINE_UTILITY_PORT") },
-            }
-        }
-    }
-
-    struct UpstreamInboundLimitsEnvGuard {
-        messages: Option<OsString>,
-        bytes: Option<OsString>,
-    }
-
-    struct JobCapacityEnvGuard {
-        active: Option<OsString>,
-        retained: Option<OsString>,
-    }
-
-    struct RequestBodyLimitEnvGuard {
-        max_request_body_bytes: Option<OsString>,
-    }
-
-    struct UpstreamConnectTimeoutEnvGuard {
-        value: Option<OsString>,
-    }
-
-    struct UpstreamWatchdogTimeoutsEnvGuard {
-        pong: Option<OsString>,
-        write: Option<OsString>,
-    }
-
-    impl UpstreamConnectTimeoutEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                value: std::env::var_os("THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS"),
-            }
-        }
-    }
-
-    impl Drop for UpstreamConnectTimeoutEnvGuard {
-        fn drop(&mut self) {
-            restore_env_var(
-                "THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS",
-                self.value.take(),
-            );
-        }
-    }
-
-    impl UpstreamWatchdogTimeoutsEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                pong: std::env::var_os("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS"),
-                write: std::env::var_os("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS"),
-            }
-        }
-    }
-
-    impl Drop for UpstreamWatchdogTimeoutsEnvGuard {
-        fn drop(&mut self) {
-            restore_env_var("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS", self.pong.take());
-            restore_env_var("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS", self.write.take());
-        }
-    }
-
-    impl JobCapacityEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                active: std::env::var_os("THREADLINE_JOB_MAX_ACTIVE_JOBS"),
-                retained: std::env::var_os("THREADLINE_JOB_MAX_RETAINED_JOBS"),
-            }
-        }
-    }
-
-    impl Drop for JobCapacityEnvGuard {
-        fn drop(&mut self) {
-            restore_env_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", self.active.take());
-            restore_env_var("THREADLINE_JOB_MAX_RETAINED_JOBS", self.retained.take());
-        }
-    }
-
-    impl RequestBodyLimitEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                max_request_body_bytes: std::env::var_os("THREADLINE_MAX_REQUEST_BODY_BYTES"),
-            }
-        }
-    }
-
-    impl Drop for RequestBodyLimitEnvGuard {
-        fn drop(&mut self) {
-            restore_env_var(
-                "THREADLINE_MAX_REQUEST_BODY_BYTES",
-                self.max_request_body_bytes.take(),
-            );
-        }
-    }
-
-    impl UpstreamInboundLimitsEnvGuard {
-        fn acquire() -> Self {
-            Self {
-                messages: std::env::var_os("THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES"),
-                bytes: std::env::var_os("THREADLINE_UPSTREAM_INBOUND_MAX_BYTES"),
-            }
-        }
-    }
-
-    impl Drop for UpstreamInboundLimitsEnvGuard {
-        fn drop(&mut self) {
-            restore_env_var(
-                "THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES",
-                self.messages.take(),
-            );
-            restore_env_var("THREADLINE_UPSTREAM_INBOUND_MAX_BYTES", self.bytes.take());
-        }
-    }
-
-    fn restore_env_var(name: &str, value: Option<OsString>) {
-        match value {
-            Some(value) => unsafe { std::env::set_var(name, value) },
-            None => unsafe { std::env::remove_var(name) },
-        }
-    }
 
     fn arg_by_long_flag<'a>(command: &'a Command, long_flag: &str) -> &'a Arg {
         command
@@ -813,336 +632,416 @@ mod tests {
 
     #[test]
     fn upstream_connect_timeout_cli_overrides_environment() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = UpstreamConnectTimeoutEnvGuard::acquire();
-        unsafe {
-            std::env::set_var("THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS", "17");
-        }
-
-        let from_environment = ThreadlineCli::parse_from(["threadline"]).server;
-        let from_cli =
-            ThreadlineCli::try_parse_from(["threadline", "--upstream-connect-timeout-secs", "23"])
+        run_cases(
+            "config::tests::upstream_connect_timeout_cli_overrides_environment",
+            &[(
+                "override",
+                &[("THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS", "17")],
+            )],
+            |_| {
+                let from_environment = ThreadlineCli::parse_from(["threadline"]).server;
+                let from_cli = ThreadlineCli::try_parse_from([
+                    "threadline",
+                    "--upstream-connect-timeout-secs",
+                    "23",
+                ])
                 .expect("valid CLI override")
                 .server;
 
-        assert_eq!(from_environment.upstream_connect_timeout_secs, 17);
-        assert_eq!(from_cli.upstream_connect_timeout_secs, 23);
+                assert_eq!(from_environment.upstream_connect_timeout_secs, 17);
+                assert_eq!(from_cli.upstream_connect_timeout_secs, 23);
+            },
+        );
     }
 
     #[test]
     fn upstream_watchdog_timeouts_validate_cli_environment_and_policy() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = UpstreamWatchdogTimeoutsEnvGuard::acquire();
-        unsafe {
-            std::env::remove_var("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS");
-            std::env::remove_var("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS");
-        }
+        run_cases(
+            "config::tests::upstream_watchdog_timeouts_validate_cli_environment_and_policy",
+            &[
+                ("default", &[]),
+                (
+                    "override",
+                    &[
+                        ("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS", "17"),
+                        ("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS", "19"),
+                    ],
+                ),
+            ],
+            |case| {
+                if case == "default" {
+                    let defaults = ThreadlineCli::parse_from(["threadline"]).server;
+                    assert_eq!(defaults.upstream_pong_timeout_secs, 60);
+                    assert_eq!(defaults.upstream_write_timeout_secs, 60);
+                    assert_eq!(
+                        defaults.upstream_watchdog_policy(),
+                        Ok(UpstreamWatchdogPolicy::DEFAULT)
+                    );
+                } else {
+                    let from_environment = ThreadlineCli::parse_from(["threadline"]).server;
+                    assert_eq!(from_environment.upstream_pong_timeout_secs, 17);
+                    assert_eq!(from_environment.upstream_write_timeout_secs, 19);
 
-        let defaults = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(defaults.upstream_pong_timeout_secs, 60);
-        assert_eq!(defaults.upstream_write_timeout_secs, 60);
-        assert_eq!(
-            defaults.upstream_watchdog_policy(),
-            Ok(UpstreamWatchdogPolicy::DEFAULT)
-        );
-
-        unsafe {
-            std::env::set_var("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS", "17");
-            std::env::set_var("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS", "19");
-        }
-
-        let from_environment = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(from_environment.upstream_pong_timeout_secs, 17);
-        assert_eq!(from_environment.upstream_write_timeout_secs, 19);
-
-        let from_cli = ThreadlineCli::try_parse_from([
-            "threadline",
-            "--upstream-pong-timeout-secs",
-            "23",
-            "--upstream-write-timeout-secs",
-            "29",
-        ])
-        .expect("valid CLI values")
-        .server;
-        assert_eq!(from_cli.upstream_pong_timeout_secs, 23);
-        assert_eq!(from_cli.upstream_write_timeout_secs, 29);
-        assert_eq!(
-            from_cli.upstream_watchdog_policy().unwrap().pong_timeout(),
-            std::time::Duration::from_secs(23)
-        );
-        assert_eq!(
-            from_cli.upstream_watchdog_policy().unwrap().write_timeout(),
-            std::time::Duration::from_secs(29)
+                    let from_cli = ThreadlineCli::try_parse_from([
+                        "threadline",
+                        "--upstream-pong-timeout-secs",
+                        "23",
+                        "--upstream-write-timeout-secs",
+                        "29",
+                    ])
+                    .expect("valid CLI values")
+                    .server;
+                    assert_eq!(from_cli.upstream_pong_timeout_secs, 23);
+                    assert_eq!(from_cli.upstream_write_timeout_secs, 29);
+                    assert_eq!(
+                        from_cli.upstream_watchdog_policy().unwrap().pong_timeout(),
+                        std::time::Duration::from_secs(23)
+                    );
+                    assert_eq!(
+                        from_cli.upstream_watchdog_policy().unwrap().write_timeout(),
+                        std::time::Duration::from_secs(29)
+                    );
+                }
+            },
         );
     }
 
     #[test]
     fn upstream_watchdog_timeouts_reject_invalid_values_and_accept_boundaries() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = UpstreamWatchdogTimeoutsEnvGuard::acquire();
-        unsafe {
-            std::env::remove_var("THREADLINE_UPSTREAM_PONG_TIMEOUT_SECS");
-            std::env::remove_var("THREADLINE_UPSTREAM_WRITE_TIMEOUT_SECS");
-        }
+        run_cases(
+            "config::tests::upstream_watchdog_timeouts_reject_invalid_values_and_accept_boundaries",
+            &[("default", &[])],
+            |_| {
+                for flag in [
+                    "--upstream-pong-timeout-secs",
+                    "--upstream-write-timeout-secs",
+                ] {
+                    for value in ["0", "3601", "-1", "not-a-number"] {
+                        assert!(
+                            ThreadlineCli::try_parse_from(["threadline", flag, value]).is_err()
+                        );
+                    }
+                    for value in ["1", "3600"] {
+                        assert!(ThreadlineCli::try_parse_from(["threadline", flag, value]).is_ok());
+                    }
+                }
 
-        for flag in [
-            "--upstream-pong-timeout-secs",
-            "--upstream-write-timeout-secs",
-        ] {
-            for value in ["0", "3601", "-1", "not-a-number"] {
-                assert!(ThreadlineCli::try_parse_from(["threadline", flag, value]).is_err());
-            }
-            for value in ["1", "3600"] {
-                assert!(ThreadlineCli::try_parse_from(["threadline", flag, value]).is_ok());
-            }
-        }
+                for config in [
+                    ThreadlineConfig {
+                        upstream_pong_timeout_secs: 0,
+                        ..ThreadlineConfig::default()
+                    },
+                    ThreadlineConfig {
+                        upstream_pong_timeout_secs: 3601,
+                        ..ThreadlineConfig::default()
+                    },
+                    ThreadlineConfig {
+                        upstream_write_timeout_secs: 0,
+                        ..ThreadlineConfig::default()
+                    },
+                    ThreadlineConfig {
+                        upstream_write_timeout_secs: 3601,
+                        ..ThreadlineConfig::default()
+                    },
+                ] {
+                    assert!(config.upstream_watchdog_policy().is_err());
+                }
 
-        for config in [
-            ThreadlineConfig {
-                upstream_pong_timeout_secs: 0,
-                ..ThreadlineConfig::default()
+                assert!(
+                    UpstreamWatchdogPolicy::new(
+                        std::time::Duration::from_millis(1),
+                        std::time::Duration::from_millis(1),
+                    )
+                    .is_ok()
+                );
             },
-            ThreadlineConfig {
-                upstream_pong_timeout_secs: 3601,
-                ..ThreadlineConfig::default()
-            },
-            ThreadlineConfig {
-                upstream_write_timeout_secs: 0,
-                ..ThreadlineConfig::default()
-            },
-            ThreadlineConfig {
-                upstream_write_timeout_secs: 3601,
-                ..ThreadlineConfig::default()
-            },
-        ] {
-            assert!(config.upstream_watchdog_policy().is_err());
-        }
-
-        assert!(
-            UpstreamWatchdogPolicy::new(
-                std::time::Duration::from_millis(1),
-                std::time::Duration::from_millis(1),
-            )
-            .is_ok()
         );
     }
 
     #[test]
     fn upstream_inbound_limits_read_environment_overrides() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = UpstreamInboundLimitsEnvGuard::acquire();
-        unsafe {
-            std::env::set_var("THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES", "7");
-            std::env::set_var("THREADLINE_UPSTREAM_INBOUND_MAX_BYTES", "11");
-        }
-
-        let config = ThreadlineCli::parse_from(["threadline"]).server;
-
-        assert_eq!(config.upstream_inbound_max_messages, 7);
-        assert_eq!(config.upstream_inbound_max_bytes, 11);
+        run_cases(
+            "config::tests::upstream_inbound_limits_read_environment_overrides",
+            &[(
+                "override",
+                &[
+                    ("THREADLINE_UPSTREAM_INBOUND_MAX_MESSAGES", "7"),
+                    ("THREADLINE_UPSTREAM_INBOUND_MAX_BYTES", "11"),
+                ],
+            )],
+            |_| {
+                let config = ThreadlineCli::parse_from(["threadline"]).server;
+                assert_eq!(config.upstream_inbound_max_messages, 7);
+                assert_eq!(config.upstream_inbound_max_bytes, 11);
+            },
+        );
     }
 
     #[test]
     fn request_body_limit_defaults_overrides_and_rejects_invalid_values() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = RequestBodyLimitEnvGuard::acquire();
-        unsafe { std::env::remove_var("THREADLINE_MAX_REQUEST_BODY_BYTES") };
-
-        let default_config = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(
-            ThreadlineConfig::default().max_request_body_bytes,
-            33_554_432
-        );
-        assert_eq!(default_config.max_request_body_bytes, 33_554_432);
-        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 33_554_432);
-
-        unsafe { std::env::set_var("THREADLINE_MAX_REQUEST_BODY_BYTES", "1") };
-        let minimum_environment_config = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(minimum_environment_config.max_request_body_bytes, 1);
-
-        unsafe { std::env::set_var("THREADLINE_MAX_REQUEST_BODY_BYTES", "3") };
-        let environment_config = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(environment_config.max_request_body_bytes, 3);
-
-        let cli_config =
-            ThreadlineCli::try_parse_from(["threadline", "--max-request-body-bytes", "1"])
-                .expect("positive body limit should parse")
-                .server;
-        assert_eq!(cli_config.max_request_body_bytes, 1);
-
-        for invalid in [
-            "0",
-            "-1",
-            "not-a-number",
-            "999999999999999999999999999999999999",
-        ] {
-            assert!(
-                ThreadlineCli::try_parse_from(["threadline", "--max-request-body-bytes", invalid])
-                    .is_err(),
-                "CLI should reject {invalid:?}"
-            );
-            unsafe { std::env::set_var("THREADLINE_MAX_REQUEST_BODY_BYTES", invalid) };
-            assert!(
-                ThreadlineCli::try_parse_from(["threadline"]).is_err(),
-                "environment should reject {invalid:?}"
-            );
-        }
-
         let maximum = usize::MAX.to_string();
-        let maximum_config =
-            ThreadlineCli::try_parse_from(["threadline", "--max-request-body-bytes", &maximum])
-                .expect("usize maximum should parse")
-                .server;
-        assert_eq!(maximum_config.max_request_body_bytes, usize::MAX);
-
-        unsafe { std::env::set_var("THREADLINE_MAX_REQUEST_BODY_BYTES", &maximum) };
-        let maximum_environment_config = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(
-            maximum_environment_config.max_request_body_bytes,
-            usize::MAX
+        run_cases(
+            "config::tests::request_body_limit_defaults_overrides_and_rejects_invalid_values",
+            &[
+                ("default", &[]),
+                ("minimum", &[("THREADLINE_MAX_REQUEST_BODY_BYTES", "1")]),
+                ("override", &[("THREADLINE_MAX_REQUEST_BODY_BYTES", "3")]),
+                ("0", &[("THREADLINE_MAX_REQUEST_BODY_BYTES", "0")]),
+                ("-1", &[("THREADLINE_MAX_REQUEST_BODY_BYTES", "-1")]),
+                (
+                    "not-a-number",
+                    &[("THREADLINE_MAX_REQUEST_BODY_BYTES", "not-a-number")],
+                ),
+                (
+                    "999999999999999999999999999999999999",
+                    &[(
+                        "THREADLINE_MAX_REQUEST_BODY_BYTES",
+                        "999999999999999999999999999999999999",
+                    )],
+                ),
+                (
+                    "maximum",
+                    &[("THREADLINE_MAX_REQUEST_BODY_BYTES", &maximum)],
+                ),
+            ],
+            |case| match case {
+                "default" => {
+                    let default_config = ThreadlineCli::parse_from(["threadline"]).server;
+                    assert_eq!(
+                        ThreadlineConfig::default().max_request_body_bytes,
+                        33_554_432
+                    );
+                    assert_eq!(default_config.max_request_body_bytes, 33_554_432);
+                    assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 33_554_432);
+                }
+                "minimum" => {
+                    let minimum_environment_config =
+                        ThreadlineCli::parse_from(["threadline"]).server;
+                    assert_eq!(minimum_environment_config.max_request_body_bytes, 1);
+                }
+                "override" => {
+                    let environment_config = ThreadlineCli::parse_from(["threadline"]).server;
+                    assert_eq!(environment_config.max_request_body_bytes, 3);
+                    let cli_config = ThreadlineCli::try_parse_from([
+                        "threadline",
+                        "--max-request-body-bytes",
+                        "1",
+                    ])
+                    .expect("positive body limit should parse")
+                    .server;
+                    assert_eq!(cli_config.max_request_body_bytes, 1);
+                }
+                "maximum" => {
+                    let maximum_config = ThreadlineCli::try_parse_from([
+                        "threadline",
+                        "--max-request-body-bytes",
+                        &maximum,
+                    ])
+                    .expect("usize maximum should parse")
+                    .server;
+                    assert_eq!(maximum_config.max_request_body_bytes, usize::MAX);
+                    let maximum_environment_config =
+                        ThreadlineCli::parse_from(["threadline"]).server;
+                    assert_eq!(
+                        maximum_environment_config.max_request_body_bytes,
+                        usize::MAX
+                    );
+                }
+                invalid => {
+                    assert!(
+                        ThreadlineCli::try_parse_from([
+                            "threadline",
+                            "--max-request-body-bytes",
+                            invalid
+                        ])
+                        .is_err(),
+                        "CLI should reject {invalid:?}"
+                    );
+                    assert!(
+                        ThreadlineCli::try_parse_from(["threadline"]).is_err(),
+                        "environment should reject {invalid:?}"
+                    );
+                }
+            },
         );
     }
 
     #[test]
     fn job_capacity_defaults_cli_values_and_zero_are_preserved() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = JobCapacityEnvGuard::acquire();
-        unsafe {
-            std::env::remove_var("THREADLINE_JOB_MAX_ACTIVE_JOBS");
-            std::env::remove_var("THREADLINE_JOB_MAX_RETAINED_JOBS");
-        }
-        let default_config = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(default_config.job_max_active_jobs, 16);
-        assert_eq!(default_config.job_max_retained_jobs, 128);
+        run_cases(
+            "config::tests::job_capacity_defaults_cli_values_and_zero_are_preserved",
+            &[("default", &[])],
+            |_| {
+                let default_config = ThreadlineCli::parse_from(["threadline"]).server;
+                assert_eq!(default_config.job_max_active_jobs, 16);
+                assert_eq!(default_config.job_max_retained_jobs, 128);
 
-        let configured = ThreadlineCli::try_parse_from([
-            "threadline",
-            "--job-max-active-jobs",
-            "0",
-            "--job-max-retained-jobs",
-            "0",
-        ])
-        .expect("capacity values should parse")
-        .server;
-        assert_eq!(configured.job_max_active_jobs, 0);
-        assert_eq!(configured.job_max_retained_jobs, 0);
-        assert_eq!(configured.job_manager_config().max_active_jobs, 0);
-        assert_eq!(configured.job_manager_config().max_retained_jobs, 0);
+                let configured = ThreadlineCli::try_parse_from([
+                    "threadline",
+                    "--job-max-active-jobs",
+                    "0",
+                    "--job-max-retained-jobs",
+                    "0",
+                ])
+                .expect("capacity values should parse")
+                .server;
+                assert_eq!(configured.job_max_active_jobs, 0);
+                assert_eq!(configured.job_max_retained_jobs, 0);
+                assert_eq!(configured.job_manager_config().max_active_jobs, 0);
+                assert_eq!(configured.job_manager_config().max_retained_jobs, 0);
 
-        let small_config = ThreadlineCli::try_parse_from([
-            "threadline",
-            "--job-max-active-jobs",
-            "2",
-            "--job-max-retained-jobs",
-            "3",
-        ])
-        .expect("small capacity values should parse")
-        .server;
-        assert_eq!(small_config.job_max_active_jobs, 2);
-        assert_eq!(small_config.job_max_retained_jobs, 3);
+                let small_config = ThreadlineCli::try_parse_from([
+                    "threadline",
+                    "--job-max-active-jobs",
+                    "2",
+                    "--job-max-retained-jobs",
+                    "3",
+                ])
+                .expect("small capacity values should parse")
+                .server;
+                assert_eq!(small_config.job_max_active_jobs, 2);
+                assert_eq!(small_config.job_max_retained_jobs, 3);
 
-        for flag in ["--job-max-active-jobs", "--job-max-retained-jobs"] {
-            for invalid in ["-1", "not-a-number", "999999999999999999999999999999999999"] {
-                assert!(
-                    ThreadlineCli::try_parse_from(["threadline", flag, invalid,]).is_err(),
-                    "{flag} should reject {invalid:?}"
-                );
-            }
-        }
+                for flag in ["--job-max-active-jobs", "--job-max-retained-jobs"] {
+                    for invalid in ["-1", "not-a-number", "999999999999999999999999999999999999"] {
+                        assert!(
+                            ThreadlineCli::try_parse_from(["threadline", flag, invalid,]).is_err(),
+                            "{flag} should reject {invalid:?}"
+                        );
+                    }
+                }
+            },
+        );
     }
 
     #[test]
     fn job_capacity_cli_overrides_environment_values() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = JobCapacityEnvGuard::acquire();
-        unsafe {
-            std::env::set_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", "0");
-            std::env::set_var("THREADLINE_JOB_MAX_RETAINED_JOBS", "0");
-        }
-
-        let environment_config = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(environment_config.job_max_active_jobs, 0);
-        assert_eq!(environment_config.job_max_retained_jobs, 0);
-
-        unsafe {
-            std::env::set_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", "2");
-            std::env::set_var("THREADLINE_JOB_MAX_RETAINED_JOBS", "3");
-        }
-        let small_environment_config = ThreadlineCli::parse_from(["threadline"]).server;
-        assert_eq!(small_environment_config.job_max_active_jobs, 2);
-        assert_eq!(small_environment_config.job_max_retained_jobs, 3);
-
-        let cli_config = ThreadlineCli::try_parse_from([
-            "threadline",
-            "--job-max-active-jobs",
-            "4",
-            "--job-max-retained-jobs",
-            "1",
-        ])
-        .expect("CLI values should override environment")
-        .server;
-        assert_eq!(cli_config.job_max_active_jobs, 4);
-        assert_eq!(cli_config.job_max_retained_jobs, 1);
-
-        for (name, other_name) in [
+        let values = [
+            ("zero", "0", "0"),
+            ("small", "2", "3"),
+            ("active-negative", "-1", "3"),
+            ("active-invalid", "not-a-number", "3"),
             (
-                "THREADLINE_JOB_MAX_ACTIVE_JOBS",
-                "THREADLINE_JOB_MAX_RETAINED_JOBS",
+                "active-overflow",
+                "999999999999999999999999999999999999",
+                "3",
             ),
+            ("retained-negative", "3", "-1"),
+            ("retained-invalid", "3", "not-a-number"),
             (
-                "THREADLINE_JOB_MAX_RETAINED_JOBS",
-                "THREADLINE_JOB_MAX_ACTIVE_JOBS",
+                "retained-overflow",
+                "3",
+                "999999999999999999999999999999999999",
             ),
-        ] {
-            for invalid in ["-1", "not-a-number", "999999999999999999999999999999999999"] {
-                unsafe {
-                    std::env::set_var(name, invalid);
-                    std::env::set_var(other_name, "3");
+        ];
+        let environments: Vec<_> = values
+            .iter()
+            .map(|(case, active, retained)| {
+                (
+                    *case,
+                    [
+                        ("THREADLINE_JOB_MAX_ACTIVE_JOBS", *active),
+                        ("THREADLINE_JOB_MAX_RETAINED_JOBS", *retained),
+                    ],
+                )
+            })
+            .collect();
+        let cases: Vec<_> = environments
+            .iter()
+            .map(|(case, environment)| (*case, environment.as_slice()))
+            .collect();
+        run_cases(
+            "config::tests::job_capacity_cli_overrides_environment_values",
+            &cases,
+            |case| match case {
+                "zero" => {
+                    let environment_config = ThreadlineCli::parse_from(["threadline"]).server;
+                    assert_eq!(environment_config.job_max_active_jobs, 0);
+                    assert_eq!(environment_config.job_max_retained_jobs, 0);
                 }
-                assert!(
+                "small" => {
+                    let small_environment_config = ThreadlineCli::parse_from(["threadline"]).server;
+                    assert_eq!(small_environment_config.job_max_active_jobs, 2);
+                    assert_eq!(small_environment_config.job_max_retained_jobs, 3);
+                    let cli_config = ThreadlineCli::try_parse_from([
+                        "threadline",
+                        "--job-max-active-jobs",
+                        "4",
+                        "--job-max-retained-jobs",
+                        "1",
+                    ])
+                    .expect("CLI values should override environment")
+                    .server;
+                    assert_eq!(cli_config.job_max_active_jobs, 4);
+                    assert_eq!(cli_config.job_max_retained_jobs, 1);
+                }
+                _ => assert!(
                     ThreadlineCli::try_parse_from(["threadline"]).is_err(),
-                    "{name} should reject {invalid:?} during startup parsing"
-                );
-            }
-        }
+                    "{case} should be rejected during startup parsing"
+                ),
+            },
+        );
     }
 
     #[test]
     fn standalone_job_capacity_environment_helper_preserves_zero_and_falls_back() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = JobCapacityEnvGuard::acquire();
-        unsafe {
-            std::env::set_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", "0");
-            std::env::set_var("THREADLINE_JOB_MAX_RETAINED_JOBS", "0");
-        }
-        let configured = job_manager_config_from_environment();
-        assert_eq!(configured.max_active_jobs, 0);
-        assert_eq!(configured.max_retained_jobs, 0);
-
-        for (active, retained) in [
-            ("invalid", "3"),
-            ("-1", "3"),
-            ("999999999999999999999999999999999999", "3"),
-            ("2", "invalid"),
-            ("2", "-1"),
-            ("2", "999999999999999999999999999999999999"),
-        ] {
-            unsafe {
-                std::env::set_var("THREADLINE_JOB_MAX_ACTIVE_JOBS", active);
-                std::env::set_var("THREADLINE_JOB_MAX_RETAINED_JOBS", retained);
-            }
-            let fallback = job_manager_config_from_environment();
-            assert_eq!(
-                fallback.max_active_jobs,
-                active.parse::<usize>().unwrap_or(DEFAULT_MAX_ACTIVE_JOBS)
-            );
-            assert_eq!(
-                fallback.max_retained_jobs,
-                retained
-                    .parse::<usize>()
-                    .unwrap_or(DEFAULT_MAX_RETAINED_JOBS)
-            );
-        }
+        let values = [
+            ("zero", "0", "0"),
+            ("active-invalid", "invalid", "3"),
+            ("active-negative", "-1", "3"),
+            (
+                "active-overflow",
+                "999999999999999999999999999999999999",
+                "3",
+            ),
+            ("retained-invalid", "2", "invalid"),
+            ("retained-negative", "2", "-1"),
+            (
+                "retained-overflow",
+                "2",
+                "999999999999999999999999999999999999",
+            ),
+        ];
+        let environments: Vec<_> = values
+            .iter()
+            .map(|(case, active, retained)| {
+                (
+                    *case,
+                    [
+                        ("THREADLINE_JOB_MAX_ACTIVE_JOBS", *active),
+                        ("THREADLINE_JOB_MAX_RETAINED_JOBS", *retained),
+                    ],
+                )
+            })
+            .collect();
+        let cases: Vec<_> = environments
+            .iter()
+            .map(|(case, environment)| (*case, environment.as_slice()))
+            .collect();
+        run_cases(
+            "config::tests::standalone_job_capacity_environment_helper_preserves_zero_and_falls_back",
+            &cases,
+            |case| {
+                if case == "zero" {
+                    let configured = job_manager_config_from_environment();
+                    assert_eq!(configured.max_active_jobs, 0);
+                    assert_eq!(configured.max_retained_jobs, 0);
+                    return;
+                }
+                let (_, active, retained) = values.iter().find(|(id, _, _)| *id == case).unwrap();
+                let fallback = job_manager_config_from_environment();
+                assert_eq!(
+                    fallback.max_active_jobs,
+                    active.parse::<usize>().unwrap_or(DEFAULT_MAX_ACTIVE_JOBS)
+                );
+                assert_eq!(
+                    fallback.max_retained_jobs,
+                    retained
+                        .parse::<usize>()
+                        .unwrap_or(DEFAULT_MAX_RETAINED_JOBS)
+                );
+            },
+        );
     }
 
     #[test]
@@ -1210,21 +1109,23 @@ mod tests {
 
     #[test]
     fn profile_defaults_to_main() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = ProfileEnvGuard::acquire();
-        unsafe { std::env::remove_var("THREADLINE_PROFILE") };
+        crate::env_test_support::run_cases(
+            "config::tests::profile_defaults_to_main",
+            &[("default", &[])],
+            |_| {
+                let config = ThreadlineCli::parse_from(["threadline"]).server;
+                let command = ThreadlineCli::command();
+                let argument = arg_by_long_flag(&command, "profile");
+                let default_values: Vec<_> = argument
+                    .get_default_values()
+                    .iter()
+                    .map(|value| value.to_str().expect("utf-8 default value"))
+                    .collect();
 
-        let config = ThreadlineCli::parse_from(["threadline"]).server;
-        let command = ThreadlineCli::command();
-        let argument = arg_by_long_flag(&command, "profile");
-        let default_values: Vec<_> = argument
-            .get_default_values()
-            .iter()
-            .map(|value| value.to_str().expect("utf-8 default value"))
-            .collect();
-
-        assert_eq!(config.profile, RouteProfile::Main);
-        assert_eq!(default_values, vec!["main"]);
+                assert_eq!(config.profile, RouteProfile::Main);
+                assert_eq!(default_values, vec!["main"]);
+            },
+        );
     }
 
     #[test]
@@ -1246,24 +1147,26 @@ mod tests {
 
     #[test]
     fn profile_reads_threadline_profile_env_var() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = ProfileEnvGuard::acquire();
-        unsafe { std::env::set_var("THREADLINE_PROFILE", "utility") };
-
-        let config = ThreadlineCli::parse_from(["threadline"]).server;
-
-        assert_eq!(config.profile, RouteProfile::Utility);
+        crate::env_test_support::run_cases(
+            "config::tests::profile_reads_threadline_profile_env_var",
+            &[("utility", &[("THREADLINE_PROFILE", "utility")])],
+            |_| {
+                let config = ThreadlineCli::parse_from(["threadline"]).server;
+                assert_eq!(config.profile, RouteProfile::Utility);
+            },
+        );
     }
 
     #[test]
     fn persistent_reasoning_enabled_defaults_to_false() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = PersistentReasoningEnabledEnvGuard::acquire();
-        unsafe { std::env::remove_var("THREADLINE_PERSISTENT_REASONING_ENABLED") };
-
-        let config = ThreadlineCli::parse_from(["threadline"]).server;
-
-        assert!(!config.persistent_reasoning_enabled);
+        run_cases(
+            "config::tests::persistent_reasoning_enabled_defaults_to_false",
+            &[("default", &[])],
+            |_| {
+                let config = ThreadlineCli::parse_from(["threadline"]).server;
+                assert!(!config.persistent_reasoning_enabled);
+            },
+        );
     }
 
     #[test]
@@ -1295,17 +1198,27 @@ mod tests {
 
     #[test]
     fn persistent_reasoning_enabled_reads_true_and_false_env_values() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = PersistentReasoningEnabledEnvGuard::acquire();
-
-        unsafe { std::env::set_var("THREADLINE_PERSISTENT_REASONING_ENABLED", "true") };
-        let enabled = ThreadlineCli::parse_from(["threadline"]).server;
-
-        unsafe { std::env::set_var("THREADLINE_PERSISTENT_REASONING_ENABLED", "false") };
-        let disabled = ThreadlineCli::parse_from(["threadline"]).server;
-
-        assert!(enabled.persistent_reasoning_enabled);
-        assert!(!disabled.persistent_reasoning_enabled);
+        run_cases(
+            "config::tests::persistent_reasoning_enabled_reads_true_and_false_env_values",
+            &[
+                (
+                    "true",
+                    &[("THREADLINE_PERSISTENT_REASONING_ENABLED", "true")],
+                ),
+                (
+                    "false",
+                    &[("THREADLINE_PERSISTENT_REASONING_ENABLED", "false")],
+                ),
+            ],
+            |case| {
+                let config = ThreadlineCli::parse_from(["threadline"]).server;
+                if case == "true" {
+                    assert!(config.persistent_reasoning_enabled);
+                } else {
+                    assert!(!config.persistent_reasoning_enabled);
+                }
+            },
+        );
     }
 
     #[test]
@@ -1327,12 +1240,13 @@ mod tests {
 
     #[test]
     fn utility_port_reads_threadline_utility_port_env_var() {
-        let _env_lock = super::THREADLINE_ENV_LOCK.lock().expect("environment lock");
-        let _guard = UtilityPortEnvGuard::acquire();
-        unsafe { std::env::set_var("THREADLINE_UTILITY_PORT", "8101") };
-
-        let config = ThreadlineCli::parse_from(["threadline"]).server;
-
-        assert_eq!(config.utility_port, Some(8101));
+        run_cases(
+            "config::tests::utility_port_reads_threadline_utility_port_env_var",
+            &[("override", &[("THREADLINE_UTILITY_PORT", "8101")])],
+            |_| {
+                let config = ThreadlineCli::parse_from(["threadline"]).server;
+                assert_eq!(config.utility_port, Some(8101));
+            },
+        );
     }
 }
