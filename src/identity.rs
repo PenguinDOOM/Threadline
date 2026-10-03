@@ -59,6 +59,7 @@ fn load_or_create_installation_id_at(state_dir: &Path) -> io::Result<String> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)?;
     file.lock()?;
 

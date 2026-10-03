@@ -1603,6 +1603,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn close_diagnostics_timeout_and_overflow_remain_sticky_and_warn_once() {
+        let _no_subscriber_dispatch =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let events = OverflowLogCapture::default();
         let subscriber = tracing_subscriber::registry().with(events.clone());
         let _subscriber = tracing::subscriber::set_default(subscriber);
