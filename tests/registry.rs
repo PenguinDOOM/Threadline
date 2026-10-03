@@ -223,17 +223,7 @@ async fn idle_liveness_timeout_preserves_completed_aliases_and_returns_stale_mar
     lease.record_completed_marker("response-1-alias").await;
     lease.release();
 
-    timeout(Duration::from_secs(1), async {
-        while matches!(websocket.terminal_state(), UpstreamTerminalState::Open) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("idle watchdog timeout");
-    assert!(matches!(
-        websocket.terminal_state(),
-        UpstreamTerminalState::LivenessTimeout(_)
-    ));
+    wait_for_idle_liveness_timeout(&websocket).await;
 
     for marker in ["response-1", "response-1-alias", "response-1"] {
         assert_eq!(
@@ -253,4 +243,18 @@ async fn idle_liveness_timeout_preserves_completed_aliases_and_returns_stale_mar
         replacement.session().session_id,
         original_session.session_id
     );
+}
+
+async fn wait_for_idle_liveness_timeout(websocket: &LiveUpstreamWebSocket) {
+    timeout(Duration::from_secs(1), async {
+        while matches!(websocket.terminal_state(), UpstreamTerminalState::Open) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle watchdog timeout");
+    assert!(matches!(
+        websocket.terminal_state(),
+        UpstreamTerminalState::LivenessTimeout(_)
+    ));
 }

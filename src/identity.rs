@@ -63,20 +63,29 @@ fn load_or_create_installation_id_at(state_dir: &Path) -> io::Result<String> {
         .open(path)?;
     file.lock()?;
 
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    if let Ok(existing) = Uuid::parse_str(contents.trim()) {
-        return Ok(existing.to_string());
+    if let Some(existing) = read_installation_id(&mut file)? {
+        return Ok(existing);
     }
 
     let installation_id = Uuid::new_v4().to_string();
+    persist_installation_id(&mut file, &installation_id)?;
+    Ok(installation_id)
+}
+
+fn read_installation_id(file: &mut fs::File) -> io::Result<Option<String>> {
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(Uuid::parse_str(contents.trim())
+        .ok()
+        .map(|id| id.to_string()))
+}
+
+fn persist_installation_id(file: &mut fs::File, installation_id: &str) -> io::Result<()> {
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(installation_id.as_bytes())?;
     file.flush()?;
-    file.sync_all()?;
-
-    Ok(installation_id)
+    file.sync_all()
 }
 
 #[cfg(test)]

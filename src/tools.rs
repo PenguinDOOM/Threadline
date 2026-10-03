@@ -208,7 +208,17 @@ fn value_contains_internal_tool_name(value: &Value) -> bool {
 
 fn internal_tool_definitions() -> Vec<Value> {
     vec![
-        json!({
+        echo_tool_definition(),
+        start_job_tool_definition(),
+        poll_job_tool_definition(),
+        read_job_output_tool_definition(),
+        get_job_result_tool_definition(),
+        cancel_job_tool_definition(),
+    ]
+}
+
+fn echo_tool_definition() -> Value {
+    json!({
             "type": "function",
             "name": ECHO_TOOL_NAME,
             "description": "Return the provided value so Threadline can satisfy local tool loops without involving downstream clients.",
@@ -222,8 +232,11 @@ fn internal_tool_definitions() -> Vec<Value> {
                 "required": ["value"],
                 "additionalProperties": false
             }
-        }),
-        json!({
+    })
+}
+
+fn start_job_tool_definition() -> Value {
+    json!({
             "type": "function",
             "name": START_JOB_TOOL_NAME,
             "description": "Start a background Threadline job for an allowed local command, return immediately with a job id, and avoid busy-polling when independent work is still available.",
@@ -239,8 +252,11 @@ fn internal_tool_definitions() -> Vec<Value> {
                 "required": ["command"],
                 "additionalProperties": false
             }
-        }),
-        json!({
+    })
+}
+
+fn poll_job_tool_definition() -> Value {
+    json!({
             "type": "function",
             "name": POLL_JOB_TOOL_NAME,
             "description": "Check a previously started Threadline job at a natural checkpoint for status updates, not in a tight loop.",
@@ -252,8 +268,11 @@ fn internal_tool_definitions() -> Vec<Value> {
                 "required": ["job_id"],
                 "additionalProperties": false
             }
-        }),
-        json!({
+    })
+}
+
+fn read_job_output_tool_definition() -> Value {
+    json!({
             "type": "function",
             "name": READ_JOB_OUTPUT_TOOL_NAME,
             "description": "Read incremental output from a Threadline job using a previous output offset; preserve next_offset for the next read and notice truncated_before if older buffered output was dropped.",
@@ -266,8 +285,11 @@ fn internal_tool_definitions() -> Vec<Value> {
                 "required": ["job_id"],
                 "additionalProperties": false
             }
-        }),
-        json!({
+    })
+}
+
+fn get_job_result_tool_definition() -> Value {
+    json!({
             "type": "function",
             "name": GET_JOB_RESULT_TOOL_NAME,
             "description": "Get the current or terminal result payload for a Threadline job after a terminal poll state or before final claims that depend on success or failure.",
@@ -279,8 +301,11 @@ fn internal_tool_definitions() -> Vec<Value> {
                 "required": ["job_id"],
                 "additionalProperties": false
             }
-        }),
-        json!({
+    })
+}
+
+fn cancel_job_tool_definition() -> Value {
+    json!({
             "type": "function",
             "name": CANCEL_JOB_TOOL_NAME,
             "description": "Cancel a stuck or no-longer-useful Threadline job, then poll or get the result to confirm the terminal state.",
@@ -292,8 +317,7 @@ fn internal_tool_definitions() -> Vec<Value> {
                 "required": ["job_id"],
                 "additionalProperties": false
             }
-        }),
-    ]
+    })
 }
 
 fn global_job_manager() -> ThreadlineJobManager {

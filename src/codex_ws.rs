@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
-    http::{HeaderValue, Request},
+    http::{HeaderMap, HeaderValue, Request},
 };
 use uuid::Uuid;
 
@@ -127,7 +127,22 @@ fn build_handshake_request_with_installation_id(
         .into_client_request()
         .map_err(|_| HandshakeBuildError::RequestBuildFailed)?;
     let headers = request.headers_mut();
+    insert_client_headers(headers, auth, codex_client_version, installation_id)?;
+    insert_session_headers(headers, &session, &client_request_id)?;
 
+    Ok(CodexHandshake {
+        request,
+        session,
+        client_request_id,
+    })
+}
+
+fn insert_client_headers(
+    headers: &mut HeaderMap,
+    auth: &LoadedUpstreamAuth,
+    codex_client_version: &str,
+    installation_id: &str,
+) -> Result<(), HandshakeBuildError> {
     headers.insert(
         "authorization",
         header_value(&format!("Bearer {}", auth.bearer_token))?,
@@ -146,20 +161,23 @@ fn build_handshake_request_with_installation_id(
     );
     headers.insert("version", header_value(codex_client_version)?);
     headers.insert(INSTALLATION_ID_HEADER, header_value(installation_id)?);
+    Ok(())
+}
+
+fn insert_session_headers(
+    headers: &mut HeaderMap,
+    session: &UpstreamSessionDescriptor,
+    client_request_id: &str,
+) -> Result<(), HandshakeBuildError> {
     headers.insert("session-id", header_value(&session.session_id)?);
     headers.insert("thread-id", header_value(&session.thread_id)?);
     headers.insert("x-codex-window-id", header_value(&session.window_id)?);
-    headers.insert("x-client-request-id", header_value(&client_request_id)?);
+    headers.insert("x-client-request-id", header_value(client_request_id)?);
 
     if let Some(turn_state) = &session.turn_state {
         headers.insert("x-codex-turn-state", header_value(turn_state)?);
     }
-
-    Ok(CodexHandshake {
-        request,
-        session,
-        client_request_id,
-    })
+    Ok(())
 }
 
 fn header_value(value: &str) -> Result<HeaderValue, HandshakeBuildError> {
