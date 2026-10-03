@@ -23,7 +23,7 @@ mod virtual_tools;
 
 use self::downstream::{
     DownstreamRequestClassification, looks_like_auxiliary_summary_conflict_fallback,
-    parse_downstream_request_with_metadata, wants_reasoning_all_turns,
+    parse_downstream_request_with_metadata,
 };
 use self::translation::{ResponseStreamLease, ResponseStreamState, response_stream};
 use self::upstream::send_response_create;
@@ -88,9 +88,6 @@ pub(crate) async fn responses_handler(
         state.persistent_reasoning_enabled,
         model_alias,
     );
-    if wants_reasoning_all_turns(&request.payload) && !model_alias.supports_reasoning_all_turns {
-        return Err(ThreadlineError::UnsupportedReasoningContext);
-    }
     request.payload.insert(
         "model".to_string(),
         Value::String(model_alias.upstream_model_id.to_string()),
@@ -434,7 +431,7 @@ fn normalize_persistent_reasoning_context(
     persistent_reasoning_enabled: bool,
     model_alias: &ModelAlias,
 ) -> bool {
-    if !persistent_reasoning_enabled || !model_alias.persistent_reasoning_eligible {
+    if !persistent_reasoning_enabled || model_alias.profile != RouteProfile::Main {
         return false;
     }
 
@@ -845,7 +842,7 @@ mod tests {
 
     fn persistent_reasoning_alias() -> &'static ModelAlias {
         resolve_request_model_for_profile(
-            json!({ "model": "threadline-main-gpt-5.6-terra" })
+            json!({ "model": "threadline-main-gpt-6-sol" })
                 .as_object()
                 .expect("model payload"),
             RouteProfile::Main,
@@ -853,20 +850,20 @@ mod tests {
         .expect("persistent reasoning alias")
     }
 
-    fn ineligible_reasoning_alias() -> &'static ModelAlias {
+    fn utility_reasoning_alias() -> &'static ModelAlias {
         resolve_request_model_for_profile(
-            json!({ "model": "threadline-main-gpt-5.5" })
+            json!({ "model": "threadline-utility-gpt-6-luna" })
                 .as_object()
                 .expect("model payload"),
-            RouteProfile::Main,
+            RouteProfile::Utility,
         )
-        .expect("ineligible reasoning alias")
+        .expect("utility reasoning alias")
     }
 
     #[test]
     fn prompt_cache_key_exposes_vscode_conversation_as_thread_identity() {
         let payload = json!({
-            "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-5.6-sol"
+            "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol"
         });
 
         assert_eq!(
@@ -880,7 +877,7 @@ mod tests {
     fn invalid_prompt_cache_key_does_not_supply_thread_identity() {
         for payload in [
             json!({}),
-            json!({ "prompt_cache_key": "not-a-uuid:gpt-5.6-sol" }),
+            json!({ "prompt_cache_key": "not-a-uuid:gpt-6-sol" }),
             json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22" }),
             json!({ "prompt_cache_key": 12 }),
         ] {
@@ -945,10 +942,11 @@ mod tests {
     }
 
     #[test]
-    fn persistent_reasoning_normalization_is_noop_when_disabled_or_ineligible_or_non_object() {
+    fn persistent_reasoning_normalization_is_noop_when_disabled_for_main_or_utility_and_non_object()
+    {
         for (enabled, alias, mut payload) in [
             (false, persistent_reasoning_alias(), json!({})),
-            (true, ineligible_reasoning_alias(), json!({})),
+            (true, utility_reasoning_alias(), json!({})),
             (
                 true,
                 persistent_reasoning_alias(),
@@ -1011,7 +1009,7 @@ mod tests {
         let response = match responses_handler(
             State(state),
             Json(json!({
-                "model": "gpt-5.4",
+                "model": "gpt-6-sol",
                 "input": "continue",
                 "previous_response_id": "response-accepted"
             })),

@@ -170,7 +170,7 @@ mod login_cli_tests {
         let _env_lock = THREADLINE_ENV_LOCK.lock().expect("environment lock");
         let removed_flag = removed_model_flag();
 
-        ThreadlineCli::try_parse_from(["threadline", removed_flag.as_str(), "gpt-5.4"])
+        ThreadlineCli::try_parse_from(["threadline", removed_flag.as_str(), "gpt-6-sol"])
             .expect_err("removed model-id flag should not parse");
     }
 
@@ -202,23 +202,16 @@ mod login_cli_tests {
         let utility_aliases_section =
             readme_section_containing(&readme, "Utility profile aliases:")
                 .expect("README should document the supported Utility model alias list");
-        let gpt_5_6_support = readme_section_containing(
-            &readme,
-            "The GPT-5.6 Sol, Terra, and Luna models remain supported for live upstream use.",
-        )
-        .expect("README should document GPT-5.6 live upstream support");
         let raw_upstream_ids_section = readme_section_containing(
             &readme,
             "These visible ids are aliases for VS Code selection and routing.",
         )
         .expect("README should explain visible aliases and raw upstream model ids");
-        let persistent_reasoning_scope = readme_section_containing(
-            &readme,
-            "The previous experimental unconditional injection is now default-off.",
-        )
-        .expect("README should document persistent reasoning eligibility");
+        let persistent_reasoning_scope =
+            readme_section_containing(&readme, "Persistent reasoning is opt-in")
+                .expect("README should document persistent reasoning eligibility");
         let custom_endpoint_section =
-            readme_section_containing(&readme, "\"id\": \"threadline-main-gpt-5.6-sol\"")
+            readme_section_containing(&readme, "\"id\": \"threadline-main-gpt-6-sol\"")
                 .expect("README should include the VS Code custom endpoint JSON example");
         let custom_endpoint_json = custom_endpoint_section
             .split_once("```json")
@@ -227,6 +220,57 @@ mod login_cli_tests {
             .expect("README custom endpoint example should be a fenced JSON block");
         let custom_endpoint_document: Value = serde_json::from_str(custom_endpoint_json)
             .expect("README custom endpoint example should contain valid JSON");
+        let custom_endpoints = custom_endpoint_document
+            .get("chat.customEndpoints")
+            .and_then(Value::as_array)
+            .expect("README should define custom endpoints as a JSON array");
+        assert_eq!(custom_endpoints.len(), 2);
+
+        let main_endpoint = &custom_endpoints[0];
+        assert_eq!(
+            main_endpoint.get("uri").and_then(Value::as_str),
+            Some("http://127.0.0.1:8100/v1")
+        );
+        let main_model_ids = main_endpoint
+            .get("models")
+            .and_then(Value::as_array)
+            .expect("README Main endpoint should define models as a JSON array")
+            .iter()
+            .map(|model| {
+                model
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .expect("README Main endpoint models should have string ids")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            main_model_ids,
+            [
+                "threadline-main-gpt-6.1-sol",
+                "threadline-main-gpt-6-astra",
+                "threadline-main-gpt-6-sol",
+                "threadline-main-gpt-6-luna",
+            ]
+        );
+
+        let utility_endpoint = &custom_endpoints[1];
+        assert_eq!(
+            utility_endpoint.get("uri").and_then(Value::as_str),
+            Some("http://127.0.0.1:8101/v1")
+        );
+        let utility_model_ids = utility_endpoint
+            .get("models")
+            .and_then(Value::as_array)
+            .expect("README Utility endpoint should define models as a JSON array")
+            .iter()
+            .map(|model| {
+                model
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .expect("README Utility endpoint models should have string ids")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(utility_model_ids, ["threadline-utility-gpt-6-luna"]);
 
         assert!(!readme.contains(&removed_flag));
         assert!(!readme.contains(&removed_env_var));
@@ -236,9 +280,6 @@ mod login_cli_tests {
             "threadline-main-gpt-6-astra",
             "threadline-main-gpt-6-sol",
             "threadline-main-gpt-6-luna",
-            "threadline-main-gpt-5.6-sol",
-            "threadline-main-gpt-5.6-terra",
-            "threadline-main-gpt-5.6-luna",
         ] {
             assert!(
                 supported_aliases_section.contains(visible_alias),
@@ -251,31 +292,21 @@ mod login_cli_tests {
         }
 
         assert!(
-            utility_aliases_section.contains("threadline-utility-gpt-5.6-luna"),
+            utility_aliases_section.contains("threadline-utility-gpt-6-luna"),
             "README should list the Utility Luna alias in the Utility aliases section"
         );
-        let utility_endpoint = custom_endpoint_document
-            .get("chat.customEndpoints")
-            .and_then(Value::as_array)
-            .and_then(|endpoints| {
-                endpoints.iter().find(|endpoint| {
-                    endpoint.get("uri").and_then(Value::as_str) == Some("http://127.0.0.1:8101/v1")
-                })
-            })
-            .expect("README should include the Utility custom endpoint");
         let utility_luna_model = utility_endpoint
             .get("models")
             .and_then(Value::as_array)
             .and_then(|models| {
                 models.iter().find(|model| {
-                    model.get("id").and_then(Value::as_str)
-                        == Some("threadline-utility-gpt-5.6-luna")
+                    model.get("id").and_then(Value::as_str) == Some("threadline-utility-gpt-6-luna")
                 })
             })
             .expect("README should include the Utility Luna model");
         assert_eq!(
             utility_luna_model.get("name").and_then(Value::as_str),
-            Some("Threadline Utility GPT-5.6 Luna")
+            Some("Threadline Utility GPT-6 Luna")
         );
         assert_eq!(
             utility_luna_model
@@ -285,26 +316,18 @@ mod login_cli_tests {
         );
         assert!(
             custom_endpoint_json.contains(
-                "\"chat.utilityModel\": \"customendpoint/threadline-utility-gpt-5.4-mini\""
+                "\"chat.utilityModel\": \"customendpoint/threadline-utility-gpt-6-luna\""
             ),
-            "README should keep the default Utility model selector on GPT-5.4 Mini"
+            "README should keep the default Utility model selector on GPT-6 Luna"
         );
         assert!(
             custom_endpoint_json.contains(
-                "\"chat.utilitySmallModel\": \"customendpoint/threadline-utility-gpt-5.4-mini\""
+                "\"chat.utilitySmallModel\": \"customendpoint/threadline-utility-gpt-6-luna\""
             ),
-            "README should keep the small Utility model selector on GPT-5.4 Mini"
+            "README should keep the small Utility model selector on GPT-6 Luna"
         );
 
-        for raw_model_id in [
-            "gpt-6.1-sol",
-            "gpt-6-astra",
-            "gpt-6-sol",
-            "gpt-6-luna",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-        ] {
+        for raw_model_id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
             assert!(
                 raw_upstream_ids_section.contains(raw_model_id),
                 "README should explain raw upstream id {raw_model_id} in the upstream-id section"
@@ -316,38 +339,36 @@ mod login_cli_tests {
                 .contains("These visible ids are aliases for VS Code selection and routing."),
             "README should distinguish visible aliases from raw upstream ids"
         );
-        for eligible_model_name in [
-            "GPT-6.1 Sol",
-            "GPT-6 Astra, Sol, and Luna",
-            "GPT-5.6 Sol, Terra, and Luna",
-        ] {
+        for eligible_model_name in ["GPT-6.1 Sol", "GPT-6 Astra, Sol, and Luna"] {
             assert!(
                 persistent_reasoning_scope.contains(eligible_model_name),
                 "README should describe persistent reasoning eligibility for {eligible_model_name}"
             );
         }
-        assert!(
-            gpt_5_6_support.contains("Threadline covers advertisement, validation, `model`-field rewriting, and the existing reasoning policy for those ids."),
-            "README should describe the supported GPT-5.6 coverage"
-        );
-        assert!(
-            gpt_5_6_support.contains("supported for live upstream use"),
-            "README should state that GPT-5.6 models support live upstream use"
-        );
-
-        for raw_model_id in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+        for retired_model_id in [
+            "gpt-5.3-codex-spark",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "threadline-main-gpt-5.4",
+            "threadline-main-gpt-5.5",
+            "threadline-main-gpt-5.6-sol",
+            "threadline-main-gpt-5.6-terra",
+            "threadline-main-gpt-5.6-luna",
+            "threadline-utility-gpt-5.4-mini",
+            "threadline-utility-gpt-5.6-luna",
+            "threadline-utility-gpt-5.3-codex-spark",
+        ] {
             assert!(
-                raw_upstream_ids_section.contains(raw_model_id),
-                "README should list supported raw model id {raw_model_id} in the upstream-id section"
+                !readme.contains(retired_model_id),
+                "README must not advertise or describe retired model id {retired_model_id}"
             );
         }
-
-        for all_turns_raw_model_id in ["gpt-5.5", "gpt-5.4"] {
-            assert!(
-                persistent_reasoning_scope.contains(all_turns_raw_model_id),
-                "README should keep raw compatibility id {all_turns_raw_model_id} in the reasoning policy"
-            );
-        }
+        assert!(persistent_reasoning_scope.contains("Main"));
+        assert!(persistent_reasoning_scope.contains("Utility"));
     }
 
     #[test]
@@ -430,21 +451,15 @@ mod login_cli_tests {
             "README should document the standalone Utility effective value"
         );
 
-        let persistent_reasoning_scope = readme_section_containing(
-            &readme,
-            "The previous experimental unconditional injection is now default-off.",
-        )
-        .expect("README should document persistent reasoning eligibility");
+        let persistent_reasoning_scope =
+            readme_section_containing(&readme, "Persistent reasoning is opt-in")
+                .expect("README should document persistent reasoning eligibility");
         assert!(
             persistent_reasoning_scope.contains("reasoning.context=all_turns")
                 && persistent_reasoning_scope.contains("eligible Main requests using"),
             "README should describe persistent reasoning as eligible Main-only injection"
         );
-        for advertised_main_model_name in [
-            "GPT-6.1 Sol",
-            "GPT-6 Astra, Sol, and Luna",
-            "GPT-5.6 Sol, Terra, and Luna",
-        ] {
+        for advertised_main_model_name in ["GPT-6.1 Sol", "GPT-6 Astra, Sol, and Luna"] {
             assert!(
                 persistent_reasoning_scope.contains(advertised_main_model_name),
                 "README should identify {advertised_main_model_name} as eligible"
@@ -456,17 +471,15 @@ mod login_cli_tests {
         )
         .expect("README should document client-explicit persistent reasoning");
         assert!(
-            client_explicit_scope.contains("eligible GPT-6 and GPT-5.6 Main aliases and raw compatibility ids support that client-explicit value")
+            client_explicit_scope
+                .contains("Main aliases and raw ids support that client-explicit value")
                 && client_explicit_scope.contains("also eligible for server-side injection"),
             "README should document explicit and automatic persistent reasoning for eligible Main ids"
         );
         assert!(
-            persistent_reasoning_scope.contains("raw compatibility ids `gpt-5.5` and `gpt-5.4`")
-                && persistent_reasoning_scope.contains("are not automatically eligible")
-                && client_explicit_scope.contains("remain excluded from automatic injection")
-                && client_explicit_scope
-                    .contains("continue to reject client-explicit `reasoning.context=all_turns`"),
-            "README should retain the GPT-5.5 and GPT-5.4 raw compatibility caveats"
+            client_explicit_scope
+                .contains("preserve client-explicit `reasoning.context=all_turns`"),
+            "README should preserve client-explicit all_turns"
         );
         assert!(
             persistent_reasoning_scope.contains("Utility requests are not automatically eligible"),

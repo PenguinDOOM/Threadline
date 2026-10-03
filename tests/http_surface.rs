@@ -96,60 +96,47 @@ impl UpstreamAuthProvider for AvailableAuthProvider {
     }
 }
 
-const NEW_MAIN_VISIBLE_MODEL_IDS: [&str; 7] = [
+const CURRENT_MAIN_VISIBLE_MODEL_IDS: [&str; 4] = [
     "threadline-main-gpt-6.1-sol",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
-    "threadline-main-gpt-5.6-sol",
-    "threadline-main-gpt-5.6-terra",
-    "threadline-main-gpt-5.6-luna",
 ];
 
-const NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS: [&str; 6] = [
-    "gpt-6.1-sol",
-    "gpt-6-sol",
-    "gpt-6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-];
+const CURRENT_MAIN_RAW_MODEL_IDS: [&str; 4] =
+    ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
 
 const ASTRA_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-6-astra", "gpt-6-astra"];
 
-const ADVERTISED_MAIN_MODEL_IDS: [&str; 9] = [
+const ADVERTISED_MAIN_MODEL_IDS: [&str; 4] = [
     "threadline-main-gpt-6.1-sol",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
-    "threadline-main-gpt-5.6-sol",
-    "threadline-main-gpt-5.6-terra",
-    "threadline-main-gpt-5.6-luna",
-    "threadline-main-gpt-5.5",
-    "threadline-main-gpt-5.4",
 ];
 
-const ADVERTISED_UTILITY_MODEL_IDS: [&str; 4] = [
-    "threadline-utility-gpt-6-luna",
-    "threadline-utility-gpt-5.6-luna",
-    "threadline-utility-gpt-5.4-mini",
-    "threadline-utility-gpt-5.3-codex-spark",
-];
+const ADVERTISED_UTILITY_MODEL_IDS: [&str; 1] = ["threadline-utility-gpt-6-luna"];
 
-const ACCEPTED_MAIN_MODEL_IDS: [&str; 20] = [
+const ACCEPTED_MAIN_MODEL_IDS: [&str; 8] = [
     "threadline-main-gpt-6.1-sol",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
-    "threadline-main-gpt-5.6-sol",
-    "threadline-main-gpt-5.6-terra",
-    "threadline-main-gpt-5.6-luna",
-    "threadline-main-gpt-5.5",
-    "threadline-main-gpt-5.4",
     "gpt-6.1-sol",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
+];
+
+const RETIRED_MODEL_IDS: [&str; 15] = [
+    "threadline-main-gpt-5.6-sol",
+    "threadline-main-gpt-5.6-terra",
+    "threadline-main-gpt-5.6-luna",
+    "threadline-main-gpt-5.5",
+    "threadline-main-gpt-5.4",
+    "threadline-utility-gpt-5.6-luna",
+    "threadline-utility-gpt-5.4-mini",
+    "threadline-utility-gpt-5.3-codex-spark",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -159,29 +146,16 @@ const ACCEPTED_MAIN_MODEL_IDS: [&str; 20] = [
     "gpt-5.3-codex-spark",
 ];
 
-const UNSUPPORTED_MODEL_IDS: [&str; 8] = [
+const UNSUPPORTED_MODEL_IDS: [&str; 5] = [
     "threadline-utility-gpt-6-luna",
-    "threadline-utility-gpt-5.6-luna",
-    "threadline-utility-gpt-5.4-mini",
-    "threadline-utility-gpt-5.3-codex-spark",
     "threadline-main-gpt-6-terra",
     "gpt-6-terra",
     "codex-mini-latest",
     "threadline-test-unsupported",
 ];
 
-const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 10] = [
-    "gpt-6.1-sol",
-    "gpt-6-sol",
-    "gpt-6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex-spark",
-];
+const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 4] =
+    ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
 
 const REQUEST_BODY_WHITESPACE_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -312,15 +286,6 @@ fn assert_invalid_model_error(payload: &Value) {
     assert_eq!(payload["error"]["code"], "invalid_model");
 }
 
-fn assert_unsupported_reasoning_context_error(payload: &Value) {
-    assert_eq!(payload["error"]["type"], "invalid_request_error");
-    assert_eq!(payload["error"]["code"], "unsupported_reasoning_context");
-    assert_eq!(
-        payload["error"]["message"],
-        "reasoning.context=all_turns is not supported for this model. The model metadata has use_responses_lite=false."
-    );
-}
-
 fn utility_config() -> ThreadlineConfig {
     ThreadlineConfig {
         profile: RouteProfile::Utility,
@@ -331,8 +296,8 @@ fn utility_config() -> ThreadlineConfig {
 #[tokio::test]
 async fn request_body_limit_accepts_exact_utf8_bytes_and_rejects_one_byte_over() {
     for (profile, model) in [
-        (RouteProfile::Main, "gpt-5.4"),
-        (RouteProfile::Utility, "threadline-utility-gpt-5.4-mini"),
+        (RouteProfile::Main, "gpt-6-sol"),
+        (RouteProfile::Utility, "threadline-utility-gpt-6-luna"),
     ] {
         let body = json!({ "model": model, "input": "cafe\u{301}" }).to_string();
         let body_bytes = body.len();
@@ -381,7 +346,7 @@ async fn request_body_limit_accepts_exact_utf8_bytes_and_rejects_one_byte_over()
 
 #[tokio::test]
 async fn request_body_limit_counts_unknown_length_chunks_cumulatively_without_auth() {
-    let body = br#"{"model":"gpt-5.4"}"#;
+    let body = br#"{"model":"gpt-6-sol"}"#;
     let limit = body.len();
     let chunks = [
         Bytes::copy_from_slice(&body[..8]),
@@ -489,10 +454,10 @@ async fn request_body_limit_preserves_io_read_error_rejection() {
 #[tokio::test]
 async fn request_body_limit_accepts_large_json_above_axum_default_with_default_and_custom_limits() {
     let input = "x".repeat(2 * 1024 * 1024 + 1);
-    let serialized_payload = serde_json::to_vec(&json!({"model":"gpt-5.4","input":input}))
+    let serialized_payload = serde_json::to_vec(&json!({"model":"gpt-6-sol","input":input}))
         .expect("serialized request payload");
     let body_bytes = serialized_payload.len();
-    let empty_payload_bytes = serde_json::to_vec(&json!({"model":"gpt-5.4","input":""}))
+    let empty_payload_bytes = serde_json::to_vec(&json!({"model":"gpt-6-sol","input":""}))
         .expect("serialized empty request payload")
         .len();
     assert_eq!(body_bytes, empty_payload_bytes + input.len());
@@ -603,7 +568,7 @@ async fn request_body_limit_preserves_invalid_model_validation_and_prioritizes_o
 
 #[tokio::test]
 async fn request_body_limit_enforces_default_boundary_without_auth() {
-    let prefix = r#"{"model":"gpt-5.4"}"#;
+    let prefix = r#"{"model":"gpt-6-sol"}"#;
     let exact_body = json_body_with_trailing_whitespace(prefix, 32 * 1024 * 1024);
     assert_eq!(exact_body.size_hint().upper(), None);
     let exact_app = build_router_with_services(
@@ -792,7 +757,7 @@ async fn responses_endpoint_rejects_non_string_model() {
     );
 
     let response =
-        post_responses_json(app, invalid_model_payload(json!({ "id": "gpt-5.4" }))).await;
+        post_responses_json(app, invalid_model_payload(json!({ "id": "gpt-6-sol" }))).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -806,7 +771,7 @@ async fn responses_model_rejects_missing_non_string_unknown_and_profile_mismatch
         (ThreadlineConfig::default(), json!({})),
         (
             ThreadlineConfig::default(),
-            invalid_model_payload(json!({ "id": "gpt-5.4" })),
+            invalid_model_payload(json!({ "id": "gpt-6-sol" })),
         ),
         (
             ThreadlineConfig::default(),
@@ -814,11 +779,11 @@ async fn responses_model_rejects_missing_non_string_unknown_and_profile_mismatch
         ),
         (
             ThreadlineConfig::default(),
-            invalid_model_payload(json!("threadline-utility-gpt-5.4-mini")),
+            invalid_model_payload(json!("threadline-utility-gpt-6-luna")),
         ),
         (
             utility_config(),
-            invalid_model_payload(json!("threadline-main-gpt-5.4")),
+            invalid_model_payload(json!("threadline-main-gpt-6-sol")),
         ),
     ];
 
@@ -857,7 +822,7 @@ async fn responses_model_accepts_main_compatibility_ids_on_main() {
 
 #[tokio::test]
 async fn responses_utility_profile_rejects_new_main_visible_aliases_before_auth_loading() {
-    for model_id in NEW_MAIN_VISIBLE_MODEL_IDS {
+    for model_id in CURRENT_MAIN_VISIBLE_MODEL_IDS {
         let app = build_router_with_services(
             utility_config(),
             ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
@@ -878,7 +843,7 @@ async fn responses_utility_profile_rejects_new_main_visible_aliases_before_auth_
 
 #[tokio::test]
 async fn responses_utility_profile_rejects_new_main_compatibility_ids_before_auth_loading() {
-    for model_id in NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS {
+    for model_id in CURRENT_MAIN_RAW_MODEL_IDS {
         let app = build_router_with_services(
             utility_config(),
             ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
@@ -970,110 +935,70 @@ async fn responses_endpoint_rejects_unsupported_model_before_lease_acquisition()
 #[tokio::test]
 async fn responses_endpoint_rejects_unsupported_model_before_auth_loading_and_upstream_connection()
 {
-    for model_id in UNSUPPORTED_MODEL_IDS {
-        let app = build_router_with_services(
-            ThreadlineConfig::default(),
-            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
-        );
+    for profile in [RouteProfile::Main, RouteProfile::Utility] {
+        for model_id in RETIRED_MODEL_IDS {
+            for reasoning in [None, Some(json!({ "context": "all_turns" }))] {
+                let config = ThreadlineConfig {
+                    profile,
+                    ..ThreadlineConfig::default()
+                };
+                let app = build_router_with_services(
+                    config,
+                    ThreadlineServices::new(
+                        Arc::new(MissingAuthProvider),
+                        Arc::new(UnusedConnector),
+                    ),
+                );
+                let mut request = json!({ "model": model_id });
+                if let Some(reasoning) = reasoning {
+                    request["reasoning"] = reasoning;
+                }
 
-        let response = post_responses_json(app, invalid_model_payload(json!(model_id))).await;
+                let response = post_responses_json(app, request).await;
 
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "model_id={model_id}"
-        );
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "profile={profile:?}, model_id={model_id}"
+                );
 
-        let payload = read_json_body(response).await;
-        assert_invalid_model_error(&payload);
+                let payload = read_json_body(response).await;
+                assert_invalid_model_error(&payload);
+            }
+        }
     }
 }
 
 #[tokio::test]
-async fn responses_endpoint_rejects_reasoning_all_turns_for_unsupported_model_before_auth_or_upstream()
- {
-    let app = build_router_with_services(
-        utility_config(),
-        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
-    );
-
-    let response = post_responses_json(
-        app,
-        json!({
-            "model": "threadline-utility-gpt-5.3-codex-spark",
-            "input": "utility-all-turns",
-            "reasoning": {
-                "context": "all_turns"
+async fn responses_endpoint_rejects_retired_model_before_retained_session_lease() {
+    for model_id in RETIRED_MODEL_IDS {
+        for reasoning in [None, Some(json!({ "context": "all_turns" }))] {
+            let app = build_router(ThreadlineConfig {
+                retained_session_capacity: 0,
+                ..ThreadlineConfig::default()
+            });
+            let mut request = json!({
+                "model": model_id,
+                "previous_response_id": "response-lease"
+            });
+            if let Some(reasoning) = reasoning {
+                request["reasoning"] = reasoning;
             }
-        }),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    let payload = read_json_body(response).await;
-    assert_unsupported_reasoning_context_error(&payload);
-}
-
-#[tokio::test]
-async fn responses_endpoint_allows_non_persistent_request_for_reasoning_all_turns_unsupported_model_to_reach_existing_auth_path()
- {
-    let app = build_router_with_services(
-        utility_config(),
-        ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
-    );
-
-    let response = post_responses_json(
-        app,
-        json!({
-            "model": "threadline-utility-gpt-5.3-codex-spark",
-            "input": "utility-non-persistent",
-            "reasoning": {
-                "effort": "high"
-            }
-        }),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-    let payload = read_json_body(response).await;
-    assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
-    assert_eq!(payload["error"]["type"], "configuration_error");
-    assert_ne!(payload["error"]["code"], "unsupported_reasoning_context");
-}
-
-#[tokio::test]
-async fn responses_endpoint_rejects_unsupported_reasoning_all_turns_before_retained_session_lease()
-{
-    let app = build_router(ThreadlineConfig {
-        retained_session_capacity: 0,
-        ..ThreadlineConfig::default()
-    });
-
-    let response = post_responses_json(
-        app,
-        json!({
-            "model": "gpt-5.4",
-            "input": "main-all-turns",
-            "previous_response_id": "response-lease",
-            "reasoning": {
-                "context": "all_turns"
-            }
-        }),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    let payload = read_json_body(response).await;
-    assert_unsupported_reasoning_context_error(&payload);
+            let response = post_responses_json(app, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "model_id={model_id}"
+            );
+            assert_invalid_model_error(&read_json_body(response).await);
+        }
+    }
 }
 
 #[tokio::test]
 async fn responses_endpoint_allows_reasoning_capable_raw_main_compatibility_ids_for_reasoning_all_turns_to_reach_existing_auth_path()
  {
-    for model_id in NEW_MAIN_RAW_COMPATIBILITY_MODEL_IDS {
+    for model_id in CURRENT_MAIN_RAW_MODEL_IDS {
         let app = build_router_with_services(
             ThreadlineConfig::default(),
             ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
@@ -1100,7 +1025,6 @@ async fn responses_endpoint_allows_reasoning_capable_raw_main_compatibility_ids_
         let payload = read_json_body(response).await;
         assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
         assert_eq!(payload["error"]["type"], "configuration_error");
-        assert_ne!(payload["error"]["code"], "unsupported_reasoning_context");
     }
 }
 
@@ -1133,39 +1057,6 @@ async fn responses_endpoint_allows_astra_main_reasoning_all_turns_to_reach_exist
         let payload = read_json_body(response).await;
         assert_eq!(payload["error"]["code"], "upstream_credentials_unavailable");
         assert_eq!(payload["error"]["type"], "configuration_error");
-        assert_ne!(payload["error"]["code"], "unsupported_reasoning_context");
-    }
-}
-
-#[tokio::test]
-async fn responses_endpoint_rejects_legacy_raw_main_compatibility_ids_for_reasoning_all_turns_before_auth_or_upstream()
- {
-    for model_id in ["gpt-5.5", "gpt-5.4"] {
-        let app = build_router_with_services(
-            ThreadlineConfig::default(),
-            ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
-        );
-
-        let response = post_responses_json(
-            app,
-            json!({
-                "model": model_id,
-                "input": "main-all-turns-legacy-model",
-                "reasoning": {
-                    "context": "all_turns"
-                }
-            }),
-        )
-        .await;
-
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "model_id={model_id}"
-        );
-
-        let payload = read_json_body(response).await;
-        assert_unsupported_reasoning_context_error(&payload);
     }
 }
 
@@ -1217,7 +1108,7 @@ async fn responses_endpoint_reports_configuration_error_for_allowed_model_when_u
         ThreadlineServices::new(Arc::new(MissingAuthProvider), Arc::new(UnusedConnector)),
     );
 
-    let response = post_responses_json(app, json!({ "model": "gpt-5.4" })).await;
+    let response = post_responses_json(app, json!({ "model": "gpt-6-sol" })).await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -1234,8 +1125,8 @@ async fn responses_endpoint_reports_configuration_error_for_allowed_model_when_u
 #[tokio::test]
 async fn responses_endpoint_maps_connect_timeout_to_fixed_server_error_for_main_and_utility() {
     for (profile, model) in [
-        (RouteProfile::Main, "gpt-5.4"),
-        (RouteProfile::Utility, "threadline-utility-gpt-5.4-mini"),
+        (RouteProfile::Main, "gpt-6-sol"),
+        (RouteProfile::Utility, "threadline-utility-gpt-6-luna"),
     ] {
         let attempts = Arc::new(AtomicUsize::new(0));
         let app = build_router_with_services(

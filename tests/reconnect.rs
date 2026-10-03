@@ -181,7 +181,7 @@ fn auxiliary_summary_input_item() -> Value {
 
 fn auxiliary_summary_request(previous_response_id: Option<&str>) -> Value {
     let mut payload = json!({
-        "model": "gpt-5.4",
+        "model": "gpt-6-sol",
         "input": [
             {
                 "type": "message",
@@ -290,7 +290,7 @@ fn assert_response_failed_payload(payload: &Value, expected_code: &str) {
 }
 
 async fn seed_marker(app: axum::Router, server: &ScriptedWebSocketServer, marker: &str) {
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"seed"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -306,7 +306,7 @@ async fn seed_marker_without_reader(
     server: &ScriptedWebSocketServer,
     marker: &str,
 ) {
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"seed"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     server
         .send_text(&assistant_text_completed_event(marker, "seed completion").to_string())
@@ -343,7 +343,7 @@ async fn retained_continuation_liveness_timeout_before_preflight_returns_previou
     let response = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -395,7 +395,7 @@ async fn retained_continuation_liveness_timeout_before_first_upstream_event_retu
     let response = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -453,7 +453,7 @@ async fn retained_continuation_liveness_timeout_before_first_upstream_event_retu
     let retry = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"retry",
             "previous_response_id":"response-1"
         }),
@@ -489,7 +489,7 @@ async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
     }]);
     let app = build_test_router(Arc::new(connector.clone()));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"first"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"first"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = timeout(Duration::from_secs(1), server.recv_client_message())
         .await
@@ -547,7 +547,7 @@ async fn live_retained_continuation_close_before_first_send_returns_previous_res
             post_responses(
                 app,
                 json!({
-                    "model":"gpt-5.4",
+                    "model":"gpt-6-sol",
                     "input":"followup",
                     "previous_response_id":"response-1"
                 }),
@@ -612,7 +612,7 @@ async fn reconnect_fallback_is_not_attempted_after_any_upstream_event() {
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -687,7 +687,7 @@ async fn retained_continuation_close_after_send_before_first_upstream_event_repl
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -777,7 +777,7 @@ async fn stale_continuation_with_spare_reconnect_plans_returns_previous_response
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -837,7 +837,7 @@ async fn stale_continuation_returns_previous_response_not_found_before_sse_witho
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),

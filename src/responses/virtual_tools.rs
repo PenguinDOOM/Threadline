@@ -197,7 +197,7 @@ mod tests {
 
     fn utility_request_with_input(input: Vec<Value>) -> Map<String, Value> {
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": input,
             "tools": [
                 {

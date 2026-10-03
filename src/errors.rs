@@ -34,11 +34,6 @@ pub enum ThreadlineError {
     InvalidModel,
 
     #[error(
-        "reasoning.context=all_turns is not supported for this model. The model metadata has use_responses_lite=false."
-    )]
-    UnsupportedReasoningContext,
-
-    #[error(
         "Threadline could not find the retained session for the supplied previous_response_id."
     )]
     PreviousResponseNotFound,
@@ -125,7 +120,6 @@ impl ThreadlineError {
             Self::InvalidResponsesRequest => StatusCode::BAD_REQUEST,
             Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InvalidModel => StatusCode::BAD_REQUEST,
-            Self::UnsupportedReasoningContext => StatusCode::BAD_REQUEST,
             Self::PreviousResponseNotFound => StatusCode::BAD_REQUEST,
             Self::RetainedSessionConflict => StatusCode::CONFLICT,
             Self::RetainedSessionCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
@@ -171,11 +165,6 @@ impl ThreadlineError {
             Self::InvalidModel => borrowed_public_error(
                 "invalid_model",
                 "The /v1/responses request must include a supported string model.",
-                "invalid_request_error",
-            ),
-            Self::UnsupportedReasoningContext => borrowed_public_error(
-                "unsupported_reasoning_context",
-                "reasoning.context=all_turns is not supported for this model. The model metadata has use_responses_lite=false.",
                 "invalid_request_error",
             ),
             Self::PreviousResponseNotFound => borrowed_public_error(
@@ -389,25 +378,6 @@ mod tests {
             "--utility-port must differ from --port"
         );
         assert_eq!(document.error.error_type.as_ref(), "configuration_error");
-    }
-
-    #[test]
-    fn unsupported_reasoning_context_maps_to_stable_invalid_request_error() {
-        let error = ThreadlineError::UnsupportedReasoningContext;
-
-        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
-
-        let document = error.public_error_document();
-
-        assert_eq!(
-            document.error.code.as_ref(),
-            "unsupported_reasoning_context"
-        );
-        assert_eq!(
-            document.error.message.as_ref(),
-            "reasoning.context=all_turns is not supported for this model. The model metadata has use_responses_lite=false."
-        );
-        assert_eq!(document.error.error_type.as_ref(), "invalid_request_error");
     }
 
     #[test]

@@ -641,7 +641,7 @@ fn retained_conflict_fallback_summary_input_item() -> Value {
 
 fn summary_request_with_input(previous_response_id: Option<&str>, input: Vec<Value>) -> Value {
     let mut payload = json!({
-        "model": "gpt-5.4",
+        "model": "gpt-6-sol",
         "context_management": {
             "type": "compaction",
             "compact_threshold": 12345
@@ -703,7 +703,7 @@ fn virtual_tool_summarizer_compatibility_instruction() -> &'static str {
 
 fn utility_virtual_tool_summarizer_request() -> Value {
     json!({
-        "model":"threadline-utility-gpt-5.4-mini",
+        "model":"threadline-utility-gpt-6-luna",
         "input":[
             {
                 "type":"message",
@@ -856,7 +856,7 @@ async fn stale_previous_response_id_returns_not_found_without_reconnect_or_confl
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
     let first_response =
-        post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+        post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"first"})).await;
     assert_eq!(first_response.status(), StatusCode::OK);
 
     let first_payload: Value = serde_json::from_str(&message_text(
@@ -888,7 +888,7 @@ async fn stale_previous_response_id_returns_not_found_without_reconnect_or_confl
         let response = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"second",
                 "previous_response_id":"response-1"
             }),
@@ -942,7 +942,7 @@ async fn live_retained_upstream_continuation_forwards_previous_response_id_witho
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
     let first_response =
-        post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+        post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"first"})).await;
     assert_eq!(first_response.status(), StatusCode::OK);
 
     let first_payload: Value = serde_json::from_str(&message_text(
@@ -967,7 +967,7 @@ async fn live_retained_upstream_continuation_forwards_previous_response_id_witho
     let second_response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"second",
             "previous_response_id":"response-1"
         }),
@@ -998,7 +998,7 @@ async fn live_retained_upstream_continuation_forwards_previous_response_id_witho
 }
 
 #[tokio::test]
-async fn retained_gpt_5_6_continuation_repeats_persistent_reasoning_context_without_reconnect() {
+async fn retained_continuation_repeats_persistent_reasoning_context_without_reconnect() {
     let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&retained_server),
@@ -1015,7 +1015,7 @@ async fn retained_gpt_5_6_continuation_repeats_persistent_reasoning_context_with
     let first_response = post_responses(
         app.clone(),
         json!({
-            "model":"threadline-main-gpt-5.6-terra",
+            "model":"threadline-main-gpt-6-sol",
             "input":"first persistent turn"
         }),
     )
@@ -1030,7 +1030,7 @@ async fn retained_gpt_5_6_continuation_repeats_persistent_reasoning_context_with
     ))
     .expect("first request json");
     assert_eq!(first_payload["type"], "response.create");
-    assert_eq!(first_payload["model"], "gpt-5.6-terra");
+    assert_eq!(first_payload["model"], "gpt-6-sol");
     assert_eq!(first_payload["reasoning"], json!({"context":"all_turns"}));
 
     retained_server
@@ -1046,7 +1046,7 @@ async fn retained_gpt_5_6_continuation_repeats_persistent_reasoning_context_with
     let second_response = post_responses(
         app,
         json!({
-            "model":"threadline-main-gpt-5.6-terra",
+            "model":"threadline-main-gpt-6-sol",
             "input":"second persistent turn",
             "previous_response_id":"response-persistent-1"
         }),
@@ -1187,7 +1187,7 @@ async fn context_management_compaction_does_not_override_stale_marker_semantics(
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
     let first_response =
-        post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+        post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"first"})).await;
     assert_eq!(first_response.status(), StatusCode::OK);
 
     let first_payload: Value = serde_json::from_str(&message_text(
@@ -1215,7 +1215,7 @@ async fn context_management_compaction_does_not_override_stale_marker_semantics(
     let second_response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"second",
             "previous_response_id":"response-1",
             "context_management": {
@@ -1263,7 +1263,7 @@ async fn context_management_only_ordinary_request_remains_retained_and_normal() 
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
     let first_response =
-        post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+        post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"first"})).await;
     assert_eq!(first_response.status(), StatusCode::OK);
 
     let _ = retained_server
@@ -1283,7 +1283,7 @@ async fn context_management_only_ordinary_request_remains_retained_and_normal() 
     let second_response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"second",
             "previous_response_id":"response-1",
             "context_management": {
@@ -1334,7 +1334,7 @@ async fn missing_previous_response_id_returns_stable_not_found() {
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"missing",
             "previous_response_id":"response-missing"
         }),
@@ -1393,7 +1393,7 @@ async fn summary_request_with_active_previous_response_id_uses_auxiliary_session
         Arc::new(connector),
     );
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -1409,7 +1409,7 @@ async fn summary_request_with_active_previous_response_id_uses_auxiliary_session
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -1467,7 +1467,8 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
             Arc::new(connector.clone()),
         );
 
-        let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+        let initial =
+            post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
         assert_eq!(
             initial.status(),
             StatusCode::OK,
@@ -1488,7 +1489,7 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
         let active = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"followup",
                 "previous_response_id":"response-1"
             }),
@@ -1567,7 +1568,7 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
         Arc::new(connector.clone()),
     );
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -1583,7 +1584,7 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -1598,7 +1599,7 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
     let response = post_responses_with_headers(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"ordinary header classified summary",
             "previous_response_id":"response-1",
             "context_management":{
@@ -1815,7 +1816,7 @@ async fn context_management_stripped_diagnostics_are_privacy_safe() {
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input": raw_prompt,
             "context_management": {
                 "type":"compaction",
@@ -1861,7 +1862,7 @@ async fn context_management_stripped_diagnostics_are_privacy_safe() {
     assert!(!stripped_line.contains(raw_prompt));
     assert!(!stripped_line.contains("compact_threshold"));
     assert!(!stripped_line.contains("note"));
-    assert!(!stripped_line.contains("{\"model\":\"gpt-5.4\""));
+    assert!(!stripped_line.contains("{\"model\":\"gpt-6-sol\""));
 }
 
 #[tokio::test]
@@ -1897,7 +1898,7 @@ async fn summary_request_without_previous_response_id_uses_auxiliary_session() {
     .expect("summary request json");
     assert!(summary_payload.get("previous_response_id").is_none());
 
-    let ordinary = post_responses(app, json!({"model":"gpt-5.4","input":"ordinary"})).await;
+    let ordinary = post_responses(app, json!({"model":"gpt-6-sol","input":"ordinary"})).await;
     assert_eq!(ordinary.status(), StatusCode::OK);
 }
 
@@ -1939,7 +1940,7 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
     let normal = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input": format!("Account {raw_request_account} credential {raw_request_secret}")
         }),
     )
@@ -1989,7 +1990,7 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
     assert!(summary_line.contains("summary_instruction_like_hit=true"));
     assert!(!summary_line.contains("response-1"));
     assert!(!summary_line.contains(auxiliary_summary_text()));
-    assert!(!summary_line.contains("{\"model\":\"gpt-5.4\""));
+    assert!(!summary_line.contains("{\"model\":\"gpt-6-sol\""));
 
     let normal_line = logs
         .lines()
@@ -2025,7 +2026,7 @@ async fn request_routing_diagnostics_distinguish_summary_without_logging_raw_req
     assert!(normal_line.contains("summary_instruction_like_hit=false"));
     assert!(!normal_line.contains(raw_request_secret));
     assert!(!normal_line.contains(raw_request_account));
-    assert!(!normal_line.contains("{\"model\":\"gpt-5.4\""));
+    assert!(!normal_line.contains("{\"model\":\"gpt-6-sol\""));
 }
 
 #[tokio::test]
@@ -2043,7 +2044,7 @@ async fn header_classified_request_routing_diagnostics_are_privacy_safe() {
     let response = post_responses_with_headers(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input": format!("ordinary request body {raw_request_secret}"),
             "previous_response_id":"response-1",
             "context_management":{
@@ -2083,7 +2084,7 @@ async fn header_classified_request_routing_diagnostics_are_privacy_safe() {
     assert!(!routed_line.contains(raw_request_secret));
     assert!(!routed_line.contains(raw_request_header));
     assert!(!routed_line.contains("response-1"));
-    assert!(!routed_line.contains("{\"model\":\"gpt-5.4\""));
+    assert!(!routed_line.contains("{\"model\":\"gpt-6-sol\""));
 }
 
 #[tokio::test]
@@ -2111,7 +2112,7 @@ async fn summary_response_id_is_not_registered_as_continuation_marker() {
     let rejected = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-summary"
         }),
@@ -2169,7 +2170,7 @@ async fn summary_request_all_shape_response_ids_are_not_registered_as_continuati
         let rejected = post_responses(
             app,
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"resume",
                 "previous_response_id":shape.response_id()
             }),
@@ -2231,7 +2232,8 @@ async fn summary_request_broader_shapes_with_active_previous_response_id_keep_na
         ]);
         let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-        let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+        let initial =
+            post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
         assert_eq!(initial.status(), StatusCode::OK, "seed status for {name}");
         let _ = retained_server
             .recv_client_message()
@@ -2247,7 +2249,7 @@ async fn summary_request_broader_shapes_with_active_previous_response_id_keep_na
         let active = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"followup",
                 "previous_response_id":"response-1"
             }),
@@ -2354,7 +2356,7 @@ async fn transient_summary_request_preserves_auxiliary_behavior_but_does_not_rev
         Arc::new(connector),
     );
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -2387,7 +2389,7 @@ async fn transient_summary_request_preserves_auxiliary_behavior_but_does_not_rev
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-1"
         }),
@@ -2446,7 +2448,7 @@ async fn transient_summary_request_uses_no_retained_capacity_after_completion() 
         .await
         .expect("summary body");
 
-    let ordinary = post_responses(app, json!({"model":"gpt-5.4","input":"ordinary"})).await;
+    let ordinary = post_responses(app, json!({"model":"gpt-6-sol","input":"ordinary"})).await;
     assert_eq!(ordinary.status(), StatusCode::OK);
 }
 
@@ -2472,7 +2474,7 @@ async fn transient_summary_request_can_run_while_previous_marker_is_active_at_ca
         Arc::new(connector),
     );
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -2488,7 +2490,7 @@ async fn transient_summary_request_can_run_while_previous_marker_is_active_at_ca
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -2541,7 +2543,7 @@ async fn transient_summary_request_failure_or_drop_does_not_leave_capacity_block
 
     let ordinary_after_failed = post_responses(
         failure_app,
-        json!({"model":"gpt-5.4","input":"ordinary-after-failed"}),
+        json!({"model":"gpt-6-sol","input":"ordinary-after-failed"}),
     )
     .await;
     assert_eq!(ordinary_after_failed.status(), StatusCode::OK);
@@ -2577,7 +2579,7 @@ async fn transient_summary_request_failure_or_drop_does_not_leave_capacity_block
 
     let ordinary_after_drop = post_responses(
         drop_app,
-        json!({"model":"gpt-5.4","input":"ordinary-after-drop"}),
+        json!({"model":"gpt-6-sol","input":"ordinary-after-drop"}),
     )
     .await;
     assert_eq!(ordinary_after_drop.status(), StatusCode::OK);
@@ -2668,7 +2670,7 @@ async fn active_continuation_drop_invalidates_marker_without_another_upstream_cr
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
         .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
@@ -2680,7 +2682,7 @@ async fn active_continuation_drop_invalidates_marker_without_another_upstream_cr
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -2695,7 +2697,7 @@ async fn active_continuation_drop_invalidates_marker_without_another_upstream_cr
     let conflict = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"conflict",
             "previous_response_id":"response-1"
         }),
@@ -2708,7 +2710,7 @@ async fn active_continuation_drop_invalidates_marker_without_another_upstream_cr
     let retried = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"retry",
             "previous_response_id":"response-1"
         }),
@@ -2743,7 +2745,7 @@ async fn polled_continuation_drop_before_first_event_requires_replay() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
         .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
@@ -2754,7 +2756,7 @@ async fn polled_continuation_drop_before_first_event_requires_replay() {
 
     let active = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"followup","previous_response_id":"response-1"}),
+        json!({"model":"gpt-6-sol","input":"followup","previous_response_id":"response-1"}),
     )
     .await;
     assert_eq!(active.status(), StatusCode::OK);
@@ -2791,7 +2793,7 @@ async fn polled_continuation_drop_before_first_event_requires_replay() {
 
     let replay = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"replay","previous_response_id":"response-1"}),
+        json!({"model":"gpt-6-sol","input":"replay","previous_response_id":"response-1"}),
     )
     .await;
     assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
@@ -2822,7 +2824,7 @@ async fn visible_continuation_output_drop_invalidates_marker() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
         .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
@@ -2833,7 +2835,7 @@ async fn visible_continuation_output_drop_invalidates_marker() {
 
     let active = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"followup","previous_response_id":"response-1"}),
+        json!({"model":"gpt-6-sol","input":"followup","previous_response_id":"response-1"}),
     )
     .await;
     let _ = server
@@ -2850,7 +2852,7 @@ async fn visible_continuation_output_drop_invalidates_marker() {
 
     let replay = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"replay","previous_response_id":"response-1"}),
+        json!({"model":"gpt-6-sol","input":"replay","previous_response_id":"response-1"}),
     )
     .await;
     assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
@@ -2894,7 +2896,7 @@ async fn dropped_fresh_active_request_releases_retained_capacity() {
         Arc::new(connector.clone()),
     );
 
-    let active = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    let active = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"first"})).await;
     assert_eq!(active.status(), StatusCode::OK);
     let _ = first_server
         .recv_client_message()
@@ -2910,7 +2912,7 @@ async fn dropped_fresh_active_request_releases_retained_capacity() {
         Ok(None)
     ));
 
-    let replacement = post_responses(app, json!({"model":"gpt-5.4","input":"second"})).await;
+    let replacement = post_responses(app, json!({"model":"gpt-6-sol","input":"second"})).await;
     assert_eq!(replacement.status(), StatusCode::OK);
     let _ = second_server
         .recv_client_message()
@@ -2929,7 +2931,7 @@ async fn completed_without_response_id_disarms_active_turn_and_preserves_prior_m
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
         .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
@@ -2940,7 +2942,7 @@ async fn completed_without_response_id_disarms_active_turn_and_preserves_prior_m
 
     let active = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"followup","previous_response_id":"response-1"}),
+        json!({"model":"gpt-6-sol","input":"followup","previous_response_id":"response-1"}),
     )
     .await;
     assert_eq!(active.status(), StatusCode::OK);
@@ -2970,7 +2972,7 @@ async fn completed_without_response_id_disarms_active_turn_and_preserves_prior_m
 
     let resumed = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"resume","previous_response_id":"response-1"}),
+        json!({"model":"gpt-6-sol","input":"resume","previous_response_id":"response-1"}),
     )
     .await;
     assert_eq!(resumed.status(), StatusCode::OK);
@@ -2992,7 +2994,7 @@ async fn abandoning_newer_turn_releases_upstream_while_completed_predecessor_bod
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let first = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    let first = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"first"})).await;
     assert_eq!(first.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("first request");
     server
@@ -3005,7 +3007,7 @@ async fn abandoning_newer_turn_releases_upstream_while_completed_predecessor_bod
 
     let second = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"second","previous_response_id":"response-a"}),
+        json!({"model":"gpt-6-sol","input":"second","previous_response_id":"response-a"}),
     )
     .await;
     assert_eq!(second.status(), StatusCode::OK);
@@ -3014,7 +3016,7 @@ async fn abandoning_newer_turn_releases_upstream_while_completed_predecessor_bod
 
     let replay = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"replay","previous_response_id":"response-a"}),
+        json!({"model":"gpt-6-sol","input":"replay","previous_response_id":"response-a"}),
     )
     .await;
     assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
@@ -3046,7 +3048,7 @@ async fn retained_session_conflict_fallback_summary_request_reroutes_transiently
     ]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -3062,7 +3064,7 @@ async fn retained_session_conflict_fallback_summary_request_reroutes_transiently
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -3114,7 +3116,7 @@ async fn retained_session_conflict_context_management_without_summary_input_rema
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -3130,7 +3132,7 @@ async fn retained_session_conflict_context_management_without_summary_input_rema
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -3176,7 +3178,7 @@ async fn retained_session_conflict_tool_choice_none_without_summary_fingerprint_
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -3192,7 +3194,7 @@ async fn retained_session_conflict_tool_choice_none_without_summary_fingerprint_
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -3207,7 +3209,7 @@ async fn retained_session_conflict_tool_choice_none_without_summary_fingerprint_
     let conflict = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "previous_response_id": "response-1",
             "context_management": {
                 "type": "compaction",
@@ -3277,7 +3279,7 @@ async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
     ]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -3293,7 +3295,7 @@ async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -3378,7 +3380,7 @@ async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
     assert!(!rerouted_line.contains(raw_request_account));
     assert!(!rerouted_line.contains(manual_summary_text()));
     assert!(!rerouted_line.contains("response-1"));
-    assert!(!rerouted_line.contains("{\"model\":\"gpt-5.4\""));
+    assert!(!rerouted_line.contains("{\"model\":\"gpt-6-sol\""));
 }
 
 #[tokio::test]
@@ -3397,7 +3399,7 @@ async fn retained_session_conflict_fallback_empty_completed_output_preserves_aux
     ]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -3413,7 +3415,7 @@ async fn retained_session_conflict_fallback_empty_completed_output_preserves_aux
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -3471,7 +3473,7 @@ async fn retained_session_conflict_fallback_empty_completed_output_preserves_aux
     let rejected = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-fallback-empty"
         }),
@@ -3503,10 +3505,10 @@ async fn retained_session_capacity_exhaustion_returns_503() {
         Arc::new(connector),
     );
 
-    let active = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    let active = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"first"})).await;
     assert_eq!(active.status(), StatusCode::OK);
 
-    let exhausted = post_responses(app, json!({"model":"gpt-5.4","input":"second"})).await;
+    let exhausted = post_responses(app, json!({"model":"gpt-6-sol","input":"second"})).await;
     assert_eq!(exhausted.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = to_bytes(exhausted.into_body(), usize::MAX)
         .await
@@ -3524,7 +3526,7 @@ async fn retained_session_capacity_exhaustion_returns_503() {
 async fn upstream_connect_failure_returns_502() {
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(FailingConnector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"connect"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"connect"})).await;
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = to_bytes(response.into_body(), usize::MAX)
@@ -3546,7 +3548,7 @@ async fn upstream_pretty_json_is_compacted_before_downstream_sse() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"pretty-delta"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"pretty-delta"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server
         .recv_client_message()
@@ -3633,7 +3635,8 @@ async fn upstream_pretty_response_completed_is_compacted_before_downstream_sse()
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"pretty-completed"})).await;
+    let response =
+        post_responses(app, json!({"model":"gpt-6-sol","input":"pretty-completed"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server
         .recv_client_message()
@@ -3685,7 +3688,7 @@ async fn downstream_completed_and_done_are_separate_body_chunks_before_eof() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"chunk-boundary"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"chunk-boundary"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server
         .recv_client_message()
@@ -3756,7 +3759,7 @@ async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -3769,7 +3772,7 @@ async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
@@ -3806,7 +3809,7 @@ async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
     let resumed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume-before-done",
             "previous_response_id":"response-2"
         }),
@@ -3824,7 +3827,7 @@ async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
     let overlapping = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"conflict while resumed turn is active",
             "previous_response_id":"response-2"
         }),
@@ -3849,7 +3852,7 @@ async fn completed_marker_remains_reusable_when_synthetic_tail_body_is_dropped()
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -3862,7 +3865,7 @@ async fn completed_marker_remains_reusable_when_synthetic_tail_body_is_dropped()
     let completed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"completed synthetic tail",
             "previous_response_id":"response-1"
         }),
@@ -3892,7 +3895,7 @@ async fn completed_marker_remains_reusable_when_synthetic_tail_body_is_dropped()
     let resumed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume after synthetic tail drop",
             "previous_response_id":"response-2"
         }),
@@ -3927,7 +3930,7 @@ async fn internal_tool_followup_strips_context_management_from_initial_and_follo
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"internal-tool-followup",
             "context_management":{
                 "type":"compaction",
@@ -3998,7 +4001,7 @@ async fn dropping_pending_internal_followup_invalidates_all_continuation_markers
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -4011,7 +4014,7 @@ async fn dropping_pending_internal_followup_invalidates_all_continuation_markers
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"internal followup",
             "previous_response_id":"response-1"
         }),
@@ -4059,7 +4062,7 @@ async fn dropping_pending_internal_followup_invalidates_all_continuation_markers
         let replay = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"replay",
                 "previous_response_id":marker
             }),
@@ -4105,7 +4108,7 @@ async fn recoverable_upstream_close_releases_prior_marker_after_completed_chunk_
     ]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = first_server
         .recv_client_message()
@@ -4139,7 +4142,7 @@ async fn recoverable_upstream_close_releases_prior_marker_after_completed_chunk_
     let resumed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume-after-close",
             "previous_response_id":"response-1"
         }),
@@ -4181,7 +4184,7 @@ async fn live_shaped_response_completed_with_internal_tool_name_still_reaches_do
 
     let response = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"live-shaped-completed"}),
+        json!({"model":"gpt-6-sol","input":"live-shaped-completed"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -4258,7 +4261,7 @@ async fn request_body_limit_forwards_large_input_and_preserves_visible_sse_compl
             Arc::new(connector),
         );
         let input = "x".repeat(2 * 1024 * 1024 + 1);
-        let payload = json!({"model":"gpt-5.4","input":input});
+        let payload = json!({"model":"gpt-6-sol","input":input});
         let serialized_payload =
             serde_json::to_vec(&payload).expect("serialized request payload");
         assert!(serialized_payload.len() > 2 * 1024 * 1024);
@@ -4373,7 +4376,7 @@ async fn upstream_response_failed_emits_response_failed_terminal_event() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"failure"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"failure"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("failure request");
     server
@@ -4412,7 +4415,7 @@ async fn terminal_failed_and_incomplete_payloads_preserve_vscode_terminal_fields
 
     let failed_response = post_responses(
         failed_app,
-        json!({"model":"gpt-5.4","input":"failed-terminal-fields"}),
+        json!({"model":"gpt-6-sol","input":"failed-terminal-fields"}),
     )
     .await;
     assert_eq!(failed_response.status(), StatusCode::OK);
@@ -4422,7 +4425,7 @@ async fn terminal_failed_and_incomplete_payloads_preserve_vscode_terminal_fields
         .expect("failed request");
     failed_server
         .send_text(
-            r#"{"type":"response.failed","response":{"id":"response-failed-fields","model":"gpt-5.4","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14},"output":[{"id":"assistant-visible","type":"message","role":"assistant","content":[{"type":"output_text","text":"visible failed text"}]}]},"error":{"code":"upstream_response_failed","message":"failed"}}"#,
+            r#"{"type":"response.failed","response":{"id":"response-failed-fields","model":"gpt-6-sol","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14},"output":[{"id":"assistant-visible","type":"message","role":"assistant","content":[{"type":"output_text","text":"visible failed text"}]}]},"error":{"code":"upstream_response_failed","message":"failed"}}"#,
         )
         .await;
 
@@ -4441,7 +4444,7 @@ async fn terminal_failed_and_incomplete_payloads_preserve_vscode_terminal_fields
 
     assert_eq!(failed_event, "response.failed");
     assert_eq!(failed_payload["response"]["id"], "response-failed-fields");
-    assert_eq!(failed_payload["response"]["model"], "gpt-5.4");
+    assert_eq!(failed_payload["response"]["model"], "gpt-6-sol");
     assert_eq!(failed_payload["response"]["usage"]["total_tokens"], 14);
     assert_eq!(
         assistant_output_text_from_completed(
@@ -4461,7 +4464,7 @@ async fn terminal_failed_and_incomplete_payloads_preserve_vscode_terminal_fields
 
     let incomplete_response = post_responses(
         incomplete_app,
-        json!({"model":"gpt-5.4","input":"incomplete-terminal-fields"}),
+        json!({"model":"gpt-6-sol","input":"incomplete-terminal-fields"}),
     )
     .await;
     assert_eq!(incomplete_response.status(), StatusCode::OK);
@@ -4471,7 +4474,7 @@ async fn terminal_failed_and_incomplete_payloads_preserve_vscode_terminal_fields
         .expect("incomplete request");
     incomplete_server
         .send_text(
-            r#"{"type":"response.incomplete","response":{"id":"response-incomplete-fields","model":"gpt-5.4","usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11},"output":[{"id":"assistant-partial","type":"message","role":"assistant","content":[{"type":"output_text","text":"visible partial text"}]}],"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            r#"{"type":"response.incomplete","response":{"id":"response-incomplete-fields","model":"gpt-6-sol","usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11},"output":[{"id":"assistant-partial","type":"message","role":"assistant","content":[{"type":"output_text","text":"visible partial text"}]}],"incomplete_details":{"reason":"max_output_tokens"}}}"#,
         )
         .await;
     incomplete_server.send_close(1000, "incomplete").await;
@@ -4496,7 +4499,7 @@ async fn terminal_failed_and_incomplete_payloads_preserve_vscode_terminal_fields
         incomplete_payload["response"]["id"],
         "response-incomplete-fields"
     );
-    assert_eq!(incomplete_payload["response"]["model"], "gpt-5.4");
+    assert_eq!(incomplete_payload["response"]["model"], "gpt-6-sol");
     assert_eq!(incomplete_payload["response"]["usage"]["total_tokens"], 11);
     assert_eq!(
         incomplete_payload["response"]["incomplete_details"]["reason"],
@@ -4522,7 +4525,7 @@ async fn dropping_incomplete_terminal_body_before_done_removes_marker() {
 
     let response = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"terminal-incomplete"}),
+        json!({"model":"gpt-6-sol","input":"terminal-incomplete"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -4532,7 +4535,7 @@ async fn dropping_incomplete_terminal_body_before_done_removes_marker() {
         .expect("incomplete request");
     server
         .send_text(
-            r#"{"type":"response.incomplete","response":{"id":"response-incomplete","model":"gpt-5.4","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"output":[{"id":"assistant-partial","type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}],"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            r#"{"type":"response.incomplete","response":{"id":"response-incomplete","model":"gpt-6-sol","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5},"output":[{"id":"assistant-partial","type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}],"incomplete_details":{"reason":"max_output_tokens"}}}"#,
         )
         .await;
     server.send_close(1000, "incomplete").await;
@@ -4555,7 +4558,7 @@ async fn dropping_incomplete_terminal_body_before_done_removes_marker() {
     let rejected = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"invalid-incomplete-resume",
             "previous_response_id":"response-incomplete"
         }),
@@ -4590,7 +4593,7 @@ async fn response_failed_releases_prior_completed_marker_after_recoverable_close
     ]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = first_server
         .recv_client_message()
@@ -4606,7 +4609,7 @@ async fn response_failed_releases_prior_completed_marker_after_recoverable_close
     let failed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
@@ -4635,7 +4638,7 @@ async fn response_failed_releases_prior_completed_marker_after_recoverable_close
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-1"
         }),
@@ -4675,7 +4678,7 @@ async fn dropping_failed_terminal_body_before_done_blocks_resume() {
     ]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = first_server
         .recv_client_message()
@@ -4691,7 +4694,7 @@ async fn dropping_failed_terminal_body_before_done_blocks_resume() {
     let failed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
@@ -4722,7 +4725,7 @@ async fn dropping_failed_terminal_body_before_done_blocks_resume() {
     let resumed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume-before-failed-body-drop",
             "previous_response_id":"response-1"
         }),
@@ -4760,7 +4763,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -4773,7 +4776,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
     let failed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
@@ -4791,7 +4794,7 @@ async fn response_failed_id_is_not_a_continuation_marker() {
     let rejected = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"invalid-resume",
             "previous_response_id":"response-failed"
         }),
@@ -4816,7 +4819,7 @@ async fn upstream_error_event_with_previous_response_not_found_code_emits_previo
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"error-code"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"error-code"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("error request");
     server
@@ -4862,7 +4865,7 @@ async fn upstream_error_event_with_previous_response_not_found_message_emits_pre
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"error-message"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"error-message"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("error request");
     server
@@ -4906,7 +4909,7 @@ async fn upstream_error_event_partial_previous_response_messages_remain_upstream
 
         let response = post_responses(
             app,
-            json!({"model":"gpt-5.4","input":format!("partial-{case_name}")}),
+            json!({"model":"gpt-6-sol","input":format!("partial-{case_name}")}),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK, "status for {case_name}");
@@ -4959,7 +4962,7 @@ async fn classified_upstream_previous_response_not_found_releases_prior_marker_w
     ]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(initial.status(), StatusCode::OK);
     let _ = first_server
         .recv_client_message()
@@ -4975,7 +4978,7 @@ async fn classified_upstream_previous_response_not_found_releases_prior_marker_w
     let failed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
@@ -5007,7 +5010,7 @@ async fn classified_upstream_previous_response_not_found_releases_prior_marker_w
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-1"
         }),
@@ -5040,7 +5043,7 @@ async fn upstream_error_event_emits_response_failed_and_done_without_successful_
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"error"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"error"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("error request");
     server
@@ -5097,7 +5100,7 @@ async fn upstream_done_or_eof_without_completed_emits_response_failed_not_done_o
 
         let response = post_responses(
             app,
-            json!({"model":"gpt-5.4","input":format!("terminal-{case_name}")}),
+            json!({"model":"gpt-6-sol","input":format!("terminal-{case_name}")}),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -5156,7 +5159,7 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let initial = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let initial = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     let _ = server.recv_client_message().await.expect("seed request");
     server
         .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
@@ -5168,7 +5171,7 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
     let response = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"malformed",
             "previous_response_id":"response-1"
         }),
@@ -5196,7 +5199,7 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
     let retried = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"retry",
             "previous_response_id":"response-1"
         }),
@@ -5219,7 +5222,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let first = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"first"})).await;
+    let first = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"first"})).await;
     let _ = server.recv_client_message().await.expect("first request");
     server
         .send_text(
@@ -5233,7 +5236,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     let second = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"second",
             "previous_response_id":"response-parent"
         }),
@@ -5257,7 +5260,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     let third = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"third",
             "previous_response_id":"response-parent"
         }),
@@ -5281,7 +5284,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
     let fourth = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"fourth",
             "previous_response_id":"response-child"
         }),
@@ -5319,7 +5322,7 @@ async fn supported_request_fields_are_preserved_while_codex_unsupported_fields_a
         app,
         json!({
             "type":"wrong.type",
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
             "tools":[{
                 "type":"function",
@@ -5381,7 +5384,7 @@ async fn supported_request_fields_are_preserved_while_codex_unsupported_fields_a
 }
 
 #[tokio::test]
-async fn advertised_main_gpt_5_6_injects_persistent_reasoning_and_preserves_reasoning_fields() {
+async fn advertised_main_model_injects_persistent_reasoning_and_preserves_reasoning_fields() {
     let server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![PlannedConnection {
         server: Arc::clone(&server),
@@ -5398,7 +5401,7 @@ async fn advertised_main_gpt_5_6_injects_persistent_reasoning_and_preserves_reas
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-main-gpt-5.6-terra",
+            "model":"threadline-main-gpt-6-sol",
             "input":"persist reasoning across turns",
             "reasoning":{"effort":"high","summary":"detailed"}
         }),
@@ -5411,7 +5414,7 @@ async fn advertised_main_gpt_5_6_injects_persistent_reasoning_and_preserves_reas
     ))
     .expect("request json");
     assert_eq!(request_payload["type"], "response.create");
-    assert_eq!(request_payload["model"], "gpt-5.6-terra");
+    assert_eq!(request_payload["model"], "gpt-6-sol");
     assert_eq!(
         request_payload["reasoning"],
         json!({"context":"all_turns","effort":"high","summary":"detailed"})
@@ -5426,7 +5429,7 @@ async fn advertised_main_gpt_5_6_injects_persistent_reasoning_and_preserves_reas
 }
 
 #[tokio::test]
-async fn raw_main_gpt_5_6_injects_persistent_reasoning_for_missing_null_and_object_reasoning() {
+async fn raw_main_models_inject_persistent_reasoning_for_missing_null_and_object_reasoning() {
     let enabled_main_config = ThreadlineConfig {
         persistent_reasoning_enabled: true,
         ..ThreadlineConfig::default()
@@ -5452,7 +5455,7 @@ async fn raw_main_gpt_5_6_injects_persistent_reasoning_for_missing_null_and_obje
         ),
     ];
 
-    for model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+    for model_id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
         for (case_name, request, expected_reasoning) in &reasoning_cases {
             let mut request = request.clone();
             request
@@ -5475,8 +5478,8 @@ async fn raw_main_gpt_5_6_injects_persistent_reasoning_for_missing_null_and_obje
 }
 
 #[tokio::test]
-async fn raw_main_gpt_5_6_preserves_disabled_default_and_client_explicit_all_turns() {
-    for model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+async fn raw_main_models_preserve_disabled_default_and_client_explicit_all_turns() {
+    for model_id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
         let disabled_payload = completed_response_create_payload(
             ThreadlineConfig::default(),
             json!({ "model": model_id, "input": "disabled reasoning" }),
@@ -5517,7 +5520,7 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
             "disabled",
             ThreadlineConfig::default(),
             json!({
-                "model":"threadline-main-gpt-5.6-terra",
+                "model":"threadline-main-gpt-6-sol",
                 "input":"disabled reasoning"
             }),
             None,
@@ -5526,7 +5529,7 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
             "missing",
             enabled_main_config.clone(),
             json!({
-                "model":"threadline-main-gpt-5.6-terra",
+                "model":"threadline-main-gpt-6-sol",
                 "input":"missing reasoning"
             }),
             Some(json!({"context":"all_turns"})),
@@ -5535,7 +5538,7 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
             "null",
             enabled_main_config.clone(),
             json!({
-                "model":"threadline-main-gpt-5.6-terra",
+                "model":"threadline-main-gpt-6-sol",
                 "input":"null reasoning",
                 "reasoning":null
             }),
@@ -5545,7 +5548,7 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
             "null context",
             enabled_main_config.clone(),
             json!({
-                "model":"threadline-main-gpt-5.6-terra",
+                "model":"threadline-main-gpt-6-sol",
                 "input":"null context",
                 "reasoning":{"context":null,"effort":"low"}
             }),
@@ -5555,7 +5558,7 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
             "non-string context",
             enabled_main_config.clone(),
             json!({
-                "model":"threadline-main-gpt-5.6-terra",
+                "model":"threadline-main-gpt-6-sol",
                 "input":"non-string context",
                 "reasoning":{"context":["all_turns"],"effort":"medium"}
             }),
@@ -5565,7 +5568,7 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
             "non-object reasoning",
             enabled_main_config.clone(),
             json!({
-                "model":"threadline-main-gpt-5.6-terra",
+                "model":"threadline-main-gpt-6-sol",
                 "input":"non-object reasoning",
                 "reasoning":"opaque"
             }),
@@ -5575,7 +5578,7 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
             "summary off",
             enabled_main_config,
             json!({
-                "model":"threadline-main-gpt-5.6-terra",
+                "model":"threadline-main-gpt-6-sol",
                 "input":"summary off",
                 "reasoning":{"summary":"off"}
             }),
@@ -5598,90 +5601,22 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
 }
 
 #[tokio::test]
-async fn persistent_reasoning_does_not_auto_inject_for_ineligible_main_or_utility_models() {
-    let enabled_main_config = ThreadlineConfig {
-        persistent_reasoning_enabled: true,
-        ..ThreadlineConfig::default()
-    };
+async fn persistent_reasoning_does_not_auto_inject_for_utility_profile() {
     let enabled_utility_config = ThreadlineConfig {
         profile: RouteProfile::Utility,
         persistent_reasoning_enabled: true,
         ..ThreadlineConfig::default()
     };
-    let cases = [
-        (
-            "advertised gpt-5.5",
-            enabled_main_config.clone(),
-            "threadline-main-gpt-5.5",
-        ),
-        (
-            "advertised gpt-5.4",
-            enabled_main_config,
-            "threadline-main-gpt-5.4",
-        ),
-        (
-            "raw gpt-5.5",
-            ThreadlineConfig {
-                persistent_reasoning_enabled: true,
-                ..ThreadlineConfig::default()
-            },
-            "gpt-5.5",
-        ),
-        (
-            "raw gpt-5.4",
-            ThreadlineConfig {
-                persistent_reasoning_enabled: true,
-                ..ThreadlineConfig::default()
-            },
-            "gpt-5.4",
-        ),
-        (
-            "raw gpt-5.4-mini",
-            ThreadlineConfig {
-                persistent_reasoning_enabled: true,
-                ..ThreadlineConfig::default()
-            },
-            "gpt-5.4-mini",
-        ),
-        (
-            "raw gpt-5.3-codex-spark",
-            ThreadlineConfig {
-                persistent_reasoning_enabled: true,
-                ..ThreadlineConfig::default()
-            },
-            "gpt-5.3-codex-spark",
-        ),
-        (
-            "utility profile",
-            enabled_utility_config,
-            "threadline-utility-gpt-5.4-mini",
-        ),
-        (
-            "utility luna",
-            ThreadlineConfig {
-                profile: RouteProfile::Utility,
-                persistent_reasoning_enabled: true,
-                ..ThreadlineConfig::default()
-            },
-            "threadline-utility-gpt-5.6-luna",
-        ),
-    ];
-
-    for (case_name, config, model) in cases {
-        let request_payload = completed_response_create_payload(
-            config,
-            json!({"model":model,"input":"ineligible persistent reasoning"}),
-        )
-        .await;
-        assert_eq!(
-            request_payload["type"], "response.create",
-            "case={case_name}"
-        );
-        assert!(
-            request_payload.get("reasoning").is_none(),
-            "case={case_name}: unexpected persistent reasoning injection"
-        );
-    }
+    let request_payload = completed_response_create_payload(
+        enabled_utility_config,
+        json!({
+            "model": "threadline-utility-gpt-6-luna",
+            "input": "utility persistent reasoning"
+        }),
+    )
+    .await;
+    assert_eq!(request_payload["type"], "response.create");
+    assert!(request_payload.get("reasoning").is_none());
 }
 
 #[tokio::test]
@@ -5702,7 +5637,7 @@ async fn utility_model_alias_rewrites_upstream_model() {
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-utility-gpt-5.4-mini",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"utility-alias"
         }),
     )
@@ -5714,7 +5649,7 @@ async fn utility_model_alias_rewrites_upstream_model() {
     ))
     .expect("request json");
     assert_eq!(request_payload["type"], "response.create");
-    assert_eq!(request_payload["model"], "gpt-5.4-mini");
+    assert_eq!(request_payload["model"], "gpt-6-luna");
 
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-utility-alias"}}"#)
@@ -5742,7 +5677,7 @@ async fn utility_luna_alias_rewrites_upstream_model() {
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-utility-gpt-5.6-luna",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"utility-luna-alias"
         }),
     )
@@ -5754,7 +5689,7 @@ async fn utility_luna_alias_rewrites_upstream_model() {
     ))
     .expect("request json");
     assert_eq!(request_payload["type"], "response.create");
-    assert_eq!(request_payload["model"], "gpt-5.6-luna");
+    assert_eq!(request_payload["model"], "gpt-6-luna");
 
     server
         .send_text(
@@ -5784,7 +5719,7 @@ async fn utility_reasoning_effort_is_preserved() {
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-utility-gpt-5.4-mini",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"utility-reasoning",
             "reasoning":{"effort":"high","summary":"auto"}
         }),
@@ -5796,7 +5731,7 @@ async fn utility_reasoning_effort_is_preserved() {
         server.recv_client_message().await.expect("request message"),
     ))
     .expect("request json");
-    assert_eq!(request_payload["model"], "gpt-5.4-mini");
+    assert_eq!(request_payload["model"], "gpt-6-luna");
     assert_eq!(
         request_payload["reasoning"],
         json!({"effort":"high","summary":"auto"})
@@ -5805,58 +5740,6 @@ async fn utility_reasoning_effort_is_preserved() {
     server
         .send_text(
             r#"{"type":"response.completed","response":{"id":"response-utility-reasoning"}}"#,
-        )
-        .await;
-    let _ = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
-}
-
-#[tokio::test]
-async fn utility_reasoning_all_turns_and_encrypted_content_are_preserved_for_supported_model() {
-    let server = Arc::new(ScriptedWebSocketServer::start().await);
-    let connector = RecordingConnector::new(vec![PlannedConnection {
-        server: Arc::clone(&server),
-        turn_state: None,
-    }]);
-    let app = build_test_router(
-        ThreadlineConfig {
-            profile: RouteProfile::Utility,
-            ..ThreadlineConfig::default()
-        },
-        Arc::new(connector),
-    );
-
-    let response = post_responses(
-        app,
-        json!({
-            "model":"threadline-utility-gpt-5.4-mini",
-            "input":"utility-all-turns-supported",
-            "reasoning":{"context":"all_turns","effort":"high"},
-            "include":["reasoning.encrypted_content"]
-        }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let request_payload: Value = serde_json::from_str(&message_text(
-        server.recv_client_message().await.expect("request message"),
-    ))
-    .expect("request json");
-    assert_eq!(request_payload["type"], "response.create");
-    assert_eq!(request_payload["model"], "gpt-5.4-mini");
-    assert_eq!(
-        request_payload["reasoning"],
-        json!({"context":"all_turns","effort":"high"})
-    );
-    assert_eq!(
-        request_payload["include"],
-        json!(["reasoning.encrypted_content"])
-    );
-
-    server
-        .send_text(
-            r#"{"type":"response.completed","response":{"id":"response-utility-all-turns"}}"#,
         )
         .await;
     let _ = to_bytes(response.into_body(), usize::MAX)
@@ -5882,7 +5765,7 @@ async fn utility_luna_reasoning_all_turns_and_encrypted_content_are_preserved() 
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-utility-gpt-5.6-luna",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"utility-luna-all-turns",
             "reasoning":{"context":"all_turns","effort":"high"},
             "include":["reasoning.encrypted_content"]
@@ -5896,7 +5779,7 @@ async fn utility_luna_reasoning_all_turns_and_encrypted_content_are_preserved() 
     ))
     .expect("request json");
     assert_eq!(request_payload["type"], "response.create");
-    assert_eq!(request_payload["model"], "gpt-5.6-luna");
+    assert_eq!(request_payload["model"], "gpt-6-luna");
     assert_eq!(
         request_payload["reasoning"],
         json!({"context":"all_turns","effort":"high"})
@@ -5937,7 +5820,7 @@ async fn utility_request_omits_previous_response_id_context_management_and_threa
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-utility-gpt-5.4-mini",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"utility-upstream-normalization",
             "previous_response_id":"response-stale",
             "context_management":{
@@ -5975,7 +5858,7 @@ async fn utility_request_omits_previous_response_id_context_management_and_threa
     ))
     .expect("request json");
     assert_eq!(request_payload["type"], "response.create");
-    assert_eq!(request_payload["model"], "gpt-5.4-mini");
+    assert_eq!(request_payload["model"], "gpt-6-luna");
     assert!(request_payload.get("previous_response_id").is_none());
     assert!(request_payload.get("context_management").is_none());
     assert_eq!(
@@ -6026,7 +5909,7 @@ async fn utility_requests_ignore_retained_capacity_and_open_fresh_sessions() {
     let first = post_responses(
         app.clone(),
         json!({
-            "model":"threadline-utility-gpt-5.4-mini",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"first utility request"
         }),
     )
@@ -6045,7 +5928,7 @@ async fn utility_requests_ignore_retained_capacity_and_open_fresh_sessions() {
     let second = post_responses(
         app.clone(),
         json!({
-            "model":"threadline-utility-gpt-5.4-mini",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"second utility request",
             "previous_response_id":"response-utility-stale"
         }),
@@ -6099,7 +5982,7 @@ async fn utility_does_not_execute_upstream_threadline_job_calls_locally() {
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-utility-gpt-5.4-mini",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"utility-job-tool-call"
         }),
     )
@@ -6177,7 +6060,7 @@ async fn utility_terminal_completion_drops_transient_upstream_handle() {
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-utility-gpt-5.4-mini",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"utility-cleanup"
         }),
     )
@@ -6372,7 +6255,7 @@ async fn main_profile_virtual_tool_summarizer_is_not_injected() {
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":[
                 {
                     "type":"message",
@@ -6427,7 +6310,7 @@ async fn utility_ordinary_request_does_not_receive_virtual_tool_instruction() {
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-utility-gpt-5.4-mini",
+            "model":"threadline-utility-gpt-6-luna",
             "input":"Return a short utility answer about the current repository status."
         }),
     )
@@ -6471,7 +6354,7 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
         app.clone(),
         json!({
             "type":"wrong.type",
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
             "max_output_tokens":321,
             "max_tokens":654,
@@ -6508,7 +6391,7 @@ async fn missing_or_null_instructions_are_normalized_for_upstream_response_creat
         app,
         json!({
             "type":"wrong.type",
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello again"}]}],
             "instructions":null,
             "max_output_tokens":654,
@@ -6553,7 +6436,7 @@ async fn explicit_instructions_are_preserved_in_upstream_response_create() {
         app,
         json!({
             "type":"wrong.type",
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":[{"role":"user","content":[{"type":"input_text","text":"preserve me"}]}],
             "instructions":"explicit downstream instructions",
             "max_output_tokens":987,
@@ -6727,8 +6610,11 @@ async fn capture_visible_apply_patch_stream() -> ApplyPatchStreamCapture {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response =
-        post_responses(app, json!({"model":"gpt-5.4","input":"apply-patch-stream"})).await;
+    let response = post_responses(
+        app,
+        json!({"model":"gpt-6-sol","input":"apply-patch-stream"}),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let _ = server
@@ -6888,8 +6774,11 @@ async fn capture_compaction_stream(compaction_name_field: &str) -> CompactionStr
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response =
-        post_responses(app, json!({"model":"gpt-5.4","input":"compaction-stream"})).await;
+    let response = post_responses(
+        app,
+        json!({"model":"gpt-6-sol","input":"compaction-stream"}),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let _ = server
@@ -7015,7 +6904,7 @@ async fn capture_completed_output_stream(
 
     let response = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"completed-output-stream"}),
+        json!({"model":"gpt-6-sol","input":"completed-output-stream"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -7401,7 +7290,8 @@ async fn compaction_output_item_done_counts_as_observable_output_when_forwarded(
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"compaction-only"})).await;
+    let response =
+        post_responses(app, json!({"model":"gpt-6-sol","input":"compaction-only"})).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let _ = server
@@ -7541,7 +7431,7 @@ async fn stalled_fresh_body_overflow_closes_pump_before_failure_is_polled() {
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"overflow"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"overflow"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("response.create");
 
@@ -7579,7 +7469,7 @@ async fn stalled_continued_body_overflow_closes_pump_before_first_event_is_polle
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -7592,7 +7482,7 @@ async fn stalled_continued_body_overflow_closes_pump_before_first_event_is_polle
     let continued = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"continued overflow",
             "previous_response_id":"response-1"
         }),
@@ -7642,7 +7532,7 @@ async fn dropping_stalled_active_body_after_overflow_invalidates_marker_without_
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -7655,7 +7545,7 @@ async fn dropping_stalled_active_body_after_overflow_invalidates_marker_without_
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"active overflow",
             "previous_response_id":"response-1"
         }),
@@ -7678,7 +7568,7 @@ async fn dropping_stalled_active_body_after_overflow_invalidates_marker_without_
     let rejected = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"replay",
             "previous_response_id":"response-1"
         }),
@@ -7708,7 +7598,7 @@ async fn overflow_before_final_completion_acceptance_fails_and_invalidates_marke
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    let response = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"final"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("response.create");
     server
@@ -7733,7 +7623,7 @@ async fn overflow_before_final_completion_acceptance_fails_and_invalidates_marke
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-final"
         }),
@@ -7763,7 +7653,7 @@ async fn overflow_after_synthetic_delta_discards_queued_forwarded_event_before_f
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"queued output"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"queued output"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("response.create");
     server
@@ -7814,7 +7704,7 @@ async fn liveness_timeout_after_synthetic_delta_discards_queued_forwarded_event_
     let connector_observer = connector.clone();
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"queued output"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"queued output"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("response.create");
     server
@@ -7855,7 +7745,7 @@ async fn overflow_after_final_completion_acceptance_preserves_single_success_the
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    let response = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"final"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("response.create");
     server
@@ -7893,7 +7783,7 @@ async fn overflow_after_final_completion_acceptance_preserves_single_success_the
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-final"
         }),
@@ -7933,7 +7823,7 @@ async fn event_after_completed_aliases_liveness_timeout_preserves_only_prior_mar
     for (previous_response_id, response_id) in
         [(None, "response-1"), (Some("response-1"), "response-2")]
     {
-        let mut payload = json!({"model":"gpt-5.4","input":"completed turn"});
+        let mut payload = json!({"model":"gpt-6-sol","input":"completed turn"});
         if let Some(previous_response_id) = previous_response_id {
             payload["previous_response_id"] = json!(previous_response_id);
         }
@@ -7950,7 +7840,7 @@ async fn event_after_completed_aliases_liveness_timeout_preserves_only_prior_mar
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"active after upstream event",
             "previous_response_id":"response-2"
         }),
@@ -7978,7 +7868,7 @@ async fn event_after_completed_aliases_liveness_timeout_preserves_only_prior_mar
         let resumed = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"resume after timeout",
                 "previous_response_id":marker
             }),
@@ -8024,7 +7914,7 @@ async fn event_after_fresh_liveness_timeout_removes_markerless_entry_and_release
         Arc::new(connector.clone()),
     );
 
-    let active = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"fresh"})).await;
+    let active = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"fresh"})).await;
     assert_eq!(active.status(), StatusCode::OK);
     timed_out_server
         .send_text(r#"{"type":"response.created","response":{"id":"response-failed"}}"#)
@@ -8043,7 +7933,7 @@ async fn event_after_fresh_liveness_timeout_removes_markerless_entry_and_release
 
     let replacement = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"replacement session"}),
+        json!({"model":"gpt-6-sol","input":"replacement session"}),
     )
     .await;
     assert_eq!(replacement.status(), StatusCode::OK);
@@ -8068,7 +7958,7 @@ async fn dropping_armed_body_before_liveness_observation_invalidates_completed_a
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     server
         .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
@@ -8080,7 +7970,7 @@ async fn dropping_armed_body_before_liveness_observation_invalidates_completed_a
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"armed continuation",
             "previous_response_id":"response-1"
         }),
@@ -8092,7 +7982,7 @@ async fn dropping_armed_body_before_liveness_observation_invalidates_completed_a
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-1"
         }),
@@ -8123,7 +8013,7 @@ async fn liveness_timeout_before_final_completion_acceptance_discards_completion
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    let response = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"final"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     server
         .send_text(&assistant_text_completed_event("response-final", "final answer").to_string())
@@ -8142,7 +8032,7 @@ async fn liveness_timeout_before_final_completion_acceptance_discards_completion
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-final"
         }),
@@ -8172,7 +8062,7 @@ async fn liveness_timeout_after_final_completion_acceptance_preserves_success_an
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    let response = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"final"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     server
         .send_text(&assistant_text_completed_event("response-final", "final answer").to_string())
@@ -8200,7 +8090,7 @@ async fn liveness_timeout_after_final_completion_acceptance_preserves_success_an
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-final"
         }),
@@ -8229,7 +8119,7 @@ async fn queued_final_completion_survives_normal_close_before_body_polling() {
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let response = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"final"})).await;
+    let response = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"final"})).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("response.create");
     server
@@ -8251,7 +8141,7 @@ async fn queued_final_completion_survives_normal_close_before_body_polling() {
     let resumed = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume",
             "previous_response_id":"response-final"
         }),
@@ -8297,7 +8187,7 @@ async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry
     for (previous_response_id, response_id) in
         [(None, "response-1"), (Some("response-1"), "response-2")]
     {
-        let mut payload = json!({"model":"gpt-5.4","input":"completed turn"});
+        let mut payload = json!({"model":"gpt-6-sol","input":"completed turn"});
         if let Some(previous_response_id) = previous_response_id {
             payload["previous_response_id"] = Value::String(previous_response_id.to_string());
         }
@@ -8318,7 +8208,7 @@ async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"overflow active turn",
             "previous_response_id":"response-2"
         }),
@@ -8345,7 +8235,7 @@ async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry
     let conflict = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"conflicting overflow acquire",
             "previous_response_id":"response-2"
         }),
@@ -8374,7 +8264,7 @@ async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry
         let rejected = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"rejected alias",
                 "previous_response_id": marker
             }),
@@ -8390,7 +8280,7 @@ async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry
 
     let replacement = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"replacement session"}),
+        json!({"model":"gpt-6-sol","input":"replacement session"}),
     )
     .await;
     assert_eq!(replacement.status(), StatusCode::OK);
@@ -8411,7 +8301,7 @@ async fn fresh_first_send_overflow_returns_fixed_error_without_a_retry() {
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let response = post_responses(app, json!({"model":"gpt-5.4","input":"fresh overflow"})).await;
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"fresh overflow"})).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -8441,7 +8331,7 @@ async fn continued_preflight_overflow_returns_fixed_error_without_reconnect_or_r
     );
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = retained_server
         .recv_client_message()
@@ -8470,7 +8360,7 @@ async fn continued_preflight_overflow_returns_fixed_error_without_reconnect_or_r
     let response = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"continued overflow",
             "previous_response_id":"response-1"
         }),
@@ -8527,7 +8417,7 @@ async fn idle_overflow_repeats_for_all_aliases_detaches_live_handle_and_evicts_n
     for (previous_response_id, response_id) in
         [(None, "response-1"), (Some("response-1"), "response-2")]
     {
-        let mut payload = json!({"model":"gpt-5.4","input":"completed turn"});
+        let mut payload = json!({"model":"gpt-6-sol","input":"completed turn"});
         if let Some(previous_response_id) = previous_response_id {
             payload["previous_response_id"] = Value::String(previous_response_id.to_string());
         }
@@ -8563,7 +8453,7 @@ async fn idle_overflow_repeats_for_all_aliases_detaches_live_handle_and_evicts_n
         let rejected = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"idle overflow alias",
                 "previous_response_id": marker
             }),
@@ -8587,7 +8477,7 @@ async fn idle_overflow_repeats_for_all_aliases_detaches_live_handle_and_evicts_n
 
     let replacement = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"replacement session"}),
+        json!({"model":"gpt-6-sol","input":"replacement session"}),
     )
     .await;
     assert_eq!(replacement.status(), StatusCode::OK);
@@ -8602,7 +8492,7 @@ async fn idle_overflow_repeats_for_all_aliases_detaches_live_handle_and_evicts_n
         let evicted = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"evicted alias",
                 "previous_response_id": marker
             }),
@@ -8676,7 +8566,7 @@ async fn auxiliary_summary_overflow_is_transient_and_leaves_retained_capacity_av
             .is_empty()
     );
 
-    let ordinary = post_responses(app, json!({"model":"gpt-5.4","input":"ordinary"})).await;
+    let ordinary = post_responses(app, json!({"model":"gpt-6-sol","input":"ordinary"})).await;
     assert_eq!(ordinary.status(), StatusCode::OK);
     let _ = ordinary_server
         .recv_client_message()
@@ -8714,7 +8604,7 @@ async fn utility_overflow_is_transient_and_does_not_retry_the_connection() {
 
     let response = post_responses(
         app.clone(),
-        json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility"}),
+        json!({"model":"threadline-utility-gpt-6-luna","input":"utility"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -8752,7 +8642,7 @@ async fn utility_overflow_is_transient_and_does_not_retry_the_connection() {
 
     let next = post_responses(
         app,
-        json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility retry"}),
+        json!({"model":"threadline-utility-gpt-6-luna","input":"utility retry"}),
     )
     .await;
     assert_eq!(next.status(), StatusCode::OK);
@@ -8796,7 +8686,7 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
         Arc::new(connector.clone()),
     );
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = main_server
         .recv_client_message()
@@ -8930,7 +8820,7 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
 
     let resumed = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"resume","previous_response_id":"response-main"}),
+        json!({"model":"gpt-6-sol","input":"resume","previous_response_id":"response-main"}),
     )
     .await;
     assert_eq!(resumed.status(), StatusCode::OK);
@@ -8985,7 +8875,7 @@ async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
         Arc::new(connector.clone()),
     );
 
-    let missed = post_responses(app.clone(), json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility missed pong","previous_response_id":"response-main"})).await;
+    let missed = post_responses(app.clone(), json!({"model":"threadline-utility-gpt-6-luna","input":"utility missed pong","previous_response_id":"response-main"})).await;
     assert_eq!(missed.status(), StatusCode::OK);
     wait_for_liveness_timeout(&connector, 0).await;
     let threadline::ws_pump::UpstreamTerminalState::LivenessTimeout(expired) =
@@ -9015,7 +8905,7 @@ async fn utility_missed_pong_and_matching_pongs_release_transient_upstreams() {
     assert!(!missed_text.contains("event: response.completed"));
     wait_for_websocket_release(&connector, 0).await;
 
-    let healthy = post_responses(app, json!({"model":"threadline-utility-gpt-5.4-mini","input":"utility healthy","previous_response_id":"response-main"})).await;
+    let healthy = post_responses(app, json!({"model":"threadline-utility-gpt-6-luna","input":"utility healthy","previous_response_id":"response-main"})).await;
     assert_eq!(healthy.status(), StatusCode::OK);
     let healthy_upstream = connector.recorded_websockets().await[1]
         .upgrade()
@@ -9570,7 +9460,7 @@ async fn internal_function_call_completed_output_remains_sanitized_and_non_obser
 
     let response = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"internal-only-completed"}),
+        json!({"model":"gpt-6-sol","input":"internal-only-completed"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -9619,7 +9509,7 @@ async fn internal_function_call_completed_output_remains_sanitized_and_non_obser
     let rejected = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"invalid-internal-only-resume",
             "previous_response_id":"response-internal-only"
         }),
@@ -9690,7 +9580,7 @@ async fn auxiliary_summary_compaction_only_completed_preserves_transient_behavio
     let rejected = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"invalid-summary-resume",
             "previous_response_id":"response-summary"
         }),
@@ -9744,7 +9634,7 @@ async fn forwarded_tool_event_does_not_hide_upstream_response_failed() {
 
     let response = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"visible-tool-then-upstream-failed"}),
+        json!({"model":"gpt-6-sol","input":"visible-tool-then-upstream-failed"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -9888,7 +9778,7 @@ async fn completed_only_synthetic_delta_precedes_completed_and_done_chunks() {
 
     let response = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"completed-output-order"}),
+        json!({"model":"gpt-6-sol","input":"completed-output-order"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -9952,7 +9842,7 @@ async fn completed_output_marker_is_reusable_after_completed_before_done() {
     }]);
     let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -9965,7 +9855,7 @@ async fn completed_output_marker_is_reusable_after_completed_before_done() {
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"completed-output-order",
             "previous_response_id":"response-1"
         }),
@@ -10017,7 +9907,7 @@ async fn completed_output_marker_is_reusable_after_completed_before_done() {
     let resumed = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume-before-queued-completed",
             "previous_response_id":"response-ordering"
         }),

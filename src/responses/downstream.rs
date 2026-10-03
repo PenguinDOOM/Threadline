@@ -162,15 +162,6 @@ pub(super) fn looks_like_auxiliary_summary_conflict_fallback(
     collect_conflict_fallback_summary_fingerprints(input).matches_auxiliary_summary()
 }
 
-pub(super) fn wants_reasoning_all_turns(payload: &serde_json::Map<String, Value>) -> bool {
-    payload
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| reasoning.get("context"))
-        .and_then(Value::as_str)
-        == Some("all_turns")
-}
-
 #[derive(Debug, Clone, Default)]
 pub(super) struct DownstreamRequestRoutingDiagnostics {
     pub(super) summary_hits: SummaryFingerprintHits,
@@ -728,7 +719,7 @@ mod tests {
         looks_like_auxiliary_summary_conflict_fallback, parse_downstream_request,
         parse_downstream_request_with_metadata, safe_scalar_field, sse_done_chunk, sse_error_chunk,
         sse_json_chunk, sse_payload_chunk, sse_terminal_response_failed_chunk,
-        sse_terminal_response_incomplete_chunk, wants_reasoning_all_turns,
+        sse_terminal_response_incomplete_chunk,
     };
     use crate::errors::ThreadlineError;
     use serde_json::{Value, json};
@@ -855,57 +846,6 @@ mod tests {
         })
     }
 
-    #[test]
-    fn wants_reasoning_all_turns_matches_only_exact_string_value() {
-        assert!(wants_reasoning_all_turns(
-            json!({
-                "reasoning": {
-                    "context": "all_turns"
-                }
-            })
-            .as_object()
-            .expect("object payload")
-        ));
-
-        assert!(!wants_reasoning_all_turns(
-            json!({
-                "reasoning": {
-                    "context": "last_turn"
-                }
-            })
-            .as_object()
-            .expect("object payload")
-        ));
-    }
-
-    #[test]
-    fn wants_reasoning_all_turns_returns_false_for_missing_or_non_object_reasoning() {
-        assert!(!wants_reasoning_all_turns(
-            json!({ "input": "no reasoning" })
-                .as_object()
-                .expect("object payload")
-        ));
-
-        assert!(!wants_reasoning_all_turns(
-            json!({ "reasoning": "all_turns" })
-                .as_object()
-                .expect("object payload")
-        ));
-    }
-
-    #[test]
-    fn wants_reasoning_all_turns_returns_false_for_non_string_context() {
-        assert!(!wants_reasoning_all_turns(
-            json!({
-                "reasoning": {
-                    "context": true
-                }
-            })
-            .as_object()
-            .expect("object payload")
-        ));
-    }
-
     fn new_auto_system_summary_input_item() -> Value {
         input_text_message("system", new_auto_system_summary_text())
     }
@@ -947,7 +887,7 @@ mod tests {
 
     fn sanitized_observed_auxiliary_summary_request() -> Value {
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "previous_response_id": "resp_123",
             "context_management": {
                 "type": "compaction",
@@ -1000,13 +940,13 @@ mod tests {
     fn parse_downstream_request_extracts_previous_response_id_and_payload() {
         let request = parse_downstream_request(json!({
             "previous_response_id": "resp_123",
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "stream": true
         }))
         .expect("parse request");
 
         assert_eq!(request.previous_response_id.as_deref(), Some("resp_123"));
-        assert_eq!(request.payload.get("model"), Some(&json!("gpt-5.4")));
+        assert_eq!(request.payload.get("model"), Some(&json!("gpt-6-sol")));
         assert_eq!(request.payload.get("stream"), Some(&json!(true)));
         assert!(!request.payload.contains_key("previous_response_id"));
     }
@@ -1846,7 +1786,7 @@ mod tests {
         let chunk = sse_terminal_response_incomplete_chunk(&json!({
             "response": {
                 "id": "response-1",
-                "model": "gpt-5.4",
+                "model": "gpt-6-sol",
                 "usage": {
                     "input_tokens": 4,
                     "output_tokens": 2,
@@ -1881,7 +1821,7 @@ mod tests {
 
         assert_eq!(payload["type"], "response.incomplete");
         assert_eq!(payload["response"]["id"], "response-1");
-        assert_eq!(payload["response"]["model"], "gpt-5.4");
+        assert_eq!(payload["response"]["model"], "gpt-6-sol");
         assert_eq!(payload["response"]["usage"]["total_tokens"], 6);
         assert_eq!(
             payload["response"]["output"][0]["content"][0]["text"],

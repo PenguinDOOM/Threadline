@@ -318,7 +318,7 @@ fn downstream_function_tool(name: &str) -> Value {
 
 fn auxiliary_summary_request_with_tools(tools: Vec<Value>) -> Value {
     json!({
-        "model": "gpt-5.4",
+        "model": "gpt-6-sol",
         "input": [
             {
                 "type": "message",
@@ -362,7 +362,7 @@ fn new_auto_final_summary_prompt_text() -> &'static str {
 
 fn new_auto_summary_request_with_tools(tools: Vec<Value>) -> Value {
     json!({
-        "model": "gpt-5.4",
+        "model": "gpt-6-sol",
         "input": [
             {
                 "type": "message",
@@ -689,7 +689,7 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "run internal tool loop",
             "max_output_tokens": 512,
             "max_tokens": 256,
@@ -833,7 +833,7 @@ async fn internal_tool_followup_preserves_persistent_reasoning_context_and_outpu
     let response = post_responses(
         app,
         json!({
-            "model":"threadline-main-gpt-5.6-terra",
+            "model":"threadline-main-gpt-6-sol",
             "input":"run persistent internal tool loop",
             "reasoning":{"effort":"high","summary":"auto"}
         }),
@@ -853,7 +853,7 @@ async fn internal_tool_followup_preserves_persistent_reasoning_context_and_outpu
     .expect("initial request json");
     let expected_reasoning = json!({"context":"all_turns","effort":"high","summary":"auto"});
     assert_eq!(first_request["type"], "response.create");
-    assert_eq!(first_request["model"], "gpt-5.6-terra");
+    assert_eq!(first_request["model"], "gpt-6-sol");
     assert_eq!(first_request["reasoning"], expected_reasoning);
 
     server
@@ -920,7 +920,7 @@ async fn internal_tool_intermediate_text_does_not_leak_and_followup_fallback_sti
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "hide intermediate assistant text during internal tool follow-up"
         }),
     )
@@ -1053,7 +1053,7 @@ async fn internal_tool_intermediate_output_item_done_text_does_not_leak() {
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "hide intermediate output_item.done assistant text during internal tool follow-up"
         }),
     )
@@ -1168,7 +1168,7 @@ async fn internal_tool_pre_done_events_are_hidden_from_downstream() {
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "run internal tool loop",
         }),
     )
@@ -1500,7 +1500,7 @@ async fn non_internal_tool_events_continue_streaming_without_local_followup() {
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "run downstream tool",
             "tools": [
                 {
@@ -1591,7 +1591,7 @@ async fn non_internal_tool_added_and_done_events_stream_before_response_complete
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "stream observed downstream tool events",
             "tools": [
                 {
@@ -1686,7 +1686,7 @@ async fn explicit_upstream_failure_remains_terminal_failure_after_forwarded_exte
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "forward tool before terminal upstream failure",
             "tools": [
                 {
@@ -1767,7 +1767,7 @@ async fn internal_tool_added_and_done_events_stay_hidden_until_intermediate_comp
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "run hidden internal tool loop",
         }),
     )
@@ -1861,7 +1861,7 @@ async fn intermediate_internal_tool_completion_keeps_marker_active_until_followu
     }]);
     let app = build_test_router(Arc::new(connector));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -1876,7 +1876,7 @@ async fn intermediate_internal_tool_completion_keeps_marker_active_until_followu
     let active = post_responses(
         app.clone(),
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "run hidden internal tool loop",
             "previous_response_id": "response-1"
         }),
@@ -1925,7 +1925,7 @@ async fn intermediate_internal_tool_completion_keeps_marker_active_until_followu
     let conflict = post_responses(
         app.clone(),
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "conflict-before-followup-finish",
             "previous_response_id": "response-1"
         }),
@@ -1981,7 +1981,7 @@ async fn internal_tool_intermediate_completion_sends_followup_without_downstream
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "hold downstream terminal state until internal follow-up request exists"
         }),
     )
@@ -2065,7 +2065,7 @@ async fn internal_tool_argument_deltas_are_not_forwarded_downstream() {
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "hide internal tool argument deltas",
             "tools": [
                 {
@@ -2244,7 +2244,7 @@ async fn internal_tool_done_suppression_emits_stable_trace_event() {
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "trace suppressed internal tool completion",
             "stream": true
         }),
@@ -2330,7 +2330,7 @@ async fn internal_tool_followup_completed_only_text_is_synthesized_as_final_delt
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "synthesize final follow-up completed-only assistant text",
         }),
     )
@@ -2442,7 +2442,7 @@ async fn internal_tool_followup_output_item_done_message_becomes_final_completed
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "surface follow-up output_item.done assistant text as final completed output"
         }),
     )
@@ -2553,7 +2553,7 @@ async fn intermediate_internal_tool_completion_does_not_record_marker() {
     let response = post_responses(
         app.clone(),
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "do not record intermediate internal completion markers"
         }),
     )
@@ -2603,7 +2603,7 @@ async fn intermediate_internal_tool_completion_does_not_record_marker() {
     let rejected = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "invalid-intermediate-resume",
             "previous_response_id": "response-intermediate"
         }),
@@ -2632,7 +2632,7 @@ async fn internal_tool_followup_failure_emits_response_failed_without_internal_l
     let response = post_responses(
         app.clone(),
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "normalize internal-tool follow-up failure"
         }),
     )
@@ -2672,7 +2672,7 @@ async fn internal_tool_followup_failure_emits_response_failed_without_internal_l
 
     server
         .send_text(
-            r#"{"type":"response.failed","response":{"id":"response-followup-failed","model":"gpt-5.4","usage":{"input_tokens":4,"output_tokens":0,"total_tokens":4}},"error":{"code":"upstream_response_failed","message":"followup failed"}}"#,
+            r#"{"type":"response.failed","response":{"id":"response-followup-failed","model":"gpt-6-sol","usage":{"input_tokens":4,"output_tokens":0,"total_tokens":4}},"error":{"code":"upstream_response_failed","message":"followup failed"}}"#,
         )
         .await;
 
@@ -2697,7 +2697,7 @@ async fn internal_tool_followup_failure_emits_response_failed_without_internal_l
     let rejected = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "invalid-followup-failed-resume",
             "previous_response_id": "response-followup-failed"
         }),
@@ -2726,7 +2726,7 @@ async fn visible_followup_function_call_argument_delta_is_forwarded_when_output_
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "reuse output index after internal tool follow-up",
             "tools": [
                 {
@@ -2874,7 +2874,7 @@ async fn internal_tool_followup_empty_final_does_not_reuse_intermediate_observab
     let response = post_responses(
         app,
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-6-sol",
             "input": "final empty completion after internal follow-up"
         }),
     )
@@ -3597,7 +3597,7 @@ async fn overflow_after_internal_tool_execution_skips_followup_and_hides_interme
 
     let response = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"run internal tool loop"}),
+        json!({"model":"gpt-6-sol","input":"run internal tool loop"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3702,7 +3702,7 @@ async fn overflow_while_internal_tool_execution_is_pending_skips_followup_and_la
 
     let response = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"run internal tool loop"}),
+        json!({"model":"gpt-6-sol","input":"run internal tool loop"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3763,7 +3763,7 @@ async fn paused_internal_tool_execution_stays_live_across_matching_pongs_before_
 
     let response = post_responses(
         app.clone(),
-        json!({"model":"gpt-5.4","input":"run paused internal tool"}),
+        json!({"model":"gpt-6-sol","input":"run paused internal tool"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3869,7 +3869,7 @@ async fn paused_internal_tool_execution_stays_live_across_matching_pongs_before_
     let intermediate = post_responses(
         app,
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"resume intermediate",
             "previous_response_id":"response-intermediate"
         }),
@@ -3920,7 +3920,7 @@ async fn liveness_expiry_while_internal_tool_waits_skips_queued_work_and_keeps_p
         ),
     );
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -3940,7 +3940,7 @@ async fn liveness_expiry_while_internal_tool_waits_skips_queued_work_and_keeps_p
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"active internal tool",
             "previous_response_id":"response-1"
         }),
@@ -4000,7 +4000,7 @@ async fn liveness_expiry_while_internal_tool_waits_skips_queued_work_and_keeps_p
         let stale = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"retry marker",
                 "previous_response_id":marker
             }),
@@ -4017,7 +4017,7 @@ async fn liveness_expiry_while_internal_tool_waits_skips_queued_work_and_keeps_p
         );
     }
 
-    let replacement = post_responses(app, json!({"model":"gpt-5.4","input":"new session"})).await;
+    let replacement = post_responses(app, json!({"model":"gpt-6-sol","input":"new session"})).await;
     assert_eq!(replacement.status(), StatusCode::OK);
     let _ = replacement_server
         .recv_client_message()
@@ -4058,7 +4058,7 @@ async fn liveness_expiry_while_failing_internal_tool_waits_prioritizes_timeout()
 
     let response = post_responses(
         app,
-        json!({"model":"gpt-5.4","input":"failing internal tool"}),
+        json!({"model":"gpt-6-sol","input":"failing internal tool"}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -4129,7 +4129,7 @@ async fn liveness_timeout_after_internal_tool_followup_starts_invalidates_retain
     let connector_observer = connector.clone();
     let app = build_test_router(Arc::new(connector));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let _ = server.recv_client_message().await.expect("seed request");
     server
@@ -4153,7 +4153,7 @@ async fn liveness_timeout_after_internal_tool_followup_starts_invalidates_retain
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"active internal tool",
             "previous_response_id":"response-1"
         }),
@@ -4202,7 +4202,7 @@ async fn liveness_timeout_after_internal_tool_followup_starts_invalidates_retain
         let stale = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"retry marker",
                 "previous_response_id":marker
             }),
@@ -4270,7 +4270,7 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
     let connector_observer = connector.clone();
     let app = build_test_router(Arc::new(connector));
 
-    let seed = post_responses(app.clone(), json!({"model":"gpt-5.4","input":"seed"})).await;
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
     let websocket = connector_observer
         .recorded_websockets()
@@ -4295,7 +4295,7 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
     let active = post_responses(
         app.clone(),
         json!({
-            "model":"gpt-5.4",
+            "model":"gpt-6-sol",
             "input":"active internal tool",
             "previous_response_id":"response-accepted"
         }),
@@ -4378,7 +4378,7 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
         let stale = post_responses(
             app.clone(),
             json!({
-                "model":"gpt-5.4",
+                "model":"gpt-6-sol",
                 "input":"retry marker",
                 "previous_response_id":marker
             }),
