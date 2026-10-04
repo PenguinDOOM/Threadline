@@ -145,7 +145,14 @@ Threadline internal tools must use the `threadline_*` prefix.
 
 Internal tool calls must never be forwarded downstream to VSCode.
 
-When an upstream response emits a Threadline internal tool call, execute it locally and store the output as pending. Wait for the intermediate response to complete. Send a follow-up `response.create` with `function_call_output`. Continue reading the follow-up response. Forward only the final assistant output downstream.
+When an upstream response emits a Threadline internal tool call:
+
+1. Execute the tool locally.
+2. Store its output as pending.
+3. Wait for the intermediate response to complete.
+4. Send a follow-up `response.create` containing `function_call_output`.
+5. Continue reading the follow-up response.
+6. Forward only the final assistant output downstream.
 
 Do not send follow-up tool outputs before the intermediate response completes.
 
