@@ -23,7 +23,7 @@ fn close_diagnostics_eof_and_fallback_keep_the_first_observed_source() {
         let capture = diagnostics.capture();
         assert_eq!(capture.calls, 1);
         let output = String::from_utf8(capture.bytes.clone()).unwrap();
-        assert!(output.starts_with(&format!("[threadline] websocket closed source={source} code=- reason=- error=- connection_age_ms=")));
+        assert!(output.starts_with(&format!("[threadline] websocket closed source={source} code=- reason=- error=- protocol_kind=- connection_age_ms=")));
     }
     let diagnostics = CloseDiagnostics::new(true);
     let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
@@ -44,58 +44,152 @@ fn close_diagnostics_eof_and_fallback_keep_the_first_observed_source() {
             .unwrap()
             .contains("source=pump_exit_fallback")
     );
+    assert!(
+        String::from_utf8(capture.bytes.clone())
+            .unwrap()
+            .contains("error=- protocol_kind=-")
+    );
 }
 
 #[test]
 fn close_diagnostics_read_errors_use_typed_fields_and_preserve_original_metadata() {
-    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    let cases = close_diagnostic_io_error_cases()
+        .into_iter()
+        .chain(close_diagnostic_protocol_error_cases());
+    for (error, expected_error, expected_protocol_kind, expected_io_kind, expected_raw_os_error) in
+        cases
+    {
+        assert_read_error_diagnostic_case(
+            error,
+            expected_error,
+            expected_protocol_kind,
+            expected_io_kind,
+            expected_raw_os_error,
+        );
+    }
+}
 
-    for (error, expected) in [
+type ReadErrorDiagnosticCase = (
+    TungsteniteError,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+fn close_diagnostic_io_error_cases() -> [ReadErrorDiagnosticCase; 2] {
+    let raw_os_error = std::io::Error::from_raw_os_error(10054);
+    let raw_os_io_kind = safe_io_error_kind(raw_os_error.kind());
+
+    [
         (
             TungsteniteError::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "io-secret\r\n\x1b[31mBearer secret",
             )),
-            "error=io",
+            "io",
+            "-",
+            "connection_reset",
+            "-",
         ),
         (
-            TungsteniteError::Io(std::io::Error::from_raw_os_error(10054)),
-            "raw_os_error=10054",
+            TungsteniteError::Io(raw_os_error),
+            "io",
+            "-",
+            raw_os_io_kind,
+            "10054",
         ),
+    ]
+}
+
+fn close_diagnostic_protocol_error_cases() -> [ReadErrorDiagnosticCase; 5] {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+    [
         (
             TungsteniteError::Protocol(ProtocolError::InvalidHeader(
                 "x-protocol-secret".parse().unwrap(),
             )),
-            "error=protocol",
+            "protocol",
+            "invalid_header",
+            "-",
+            "-",
         ),
-    ] {
-        let original = error.to_string();
-        let diagnostics = CloseDiagnostics::new(true);
-        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
-        assert!(!handle_test_inbound(Some(Err(error)), &state, &diagnostics));
-        record_close(
-            &state,
-            empty_close_metadata(),
-            UpstreamCloseSource::PumpExitFallback,
-            &diagnostics,
-        );
-        assert_eq!(
-            *state.lock().unwrap(),
-            UpstreamTerminalState::Closed(UpstreamCloseMetadata {
-                code: None,
-                reason: None,
-                error: Some(original),
-            })
-        );
-        let capture = diagnostics.capture();
-        assert_eq!(capture.calls, 1);
-        let output = String::from_utf8(capture.bytes.clone()).unwrap();
-        assert!(output.contains("source=read_error"));
-        assert!(output.contains(expected));
-        assert!(!output.contains("secret"));
-        assert!(!output.contains(['\r', '\x1b']));
-        assert_eq!(output.lines().count(), 1);
-    }
+        (
+            TungsteniteError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+            "protocol",
+            "reset_without_closing_handshake",
+            "-",
+            "-",
+        ),
+        (
+            TungsteniteError::Protocol(ProtocolError::InvalidOpcode(17)),
+            "protocol",
+            "invalid_opcode",
+            "-",
+            "-",
+        ),
+        (
+            TungsteniteError::Protocol(ProtocolError::InvalidCloseSequence),
+            "protocol",
+            "invalid_close_sequence",
+            "-",
+            "-",
+        ),
+        (
+            TungsteniteError::Protocol(ProtocolError::MaskedFrameFromServer),
+            "protocol",
+            "masked_frame_from_server",
+            "-",
+            "-",
+        ),
+    ]
+}
+
+fn assert_read_error_diagnostic_case(
+    error: TungsteniteError,
+    expected_error: &str,
+    expected_protocol_kind: &str,
+    expected_io_kind: &str,
+    expected_raw_os_error: &str,
+) {
+    let original = error.to_string();
+    let diagnostics = CloseDiagnostics::new(true);
+    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    assert!(!handle_test_inbound(Some(Err(error)), &state, &diagnostics));
+    record_close(
+        &state,
+        empty_close_metadata(),
+        UpstreamCloseSource::PumpExitFallback,
+        &diagnostics,
+    );
+    assert_eq!(
+        *state.lock().unwrap(),
+        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+            code: None,
+            reason: None,
+            error: Some(original),
+        })
+    );
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    let output = String::from_utf8(capture.bytes.clone()).unwrap();
+    let age = output
+        .split_once("connection_age_ms=")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("connection age field");
+    assert!(!age.is_empty() && age.bytes().all(|byte| byte.is_ascii_digit()));
+    assert_eq!(
+        output,
+        format!(
+            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
+        )
+    );
+    assert!(output.ends_with('\n'));
+    assert_eq!(output.bytes().filter(|byte| *byte == b'\n').count(), 1);
+    assert!(!output.contains("secret"));
+    assert!(!output.contains(['\r', '\x1b']));
+    assert_eq!(output.lines().count(), 1);
 }
 
 #[test]
@@ -157,7 +251,7 @@ fn assert_redacted_peer_close(hostile: &str, reason: &'static str) {
         "" | "going away" | "normal closure" => reason,
         _ => "[redacted]",
     };
-    assert!(output.contains(&format!("reason={expected} error=-")));
+    assert!(output.contains(&format!("reason={expected} error=- protocol_kind=-")));
     assert!(!output.contains("secret"));
     assert!(!output.contains(['\r', '\x1b']));
     assert_eq!(output.lines().count(), 1);
@@ -192,7 +286,7 @@ fn assert_redacted_write_buffer_error(frame: Message) {
     assert_eq!(capture.calls, 1);
     let output = String::from_utf8(capture.bytes.clone()).unwrap();
     assert!(output.contains("source=write_error"));
-    assert!(output.contains("error=write_buffer_full"));
+    assert!(output.contains("error=write_buffer_full protocol_kind=-"));
     assert!(!output.contains("secret"));
     assert!(!output.contains(['\r', '\x1b']));
     assert_eq!(output.lines().count(), 1);
@@ -241,7 +335,7 @@ async fn close_diagnostics_constructor_peer_close_is_independent_of_off_subscrib
         if enabled {
             assert_eq!(
                 String::from_utf8(capture.bytes.clone()).unwrap(),
-                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- connection_age_ms=1234 io_kind=- raw_os_error=-\n"
+                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 io_kind=- raw_os_error=-\n"
             );
         } else {
             assert!(capture.bytes.is_empty());
@@ -289,7 +383,7 @@ async fn close_diagnostics_constructor_channel_close_records_once_in_both_dispat
         let capture = pump.diagnostics.capture();
         assert_eq!(capture.calls, 1);
         let output = String::from_utf8(capture.bytes.clone()).unwrap();
-        assert!(output.starts_with("[threadline] websocket closed source=outbound_channel_closed code=- reason=[redacted] error=- connection_age_ms="));
+        assert!(output.starts_with("[threadline] websocket closed source=outbound_channel_closed code=- reason=[redacted] error=- protocol_kind=- connection_age_ms="));
         assert_eq!(output.lines().count(), 1);
     }
 }

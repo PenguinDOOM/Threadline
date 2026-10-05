@@ -96,8 +96,45 @@ impl std::io::Write for TestDiagnosticWriter {
 
 pub(super) struct SafeTransportError {
     kind: &'static str,
+    protocol_kind: Option<&'static str>,
     io_kind: Option<&'static str>,
     raw_os_error: Option<i32>,
+}
+
+fn safe_protocol_error_kind(
+    error: &tokio_tungstenite::tungstenite::error::ProtocolError,
+) -> &'static str {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+    match error {
+        ProtocolError::WrongHttpMethod => "wrong_http_method",
+        ProtocolError::WrongHttpVersion => "wrong_http_version",
+        ProtocolError::MissingConnectionUpgradeHeader => "missing_connection_upgrade_header",
+        ProtocolError::MissingUpgradeWebSocketHeader => "missing_upgrade_web_socket_header",
+        ProtocolError::MissingSecWebSocketVersionHeader => "missing_sec_web_socket_version_header",
+        ProtocolError::MissingSecWebSocketKey => "missing_sec_web_socket_key",
+        ProtocolError::SecWebSocketAcceptKeyMismatch => "sec_web_socket_accept_key_mismatch",
+        ProtocolError::SecWebSocketSubProtocolError(_) => "sec_web_socket_sub_protocol_error",
+        ProtocolError::JunkAfterRequest => "junk_after_request",
+        ProtocolError::CustomResponseSuccessful => "custom_response_successful",
+        ProtocolError::InvalidHeader(_) => "invalid_header",
+        ProtocolError::HandshakeIncomplete => "handshake_incomplete",
+        ProtocolError::HttparseError(_) => "httparse_error",
+        ProtocolError::SendAfterClosing => "send_after_closing",
+        ProtocolError::ReceivedAfterClosing => "received_after_closing",
+        ProtocolError::NonZeroReservedBits => "non_zero_reserved_bits",
+        ProtocolError::UnmaskedFrameFromClient => "unmasked_frame_from_client",
+        ProtocolError::MaskedFrameFromServer => "masked_frame_from_server",
+        ProtocolError::FragmentedControlFrame => "fragmented_control_frame",
+        ProtocolError::ControlFrameTooBig => "control_frame_too_big",
+        ProtocolError::UnknownControlFrameType(_) => "unknown_control_frame_type",
+        ProtocolError::UnknownDataFrameType(_) => "unknown_data_frame_type",
+        ProtocolError::UnexpectedContinueFrame => "unexpected_continue_frame",
+        ProtocolError::ExpectedFragment(_) => "expected_fragment",
+        ProtocolError::ResetWithoutClosingHandshake => "reset_without_closing_handshake",
+        ProtocolError::InvalidOpcode(_) => "invalid_opcode",
+        ProtocolError::InvalidCloseSequence => "invalid_close_sequence",
+    }
 }
 
 pub(super) fn safe_transport_error(error: &TungsteniteError) -> SafeTransportError {
@@ -115,9 +152,16 @@ pub(super) fn safe_transport_error(error: &TungsteniteError) -> SafeTransportErr
         TungsteniteError::Http(_) => "http",
         TungsteniteError::HttpFormat(_) => "http_format",
     };
+    let protocol_kind = match error {
+        TungsteniteError::Protocol(protocol_error) => {
+            Some(safe_protocol_error_kind(protocol_error))
+        }
+        _ => None,
+    };
     let (io_kind, raw_os_error) = safe_io_error(error);
     SafeTransportError {
         kind,
+        protocol_kind,
         io_kind,
         raw_os_error,
     }
@@ -212,12 +256,13 @@ pub(super) fn closed_diagnostic_line(
 ) -> String {
     let code = code.map_or_else(|| "-".to_string(), |code| code.to_string());
     let kind = error.map_or("-", |error| error.kind);
+    let protocol_kind = error.and_then(|error| error.protocol_kind).unwrap_or("-");
     let io_kind = error.and_then(|error| error.io_kind).unwrap_or("-");
     let raw_os_error = error
         .and_then(|error| error.raw_os_error)
         .map_or_else(|| "-".to_string(), |code| code.to_string());
     format!(
-        "[threadline] websocket closed source={} code={code} reason={reason} error={kind} connection_age_ms={age_ms} io_kind={io_kind} raw_os_error={raw_os_error}\n",
+        "[threadline] websocket closed source={} code={code} reason={reason} error={kind} protocol_kind={protocol_kind} connection_age_ms={age_ms} io_kind={io_kind} raw_os_error={raw_os_error}\n",
         source.as_str()
     )
 }

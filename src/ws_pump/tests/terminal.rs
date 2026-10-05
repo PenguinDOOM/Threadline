@@ -146,7 +146,7 @@ async fn close_diagnostics_first_commit_freezes_lifetime_and_unlocks_before_writ
     assert_eq!(capture.calls, 1);
     assert_eq!(
         String::from_utf8(capture.bytes.clone()).unwrap(),
-        "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- connection_age_ms=1234 io_kind=- raw_os_error=-\n"
+        "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 io_kind=- raw_os_error=-\n"
     );
 }
 
