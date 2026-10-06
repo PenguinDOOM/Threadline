@@ -75,6 +75,9 @@ pub(super) async fn process_upstream_event(
     state: &mut ResponseStreamState,
     parsed: Value,
 ) -> StreamProgress {
+    if !recovery::lifecycle_only(&parsed) {
+        state.replay_prohibited = true;
+    }
     let trace_metadata = UpstreamEventTraceMetadata::from_event(&parsed);
     trace_upstream_event(&trace_metadata);
     state.observable_output.last_upstream_event_type = Some(trace_metadata.event_type.clone());
@@ -92,7 +95,7 @@ pub(super) async fn process_upstream_event(
     }
     match event_type.as_str() {
         "response.completed" => handle_completed_event(state, &parsed, &event_type).await,
-        "response.failed" => handle_failed_event(state, &parsed, &event_type),
+        "response.failed" => handle_failed_event(state, &parsed, &event_type).await,
         "response.incomplete" => handle_incomplete_event(state, &parsed, &event_type).await,
         "error" => handle_error_event(state, &parsed, &event_type).await,
         _ => handle_visible_event(state, parsed, &event_type),
@@ -149,11 +152,14 @@ pub(super) async fn handle_completed_event(
     StreamProgress::Continue
 }
 
-pub(super) fn handle_failed_event(
+pub(super) async fn handle_failed_event(
     state: &mut ResponseStreamState,
     parsed: &Value,
     event_type: &str,
 ) -> StreamProgress {
+    if recovery::failure_kind(parsed) == recovery::RecoveryFailure::ConnectionLimit {
+        return handle_error_event(state, parsed, event_type).await;
+    }
     trace_downstream_sse_event(&downstream_sse_trace_metadata(
         parsed,
         DownstreamTraceAction::Terminal,
@@ -194,7 +200,9 @@ pub(super) async fn handle_error_event(
 ) -> StreamProgress {
     let (is_previous_response_not_found, failed_payload) =
         translated_upstream_error_payload(parsed, event_type);
-    if is_previous_response_not_found {
+    if is_previous_response_not_found
+        && recovery::failure_kind(parsed) != recovery::RecoveryFailure::ConnectionLimit
+    {
         state.upstream = None;
         state.lease.finalize_recoverable_turn();
     } else {

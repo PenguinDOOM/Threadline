@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, Response, StatusCode};
-use futures_util::{Stream, StreamExt, future::BoxFuture, stream};
+use futures_util::{StreamExt, future::BoxFuture, stream};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Instant, sleep, timeout};
@@ -964,16 +964,14 @@ async fn live_retained_upstream_continuation_forwards_previous_response_id_witho
         .await
         .expect("first body");
 
-    let second_response = post_responses(
+    let second_response = tokio::spawn(post_responses(
         app,
         json!({
             "model":"gpt-6-sol",
             "input":"second",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(second_response.status(), StatusCode::OK);
+    ));
 
     let second_payload: Value = serde_json::from_str(&message_text(
         retained_server
@@ -989,6 +987,8 @@ async fn live_retained_upstream_continuation_forwards_previous_response_id_witho
     retained_server
         .send_text(&assistant_text_completed_event("response-2", "second completion").to_string())
         .await;
+    let second_response = second_response.await.expect("continuation headers");
+    assert_eq!(second_response.status(), StatusCode::OK);
     let _ = to_bytes(second_response.into_body(), usize::MAX)
         .await
         .expect("second body");
@@ -1043,16 +1043,14 @@ async fn retained_continuation_repeats_persistent_reasoning_context_without_reco
         .await
         .expect("first body");
 
-    let second_response = post_responses(
+    let second_response = tokio::spawn(post_responses(
         app,
         json!({
             "model":"threadline-main-gpt-6-sol",
             "input":"second persistent turn",
             "previous_response_id":"response-persistent-1"
         }),
-    )
-    .await;
-    assert_eq!(second_response.status(), StatusCode::OK);
+    ));
 
     let second_payload: Value = serde_json::from_str(&message_text(
         retained_server
@@ -1074,6 +1072,8 @@ async fn retained_continuation_repeats_persistent_reasoning_context_without_reco
                 .to_string(),
         )
         .await;
+    let second_response = second_response.await.expect("continuation headers");
+    assert_eq!(second_response.status(), StatusCode::OK);
     let _ = to_bytes(second_response.into_body(), usize::MAX)
         .await
         .expect("second body");
@@ -1280,7 +1280,7 @@ async fn context_management_only_ordinary_request_remains_retained_and_normal() 
         .await
         .expect("first body");
 
-    let second_response = post_responses(
+    let second_response = tokio::spawn(post_responses(
         app,
         json!({
             "model":"gpt-6-sol",
@@ -1291,9 +1291,7 @@ async fn context_management_only_ordinary_request_remains_retained_and_normal() 
                 "compact_threshold":12345
             }
         }),
-    )
-    .await;
-    assert_eq!(second_response.status(), StatusCode::OK);
+    ));
 
     let second_payload: Value = serde_json::from_str(&message_text(
         timeout(
@@ -1319,6 +1317,8 @@ async fn context_management_only_ordinary_request_remains_retained_and_normal() 
     retained_server
         .send_text(&assistant_text_completed_event("response-2", "second completion").to_string())
         .await;
+    let second_response = second_response.await.expect("continuation headers");
+    assert_eq!(second_response.status(), StatusCode::OK);
     let _ = to_bytes(second_response.into_body(), usize::MAX)
         .await
         .expect("second body");
@@ -1406,16 +1406,14 @@ async fn summary_request_with_active_previous_response_id_uses_auxiliary_session
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -1423,6 +1421,13 @@ async fn summary_request_with_active_previous_response_id_uses_auxiliary_session
 
     let summary = post_responses(app, auxiliary_summary_request(Some("response-1"))).await;
     assert_eq!(summary.status(), StatusCode::OK);
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -1486,21 +1491,14 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
             .await
             .expect("seed body");
 
-        let active = post_responses(
+        let active = tokio::spawn(post_responses(
             app.clone(),
             json!({
                 "model":"gpt-6-sol",
                 "input":"followup",
                 "previous_response_id":"response-1"
             }),
-        )
-        .await;
-        assert_eq!(
-            active.status(),
-            StatusCode::OK,
-            "active status for {}",
-            shape.label()
-        );
+        ));
         let _ = retained_server
             .recv_client_message()
             .await
@@ -1540,6 +1538,13 @@ async fn summary_request_all_shapes_with_active_previous_response_id_use_auxilia
             requested_sessions[1].is_none(),
             "summary transient connect should use session None for {}",
             shape.label()
+        );
+        active.abort();
+        assert!(
+            active
+                .await
+                .expect_err("cancel pending continuation")
+                .is_cancelled()
         );
     }
 }
@@ -1581,16 +1586,14 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -1679,6 +1682,13 @@ async fn header_classified_summary_with_active_previous_response_id_routes_trans
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     assert!(!body_text.contains("threadline_start_job"));
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -2246,16 +2256,14 @@ async fn summary_request_broader_shapes_with_active_previous_response_id_keep_na
             .await
             .expect("seed body");
 
-        let active = post_responses(
+        let active = tokio::spawn(post_responses(
             app.clone(),
             json!({
                 "model":"gpt-6-sol",
                 "input":"followup",
                 "previous_response_id":"response-1"
             }),
-        )
-        .await;
-        assert_eq!(active.status(), StatusCode::OK, "active status for {name}");
+        ));
         let _ = retained_server
             .recv_client_message()
             .await
@@ -2326,6 +2334,13 @@ async fn summary_request_broader_shapes_with_active_previous_response_id_keep_na
                 "conflict code for {name}"
             );
         }
+        active.abort();
+        assert!(
+            active
+                .await
+                .expect_err("cancel pending continuation")
+                .is_cancelled()
+        );
     }
 }
 
@@ -2487,16 +2502,14 @@ async fn transient_summary_request_can_run_while_previous_marker_is_active_at_ca
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -2504,6 +2517,13 @@ async fn transient_summary_request_can_run_while_previous_marker_is_active_at_ca
 
     let summary = post_responses(app, auxiliary_summary_request(Some("response-1"))).await;
     assert_eq!(summary.status(), StatusCode::OK);
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -2679,16 +2699,14 @@ async fn active_continuation_drop_invalidates_marker_without_another_upstream_cr
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = server
         .recv_client_message()
         .await
@@ -2705,7 +2723,13 @@ async fn active_continuation_drop_invalidates_marker_without_another_upstream_cr
     .await;
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
 
-    drop(active);
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 
     let retried = post_responses(
         app,
@@ -2754,22 +2778,17 @@ async fn polled_continuation_drop_before_first_event_requires_replay() {
         .await
         .expect("seed body");
 
-    let active = post_responses(
-        app.clone(),
-        json!({"model":"gpt-6-sol","input":"followup","previous_response_id":"response-1"}),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
-    let _ = server
-        .recv_client_message()
-        .await
-        .expect("followup request");
     let (pending_tx, pending_rx) = oneshot::channel();
+    let active_app = app.clone();
     let poll_task = tokio::spawn(async move {
-        let mut active_body = active.into_body().into_data_stream();
+        let active = post_responses(
+            active_app,
+            json!({"model":"gpt-6-sol","input":"followup","previous_response_id":"response-1"}),
+        );
+        futures_util::pin_mut!(active);
         let mut pending_tx = Some(pending_tx);
         futures_util::future::poll_fn(|context| {
-            let result = std::pin::Pin::new(&mut active_body).poll_next(context);
+            let result = active.as_mut().poll(context);
             if matches!(result, Poll::Pending)
                 && let Some(pending_tx) = pending_tx.take()
             {
@@ -2779,9 +2798,13 @@ async fn polled_continuation_drop_before_first_event_requires_replay() {
         })
         .await
     });
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("followup request");
     timeout(Duration::from_secs(1), pending_rx)
         .await
-        .expect("body polling must wait for the first upstream event")
+        .expect("handler polling must wait for the first upstream event")
         .expect("polling task must report pending");
     poll_task.abort();
     assert!(
@@ -2833,11 +2856,10 @@ async fn visible_continuation_output_drop_invalidates_marker() {
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({"model":"gpt-6-sol","input":"followup","previous_response_id":"response-1"}),
-    )
-    .await;
+    ));
     let _ = server
         .recv_client_message()
         .await
@@ -2845,6 +2867,8 @@ async fn visible_continuation_output_drop_invalidates_marker() {
     server
         .send_text(r#"{"type":"response.output_text.delta","delta":"visible"}"#)
         .await;
+    let active = active.await.expect("visible continuation headers");
+    assert_eq!(active.status(), StatusCode::OK);
     let mut active_body = active.into_body().into_data_stream();
     let visible_chunk = next_body_chunk(&mut active_body).await;
     assert!(String::from_utf8_lossy(&visible_chunk).contains("visible"));
@@ -2940,12 +2964,10 @@ async fn completed_without_response_id_disarms_active_turn_and_preserves_prior_m
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({"model":"gpt-6-sol","input":"followup","previous_response_id":"response-1"}),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = server
         .recv_client_message()
         .await
@@ -2965,24 +2987,30 @@ async fn completed_without_response_id_disarms_active_turn_and_preserves_prior_m
             .to_string(),
         )
         .await;
+    let active = active.await.expect("continuation headers");
+    assert_eq!(active.status(), StatusCode::OK);
     let mut active_body = active.into_body().into_data_stream();
     let synthetic_delta = next_body_chunk(&mut active_body).await;
     assert!(String::from_utf8_lossy(&synthetic_delta).contains("completed without id"));
     drop(active_body);
 
-    let resumed = post_responses(
+    let resumed = tokio::spawn(post_responses(
         app,
         json!({"model":"gpt-6-sol","input":"resume","previous_response_id":"response-1"}),
-    )
-    .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
+    ));
     let resumed_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("resumed request"),
     ))
     .expect("resumed request json");
     assert_eq!(resumed_payload["previous_response_id"], "response-1");
     assert_eq!(connector.recorded_sessions().await.len(), 1);
-    drop(resumed);
+    resumed.abort();
+    assert!(
+        resumed
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -3005,14 +3033,18 @@ async fn abandoning_newer_turn_releases_upstream_while_completed_predecessor_bod
     let completed_chunk = next_body_chunk(&mut first_body).await;
     assert!(String::from_utf8_lossy(&completed_chunk).contains("response.completed"));
 
-    let second = post_responses(
+    let second = tokio::spawn(post_responses(
         app.clone(),
         json!({"model":"gpt-6-sol","input":"second","previous_response_id":"response-a"}),
-    )
-    .await;
-    assert_eq!(second.status(), StatusCode::OK);
+    ));
     let _ = server.recv_client_message().await.expect("second request");
-    drop(second);
+    second.abort();
+    assert!(
+        second
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 
     let replay = post_responses(
         app,
@@ -3061,16 +3093,14 @@ async fn retained_session_conflict_fallback_summary_request_reroutes_transiently
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -3105,6 +3135,13 @@ async fn retained_session_conflict_fallback_summary_request_reroutes_transiently
     let _ = to_bytes(summary.into_body(), usize::MAX)
         .await
         .expect("summary body");
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -3129,16 +3166,14 @@ async fn retained_session_conflict_context_management_without_summary_input_rema
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -3167,6 +3202,13 @@ async fn retained_session_conflict_context_management_without_summary_input_rema
         .expect("conflict body");
     let payload: Value = serde_json::from_slice(&body).expect("conflict json body");
     assert_eq!(payload["error"]["code"], "retained_session_conflict");
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -3191,16 +3233,14 @@ async fn retained_session_conflict_tool_choice_none_without_summary_fingerprint_
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -3258,6 +3298,13 @@ async fn retained_session_conflict_tool_choice_none_without_summary_fingerprint_
         .expect("conflict body");
     let payload: Value = serde_json::from_slice(&body).expect("conflict json body");
     assert_eq!(payload["error"]["code"], "retained_session_conflict");
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -3292,16 +3339,14 @@ async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -3381,6 +3426,13 @@ async fn retained_session_conflict_rerouted_diagnostics_are_privacy_safe() {
     assert!(!rerouted_line.contains(manual_summary_text()));
     assert!(!rerouted_line.contains("response-1"));
     assert!(!rerouted_line.contains("{\"model\":\"gpt-6-sol\""));
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
+    );
 }
 
 #[tokio::test]
@@ -3412,16 +3464,14 @@ async fn retained_session_conflict_fallback_empty_completed_output_preserves_aux
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -3487,6 +3537,13 @@ async fn retained_session_conflict_fallback_empty_completed_output_preserves_aux
     assert_eq!(
         rejected_payload["error"]["code"],
         "previous_response_not_found"
+    );
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel pending continuation")
+            .is_cancelled()
     );
 }
 
@@ -3769,16 +3826,14 @@ async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let active_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("active request"),
     ))
@@ -3787,7 +3842,8 @@ async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
     server
         .send_text(&assistant_text_completed_event("response-2", "followup completion").to_string())
         .await;
-
+    let active = active.await.expect("continuation headers");
+    assert_eq!(active.status(), StatusCode::OK);
     let mut active_body = active.into_body().into_data_stream();
     let first_chunk = next_body_chunk(&mut active_body).await;
     let first_text = String::from_utf8(first_chunk.to_vec()).expect("utf8 first chunk");
@@ -3806,16 +3862,14 @@ async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
         assistant_text_completed_event("response-2", "followup completion")
     );
 
-    let resumed = post_responses(
+    let resumed = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"resume-before-done",
             "previous_response_id":"response-2"
         }),
-    )
-    .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
+    ));
     let resumed_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("resumed request"),
     ))
@@ -3838,6 +3892,8 @@ async fn completed_body_drop_after_reuse_does_not_unlock_newer_active_lease() {
     server
         .send_text(&assistant_text_completed_event("response-3", "resume completion").to_string())
         .await;
+    let resumed = resumed.await.expect("continuation headers");
+    assert_eq!(resumed.status(), StatusCode::OK);
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
         .expect("resumed body");
@@ -3862,16 +3918,14 @@ async fn completed_marker_remains_reusable_when_synthetic_tail_body_is_dropped()
         .await
         .expect("seed body");
 
-    let completed = post_responses(
+    let completed = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"completed synthetic tail",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(completed.status(), StatusCode::OK);
+    ));
     let _ = server
         .recv_client_message()
         .await
@@ -3879,7 +3933,8 @@ async fn completed_marker_remains_reusable_when_synthetic_tail_body_is_dropped()
     server
         .send_text(&assistant_text_completed_event("response-2", "completed text").to_string())
         .await;
-
+    let completed = completed.await.expect("continuation headers");
+    assert_eq!(completed.status(), StatusCode::OK);
     let mut completed_body = completed.into_body().into_data_stream();
     let synthetic_delta = next_body_chunk(&mut completed_body).await;
     let (event, data) = sse_event_and_data(
@@ -3892,16 +3947,14 @@ async fn completed_marker_remains_reusable_when_synthetic_tail_body_is_dropped()
     assert_eq!(payload["delta"], "completed text");
     drop(completed_body);
 
-    let resumed = post_responses(
+    let resumed = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"resume after synthetic tail drop",
             "previous_response_id":"response-2"
         }),
-    )
-    .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
+    ));
     let resumed_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("resumed request"),
     ))
@@ -3912,6 +3965,8 @@ async fn completed_marker_remains_reusable_when_synthetic_tail_body_is_dropped()
     server
         .send_text(&assistant_text_completed_event("response-3", "resumed completion").to_string())
         .await;
+    let resumed = resumed.await.expect("continuation headers");
+    assert_eq!(resumed.status(), StatusCode::OK);
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
         .expect("resumed body");
@@ -4011,18 +4066,20 @@ async fn dropping_pending_internal_followup_invalidates_all_continuation_markers
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"internal followup",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = server.recv_client_message().await.expect("active request");
-    let polling_task = tokio::spawn(async move { to_bytes(active.into_body(), usize::MAX).await });
+    let polling_task = tokio::spawn(async move {
+        let active = active.await.expect("continuation headers");
+        assert_eq!(active.status(), StatusCode::OK);
+        to_bytes(active.into_body(), usize::MAX).await
+    });
 
     server
         .send_text(r#"{"type":"response.created","response":{"id":"response-intermediate"}}"#)
@@ -4606,16 +4663,14 @@ async fn response_failed_releases_prior_completed_marker_after_recoverable_close
         .await
         .expect("seed body");
 
-    let failed = post_responses(
+    let failed = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(failed.status(), StatusCode::OK);
+    ));
     let failed_payload: Value = serde_json::from_str(&message_text(
         first_server
             .recv_client_message()
@@ -4628,6 +4683,8 @@ async fn response_failed_releases_prior_completed_marker_after_recoverable_close
     first_server
         .send_text(r#"{"type":"response.failed","response":{"id":"response-failed"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
         .await;
+    let failed = failed.await.expect("failure headers");
+    assert_eq!(failed.status(), StatusCode::OK);
     let _ = to_bytes(failed.into_body(), usize::MAX)
         .await
         .expect("failed body");
@@ -4691,16 +4748,14 @@ async fn dropping_failed_terminal_body_before_done_blocks_resume() {
         .await
         .expect("seed body");
 
-    let failed = post_responses(
+    let failed = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(failed.status(), StatusCode::OK);
+    ));
     let failed_payload: Value = serde_json::from_str(&message_text(
         first_server
             .recv_client_message()
@@ -4712,7 +4767,8 @@ async fn dropping_failed_terminal_body_before_done_blocks_resume() {
     first_server
         .send_text(r#"{"type":"response.failed","response":{"id":"response-failed"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
         .await;
-
+    let failed = failed.await.expect("failure headers");
+    assert_eq!(failed.status(), StatusCode::OK);
     let mut failed_body = failed.into_body().into_data_stream();
     let failed_chunk = next_body_chunk(&mut failed_body).await;
     let failed_text = String::from_utf8(failed_chunk.to_vec()).expect("utf8 failed chunk");
@@ -4773,20 +4829,20 @@ async fn response_failed_id_is_not_a_continuation_marker() {
         .await
         .expect("seed body");
 
-    let failed = post_responses(
+    let failed = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(failed.status(), StatusCode::OK);
+    ));
     let _ = server.recv_client_message().await.expect("failed request");
     server
         .send_text(r#"{"type":"response.failed","response":{"id":"response-failed"},"error":{"code":"upstream_response_failed","message":"failed"}}"#)
         .await;
+    let failed = failed.await.expect("failure headers");
+    assert_eq!(failed.status(), StatusCode::OK);
     let _ = to_bytes(failed.into_body(), usize::MAX)
         .await
         .expect("failed body");
@@ -4975,16 +5031,14 @@ async fn classified_upstream_previous_response_not_found_releases_prior_marker_w
         .await
         .expect("seed body");
 
-    let failed = post_responses(
+    let failed = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"failure",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(failed.status(), StatusCode::OK);
+    ));
     let failed_payload: Value = serde_json::from_str(&message_text(
         first_server
             .recv_client_message()
@@ -4998,14 +5052,19 @@ async fn classified_upstream_previous_response_not_found_releases_prior_marker_w
             r#"{"type":"error","error":{"code":"previous_response_not_found","message":"Previous response with id 'response-1' not found."},"status":404}"#,
         )
         .await;
-    let _ = to_bytes(failed.into_body(), usize::MAX)
+    let failed = failed.await.expect("marker-missing headers");
+    assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(failed.into_body(), usize::MAX)
         .await
         .expect("failed body");
-
-    first_server
-        .send_close(1000, "classified failure complete")
-        .await;
-    sleep(Duration::from_millis(50)).await;
+    let error: Value = serde_json::from_slice(&body).expect("marker-missing JSON");
+    assert_eq!(error["error"]["code"], "previous_response_not_found");
+    timeout(
+        Duration::from_secs(1),
+        first_server.wait_for_client_disconnect(),
+    )
+    .await
+    .expect("invalidated upstream released");
 
     let resumed = post_responses(
         app,
@@ -5089,6 +5148,47 @@ async fn upstream_error_event_emits_response_failed_and_done_without_successful_
 }
 
 #[tokio::test]
+async fn connection_limit_failure_logs_no_untrusted_upstream_message() {
+    let trace_guard = TraceCaptureGuard::begin().await;
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector));
+
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"error"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("error request");
+    server
+        .send_text(
+            r#"{"type":"response.failed","response":{"id":"response-limit","error":{"code":"websocket_connection_limit_reached","message":"SENSITIVE_SENTINEL"}}}"#,
+        )
+        .await;
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    let frames = split_sse_frames(&body_text);
+    let (event, data) = sse_event_and_data(frames.first().expect("failed frame"));
+    let payload: Value = serde_json::from_str(data).expect("failed json");
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(event, "response.failed");
+    assert_eq!(
+        payload["response"]["error"]["code"],
+        "websocket_connection_limit_reached"
+    );
+    assert_eq!(
+        payload["response"]["error"]["message"],
+        "The upstream websocket connection limit was reached."
+    );
+    assert!(!trace_guard.logs().contains("SENSITIVE_SENTINEL"));
+    assert_done_frame(frames[1]);
+}
+
+#[tokio::test]
 async fn upstream_done_or_eof_without_completed_emits_response_failed_not_done_only() {
     for case_name in ["done", "eof"] {
         let server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -5168,22 +5268,21 @@ async fn malformed_upstream_json_emits_a_stable_sse_error_and_releases_the_marke
         .await
         .expect("seed body");
 
-    let response = post_responses(
+    let response = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"malformed",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    ));
     let _ = server
         .recv_client_message()
         .await
         .expect("malformed request");
     server.send_text("not-json").await;
-
+    let response = response.await.expect("malformed event headers");
+    assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
@@ -5233,15 +5332,14 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
         .await
         .expect("first body");
 
-    let second = post_responses(
+    let second = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"second",
             "previous_response_id":"response-parent"
         }),
-    )
-    .await;
+    ));
     let second_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("second request"),
     ))
@@ -5253,19 +5351,19 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
             &assistant_text_completed_event("response-child", "child completion").to_string(),
         )
         .await;
+    let second = second.await.expect("second headers");
     let _ = to_bytes(second.into_body(), usize::MAX)
         .await
         .expect("second body");
 
-    let third = post_responses(
+    let third = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"third",
             "previous_response_id":"response-parent"
         }),
-    )
-    .await;
+    ));
     let third_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("third request"),
     ))
@@ -5277,19 +5375,19 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
             &assistant_text_completed_event("response-third", "third completion").to_string(),
         )
         .await;
+    let third = third.await.expect("third headers");
     let _ = to_bytes(third.into_body(), usize::MAX)
         .await
         .expect("third body");
 
-    let fourth = post_responses(
+    let fourth = tokio::spawn(post_responses(
         app,
         json!({
             "model":"gpt-6-sol",
             "input":"fourth",
             "previous_response_id":"response-child"
         }),
-    )
-    .await;
+    ));
     let fourth_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("fourth request"),
     ))
@@ -5301,6 +5399,7 @@ async fn nested_response_markers_remain_reusable_without_main_agent_assumptions(
             &assistant_text_completed_event("response-fourth", "fourth completion").to_string(),
         )
         .await;
+    let fourth = fourth.await.expect("fourth headers");
     let _ = to_bytes(fourth.into_body(), usize::MAX)
         .await
         .expect("fourth body");
@@ -7479,16 +7578,14 @@ async fn stalled_continued_body_overflow_closes_pump_before_first_event_is_polle
         .await
         .expect("seed body");
 
-    let continued = post_responses(
+    let continued = tokio::spawn(post_responses(
         app,
         json!({
             "model":"gpt-6-sol",
             "input":"continued overflow",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(continued.status(), StatusCode::OK);
+    ));
     let continued_request: Value = serde_json::from_str(&message_text(
         server
             .recv_client_message()
@@ -7501,8 +7598,13 @@ async fn stalled_continued_body_overflow_closes_pump_before_first_event_is_polle
     server
         .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
         .await;
+    let continued = continued.await.expect("continuation headers");
+    assert_eq!(continued.status(), StatusCode::OK);
     server
-        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .send_text_burst(&[
+            r#"{"type":"response.output_text.delta","delta":"second"}"#,
+            r#"{"type":"response.output_text.delta","delta":"overflow"}"#,
+        ])
         .await;
     timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
         .await
@@ -7542,22 +7644,25 @@ async fn dropping_stalled_active_body_after_overflow_invalidates_marker_without_
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"active overflow",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = server.recv_client_message().await.expect("active request");
     server
         .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
         .await;
+    let active = active.await.expect("continuation headers");
+    assert_eq!(active.status(), StatusCode::OK);
     server
-        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .send_text_burst(&[
+            r#"{"type":"response.output_text.delta","delta":"second"}"#,
+            r#"{"type":"response.output_text.delta","delta":"overflow"}"#,
+        ])
         .await;
     timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
         .await
@@ -7827,30 +7932,30 @@ async fn event_after_completed_aliases_liveness_timeout_preserves_only_prior_mar
         if let Some(previous_response_id) = previous_response_id {
             payload["previous_response_id"] = json!(previous_response_id);
         }
-        let response = post_responses(app.clone(), payload).await;
-        assert_eq!(response.status(), StatusCode::OK);
+        let response = tokio::spawn(post_responses(app.clone(), payload));
         retained_server
             .send_text(&assistant_text_completed_event(response_id, "completed turn").to_string())
             .await;
+        let response = response.await.expect("completed turn headers");
+        assert_eq!(response.status(), StatusCode::OK);
         let _ = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("completed turn body");
     }
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"active after upstream event",
             "previous_response_id":"response-2"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     retained_server
         .send_text(r#"{"type":"response.created","response":{"id":"response-3"}}"#)
         .await;
-
+    let active = active.await.expect("lifecycle timeout headers");
+    assert_eq!(active.status(), StatusCode::BAD_GATEWAY);
     let active_body = timeout(
         Duration::from_secs(1),
         to_bytes(active.into_body(), usize::MAX),
@@ -7859,10 +7964,8 @@ async fn event_after_completed_aliases_liveness_timeout_preserves_only_prior_mar
     .expect("liveness timeout body")
     .expect("liveness timeout response body");
     let active_text = String::from_utf8(active_body.to_vec()).expect("active body utf8");
-    assert_eq!(active_text.matches("event: response.failed").count(), 1);
-    assert_eq!(active_text.matches("data: [DONE]").count(), 1);
-    assert!(active_text.contains("upstream_liveness_timeout"));
-    assert!(!active_text.contains("event: response.completed"));
+    let error: Value = serde_json::from_str(&active_text).expect("timeout JSON");
+    assert_eq!(error["error"]["code"], "upstream_liveness_timeout");
 
     for marker in ["response-1", "response-2", "response-3"] {
         let resumed = post_responses(
@@ -7947,7 +8050,7 @@ async fn event_after_fresh_liveness_timeout_removes_markerless_entry_and_release
 
 #[tokio::test]
 async fn dropping_armed_body_before_liveness_observation_invalidates_completed_aliases() {
-    let server = Arc::new(ScriptedWebSocketServer::start_without_reader().await);
+    let server = Arc::new(ScriptedWebSocketServer::start_with_stoppable_reader().await);
     let connector = RecordingConnector::with_watchdog_policy(
         vec![PlannedConnection {
             server: Arc::clone(&server),
@@ -7960,6 +8063,7 @@ async fn dropping_armed_body_before_liveness_observation_invalidates_completed_a
 
     let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
     assert_eq!(seed.status(), StatusCode::OK);
+    let _ = server.recv_client_message().await.expect("seed request");
     server
         .send_text(&assistant_text_completed_event("response-1", "seed completion").to_string())
         .await;
@@ -7967,17 +8071,26 @@ async fn dropping_armed_body_before_liveness_observation_invalidates_completed_a
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"armed continuation",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
-    drop(active);
+    ));
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("armed continuation request");
+    server.stop_reader();
+    active.abort();
+    assert!(
+        active
+            .await
+            .expect_err("cancel before timeout observation")
+            .is_cancelled()
+    );
 
     let resumed = post_responses(
         app,
@@ -8191,8 +8304,7 @@ async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry
         if let Some(previous_response_id) = previous_response_id {
             payload["previous_response_id"] = Value::String(previous_response_id.to_string());
         }
-        let response = post_responses(app.clone(), payload).await;
-        assert_eq!(response.status(), StatusCode::OK);
+        let response = tokio::spawn(post_responses(app.clone(), payload));
         let _ = retained_server
             .recv_client_message()
             .await
@@ -8200,21 +8312,21 @@ async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry
         retained_server
             .send_text(&assistant_text_completed_event(response_id, "completed turn").to_string())
             .await;
+        let response = response.await.expect("completed turn headers");
+        assert_eq!(response.status(), StatusCode::OK);
         let _ = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("completed turn body");
     }
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"overflow active turn",
             "previous_response_id":"response-2"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let _ = retained_server
         .recv_client_message()
         .await
@@ -8222,8 +8334,13 @@ async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry
     retained_server
         .send_text(r#"{"type":"response.output_text.delta","delta":"first"}"#)
         .await;
+    let active = active.await.expect("continuation headers");
+    assert_eq!(active.status(), StatusCode::OK);
     retained_server
-        .send_text(r#"{"type":"response.output_text.delta","delta":"second"}"#)
+        .send_text_burst(&[
+            r#"{"type":"response.output_text.delta","delta":"second"}"#,
+            r#"{"type":"response.output_text.delta","delta":"overflow"}"#,
+        ])
         .await;
     timeout(
         Duration::from_secs(1),
@@ -8421,8 +8538,7 @@ async fn idle_overflow_repeats_for_all_aliases_detaches_live_handle_and_evicts_n
         if let Some(previous_response_id) = previous_response_id {
             payload["previous_response_id"] = Value::String(previous_response_id.to_string());
         }
-        let response = post_responses(app.clone(), payload).await;
-        assert_eq!(response.status(), StatusCode::OK);
+        let response = tokio::spawn(post_responses(app.clone(), payload));
         let _ = retained_server
             .recv_client_message()
             .await
@@ -8430,6 +8546,8 @@ async fn idle_overflow_repeats_for_all_aliases_detaches_live_handle_and_evicts_n
         retained_server
             .send_text(&assistant_text_completed_event(response_id, "completed turn").to_string())
             .await;
+        let response = response.await.expect("completed turn headers");
+        assert_eq!(response.status(), StatusCode::OK);
         let _ = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("completed turn body");
@@ -8818,12 +8936,10 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
     drop(healthy_upstream);
     wait_for_websocket_release(&connector, 2).await;
 
-    let resumed = post_responses(
+    let resumed = tokio::spawn(post_responses(
         app.clone(),
         json!({"model":"gpt-6-sol","input":"resume","previous_response_id":"response-main"}),
-    )
-    .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
+    ));
     let resumed_request: Value = serde_json::from_str(&message_text(
         main_requests_rx
             .recv()
@@ -8837,6 +8953,8 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
             &assistant_text_completed_event("response-main-continued", "continued").to_string(),
         )
         .await;
+    let resumed = resumed.await.expect("continuation headers");
+    assert_eq!(resumed.status(), StatusCode::OK);
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
         .expect("main continuation body");
@@ -9852,16 +9970,14 @@ async fn completed_output_marker_is_reusable_after_completed_before_done() {
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"completed-output-order",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let active_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("active request"),
     ))
@@ -9888,7 +10004,8 @@ async fn completed_output_marker_is_reusable_after_completed_before_done() {
         }
     });
     server.send_text(&completed_event.to_string()).await;
-
+    let active = active.await.expect("continuation headers");
+    assert_eq!(active.status(), StatusCode::OK);
     let mut active_body = active.into_body().into_data_stream();
     let first_chunk = next_body_chunk(&mut active_body).await;
     let first_text = String::from_utf8(first_chunk.to_vec()).expect("utf8 first chunk");
@@ -9904,16 +10021,14 @@ async fn completed_output_marker_is_reusable_after_completed_before_done() {
     assert_eq!(second_event, "response.completed");
     assert_eq!(second_payload, completed_event);
 
-    let resumed = post_responses(
+    let resumed = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"resume-before-queued-completed",
             "previous_response_id":"response-ordering"
         }),
-    )
-    .await;
-    assert_eq!(resumed.status(), StatusCode::OK);
+    ));
     let resumed_payload: Value = serde_json::from_str(&message_text(
         server.recv_client_message().await.expect("resumed request"),
     ))
@@ -9930,6 +10045,8 @@ async fn completed_output_marker_is_reusable_after_completed_before_done() {
     server
         .send_text(r#"{"type":"response.completed","response":{"id":"response-3"}}"#)
         .await;
+    let resumed = resumed.await.expect("continuation headers");
+    assert_eq!(resumed.status(), StatusCode::OK);
     let _ = to_bytes(resumed.into_body(), usize::MAX)
         .await
         .expect("resumed body");

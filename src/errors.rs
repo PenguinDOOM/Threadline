@@ -64,6 +64,9 @@ pub enum ThreadlineError {
     #[error("The upstream websocket liveness check timed out.")]
     UpstreamLivenessTimeout,
 
+    #[error("The upstream websocket connection limit was reached.")]
+    UpstreamWebSocketConnectionLimit,
+
     #[error(
         "The upstream response.failed event cannot be streamed as a successful downstream response."
     )]
@@ -129,6 +132,7 @@ impl ThreadlineError {
             Self::UpstreamWebSocketClosed => StatusCode::BAD_GATEWAY,
             Self::UpstreamInboundBufferOverflow => StatusCode::BAD_GATEWAY,
             Self::UpstreamLivenessTimeout => StatusCode::BAD_GATEWAY,
+            Self::UpstreamWebSocketConnectionLimit => StatusCode::BAD_GATEWAY,
             Self::UpstreamResponseFailed => StatusCode::BAD_GATEWAY,
             Self::UpstreamErrorEvent => StatusCode::BAD_GATEWAY,
             Self::UpstreamInvalidJson => StatusCode::BAD_GATEWAY,
@@ -166,6 +170,7 @@ impl ThreadlineError {
             Self::UpstreamWebSocketClosed => UPSTREAM_WEB_SOCKET_CLOSED,
             Self::UpstreamInboundBufferOverflow => UPSTREAM_INBOUND_BUFFER_OVERFLOW,
             Self::UpstreamLivenessTimeout => UPSTREAM_LIVENESS_TIMEOUT,
+            Self::UpstreamWebSocketConnectionLimit => UPSTREAM_WEB_SOCKET_CONNECTION_LIMIT,
             Self::UpstreamResponseFailed => UPSTREAM_RESPONSE_FAILED,
             Self::UpstreamErrorEvent => UPSTREAM_ERROR_EVENT,
             Self::UpstreamInvalidJson => UPSTREAM_INVALID_JSON,
@@ -262,6 +267,12 @@ const UPSTREAM_INBOUND_BUFFER_OVERFLOW: PublicErrorPayload = borrowed_public_err
 const UPSTREAM_LIVENESS_TIMEOUT: PublicErrorPayload = borrowed_public_error(
     "upstream_liveness_timeout",
     "The upstream websocket liveness check timed out.",
+    "server_error",
+);
+
+const UPSTREAM_WEB_SOCKET_CONNECTION_LIMIT: PublicErrorPayload = borrowed_public_error(
+    "websocket_connection_limit_reached",
+    "The upstream websocket connection limit was reached.",
     "server_error",
 );
 

@@ -4,6 +4,7 @@ pub(super) async fn start_continuation_upstream(
     lease: &mut RetainedSessionLease,
     upstream_request: &mut serde_json::Map<String, Value>,
     previous_response_id: &str,
+    recovery_local_tools_only: bool,
 ) -> Result<Arc<LiveUpstreamWebSocket>, ThreadlineError> {
     let Some(upstream) = lease.upstream() else {
         trace_stale_continuation(lease, previous_response_id, "missing_or_closed_upstream");
@@ -24,7 +25,11 @@ pub(super) async fn start_continuation_upstream(
 
     lease.arm_active_turn();
     if let Err(error) = send_response_create(&upstream, upstream_request).await {
-        let error = rewrite_stale_continuation_first_send_error(error);
+        let error = if recovery_local_tools_only {
+            rewrite_stale_continuation_first_send_error(error)
+        } else {
+            error
+        };
         if matches!(error, ThreadlineError::PreviousResponseNotFound) {
             trace_stale_continuation(lease, previous_response_id, "first_send_closed");
             lease.release();
@@ -35,12 +40,20 @@ pub(super) async fn start_continuation_upstream(
     }
 
     tokio::task::yield_now().await;
-    check_continuation_transport(
-        lease,
-        &upstream,
-        previous_response_id,
-        "first_send_closed_after_enqueue",
-    )?;
+    if let Some(error) = super::translation::queue_transport_error(upstream.terminal_state()) {
+        let error = if recovery_local_tools_only {
+            rewrite_stale_continuation_first_send_error(error)
+        } else {
+            error
+        };
+        trace_stale_continuation(
+            lease,
+            previous_response_id,
+            "first_send_closed_after_enqueue",
+        );
+        lease.release();
+        return Err(error);
+    }
 
     Ok(upstream)
 }
@@ -49,27 +62,11 @@ pub(super) async fn start_new_upstream(
     services: &ThreadlineServices,
     lease: &mut RetainedSessionLease,
     upstream_request: &serde_json::Map<String, Value>,
-    reconnect_attempted: &mut bool,
 ) -> Result<Arc<LiveUpstreamWebSocket>, ThreadlineError> {
     let auth = services.auth_provider().load()?;
-    let mut upstream = ensure_upstream(services, lease, auth).await?;
+    let upstream = ensure_upstream(services, lease, auth).await?;
     lease.arm_active_turn();
-    if let Err(error) = send_response_create(&upstream, upstream_request).await {
-        if let Some(reconnected) = attempt_pre_first_event_reconnect(
-            services,
-            lease,
-            upstream_request,
-            None,
-            false,
-            reconnect_attempted,
-        )
-        .await?
-        {
-            upstream = reconnected;
-        } else {
-            return Err(error);
-        }
-    }
+    send_response_create(&upstream, upstream_request).await?;
 
     Ok(upstream)
 }
@@ -132,59 +129,6 @@ pub(super) fn continuation_terminal_error(
             Some(ThreadlineError::PreviousResponseNotFound)
         }
     }
-}
-
-pub(super) async fn attempt_pre_first_event_reconnect(
-    services: &ThreadlineServices,
-    lease: &mut RetainedSessionLease,
-    request_payload: &serde_json::Map<String, Value>,
-    previous_response_id: Option<&str>,
-    upstream_event_seen: bool,
-    reconnect_attempted: &mut bool,
-) -> Result<Option<Arc<LiveUpstreamWebSocket>>, ThreadlineError> {
-    let Some(previous_response_id) = previous_response_id else {
-        return Ok(None);
-    };
-
-    if upstream_event_seen || *reconnect_attempted {
-        return Ok(None);
-    }
-
-    *reconnect_attempted = true;
-    lease.detach_upstream_recoverably();
-    debug!(
-        previous_response_id,
-        session_id = %lease.session().session_id,
-        thread_id = %lease.session().thread_id,
-        window_id = %lease.session().window_id,
-        "reconnect_continuation_attempt"
-    );
-
-    let auth = services.auth_provider().load()?;
-    let upstream = match ensure_upstream(services, lease, auth).await {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            debug!(
-                previous_response_id,
-                session_id = %lease.session().session_id,
-                thread_id = %lease.session().thread_id,
-                "reconnect_continuation_failed"
-            );
-            return Err(error);
-        }
-    };
-
-    if let Err(error) = send_response_create(&upstream, request_payload).await {
-        debug!(
-            previous_response_id,
-            session_id = %lease.session().session_id,
-            thread_id = %lease.session().thread_id,
-            "reconnect_continuation_failed"
-        );
-        return Err(error);
-    }
-
-    Ok(Some(upstream))
 }
 
 pub(super) async fn acquire_lease(

@@ -94,6 +94,7 @@ pub(super) async fn execute_internal_tool_event(
     call: InternalToolCall,
     trace_metadata: &UpstreamEventTraceMetadata,
 ) -> StreamProgress {
+    state.replay_prohibited = true;
     let execution_result = state.services.execute_internal_tool(call).await;
     if let Some(error) = state
         .upstream

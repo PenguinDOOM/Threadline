@@ -12,6 +12,7 @@ mod internal_tools;
 use internal_tools::*;
 mod progression;
 use progression::*;
+pub(super) mod recovery;
 
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
@@ -105,13 +106,6 @@ impl ResponseStreamLease {
     async fn mark_upstream_terminal(&mut self) {
         if let Self::Retained(lease) = self {
             lease.mark_upstream_terminal().await;
-        }
-    }
-
-    fn retained_mut(&mut self) -> Option<&mut RetainedSessionLease> {
-        match self {
-            Self::Retained(lease) => Some(lease),
-            Self::TransientAuxiliary => None,
         }
     }
 }
@@ -362,8 +356,11 @@ pub(super) struct ResponseStreamState {
     pub(super) execute_internal_tools: bool,
     pub(super) suppressed_internal_output_indexes: HashSet<u64>,
     pub(super) upstream_event_seen: bool,
+    pub(super) headers_committed: bool,
+    pub(super) replay_prohibited: bool,
+    pub(super) recovery_local_tools_only: bool,
+    pub(super) pending_upstream_events: VecDeque<String>,
     pub(super) replay_stale_marker_on_pre_first_event_close: bool,
-    pub(super) reconnect_attempted: bool,
     pub(super) observable_output: DownstreamObservableOutputState,
     pub(super) downstream_visible_text_sources: HashSet<VisibleTextDedupeIdentity>,
     pub(super) downstream_visible_text_delta_count: usize,
@@ -376,6 +373,8 @@ pub(super) struct ResponseStreamState {
     pub(super) apply_no_observable_output_failure: bool,
     pub(super) done: bool,
 }
+
+pub(super) use recovery::queue_transport_error;
 
 pub(super) fn response_stream(
     state: ResponseStreamState,

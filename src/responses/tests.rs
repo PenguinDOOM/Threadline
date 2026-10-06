@@ -291,6 +291,35 @@ async fn retained_continuation_first_send_liveness_timeout_invalidates_all_alias
     assert_markers_removed(&registry, &["response-accepted", "response-alias"]).await;
 }
 
+#[tokio::test]
+async fn retained_continuation_first_send_timeout_with_hosted_tools_is_not_replayable() {
+    let (registry, upstream, send_attempts) = seed_retained_aliases_for_first_send_timeout().await;
+    let connector_calls = Arc::new(AtomicUsize::new(0));
+    let state = ResponsesRouteState {
+        profile: RouteProfile::Main,
+        persistent_reasoning_enabled: false,
+        registry: Arc::clone(&registry),
+        services: ThreadlineServices::new(
+            Arc::new(StaticAuthProvider),
+            Arc::new(CountingConnector {
+                calls: Arc::clone(&connector_calls),
+            }),
+        ),
+    };
+    let error = match responses_handler(State(state), Json(json!({"model":"gpt-6-sol","input":"continue","previous_response_id":"response-accepted","tools":[{"type":"web_search"}],"tool_choice":"none"})), Default::default()).await {
+        Ok(_) => panic!("send timeout must fail before headers"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ThreadlineError::UpstreamLivenessTimeout));
+    assert_eq!(send_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(connector_calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        upstream.terminal_state(),
+        UpstreamTerminalState::LivenessTimeout(_)
+    ));
+    assert_markers_removed(&registry, &["response-accepted", "response-alias"]).await;
+}
+
 #[test]
 fn stale_continuation_first_send_preserves_inbound_overflow_error() {
     let preserved =

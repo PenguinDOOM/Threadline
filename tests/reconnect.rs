@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use axum::body::{Body, to_bytes};
@@ -21,12 +22,29 @@ use threadline::config::ThreadlineConfig;
 use threadline::errors::ThreadlineError;
 use threadline::http::build_router_with_services;
 use threadline::responses::{
-    ConnectedUpstream, ThreadlineServices, UpstreamAuthProvider, UpstreamConnector,
+    ConnectedUpstream, InternalToolExecutor, ThreadlineServices, UpstreamAuthProvider,
+    UpstreamConnector,
 };
+use threadline::tools::{InternalToolCall, PendingInternalToolOutput};
 use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamWatchdogPolicy};
 
 #[derive(Clone)]
 struct StaticAuthProvider;
+
+#[derive(Default)]
+struct CountingToolExecutor {
+    executions: AtomicUsize,
+}
+
+impl InternalToolExecutor for CountingToolExecutor {
+    fn execute(
+        &self,
+        call: InternalToolCall,
+    ) -> BoxFuture<'static, Result<PendingInternalToolOutput, ThreadlineError>> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { call.execute() })
+    }
+}
 
 impl UpstreamAuthProvider for StaticAuthProvider {
     fn load(&self) -> Result<LoadedUpstreamAuth, ThreadlineError> {
@@ -342,4 +360,180 @@ fn planned_connection(
 async fn assert_no_reconnect(server: &ScriptedWebSocketServer) {
     let no_reconnect = timeout(Duration::from_millis(250), server.recv_client_message()).await;
     assert!(no_reconnect.is_err());
+}
+
+async fn begin_continuation(
+    app: axum::Router,
+    server: &ScriptedWebSocketServer,
+    marker: &str,
+    tools: Option<Value>,
+) -> tokio::task::JoinHandle<Response<Body>> {
+    let mut payload = json!({"model":"gpt-6-sol","input":"continue","previous_response_id":marker});
+    if let Some(tools) = tools {
+        payload["tools"] = tools;
+    }
+    let response = tokio::spawn(post_responses(app, payload));
+    let message = timeout(Duration::from_secs(1), server.recv_client_message())
+        .await
+        .expect("continuation received before headers")
+        .expect("continuation create");
+    let request: Value =
+        serde_json::from_str(&message.into_text().expect("text create")).expect("create json");
+    assert_eq!(request["previous_response_id"], marker);
+    response
+}
+
+#[tokio::test]
+async fn recovery_prelude_capacity_handoff_is_fifo_and_exactly_once() {
+    for byte_boundary in [false, true] {
+        let server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector =
+            RecordingConnector::new(vec![planned_connection(&server, None, false, None)]);
+        let app = build_test_router(Arc::new(connector.clone()));
+        seed_marker(app.clone(), &server, "seed-marker").await;
+        let response = begin_continuation(app, &server, "seed-marker", None).await;
+        let events: Vec<Value> = (0..if byte_boundary { 2 } else { 9 }).map(|sequence| json!({"type":"response.in_progress","sequence_number":sequence,"response":{"id": if byte_boundary { "x".repeat(40 * 1024) } else { "active".to_string() },"output":[]}})).collect();
+        for event in &events {
+            server.send_text(&event.to_string()).await;
+        }
+        let response = timeout(Duration::from_secs(1), response)
+            .await
+            .expect("capacity commits headers without semantic event")
+            .expect("response task");
+        assert_eq!(response.status(), StatusCode::OK);
+        server
+            .send_text(r#"{"type":"error","error":{"code":"websocket_connection_limit_reached"}}"#)
+            .await;
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8(bytes.to_vec()).expect("utf8");
+        let frames = split_sse_frames(&body);
+        assert_eq!(frames.len(), events.len() + 2);
+        for (frame, expected) in frames.iter().zip(&events) {
+            let event: Value =
+                serde_json::from_str(sse_event_and_data(frame).1).expect("lifecycle event");
+            assert_eq!(&event, expected);
+        }
+        let failed: Value =
+            serde_json::from_str(sse_event_and_data(frames[events.len()]).1).expect("failure");
+        assert_response_failed_payload(&failed, "websocket_connection_limit_reached");
+        assert_done_frame(frames[events.len() + 1]);
+    }
+}
+
+#[tokio::test]
+async fn recovery_idle_queued_limit_uses_original_local_tool_eligibility() {
+    for hosted in [false, true] {
+        let server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector =
+            RecordingConnector::new(vec![planned_connection(&server, None, false, None)]);
+        let app = build_test_router(Arc::new(connector.clone()));
+        seed_marker(app.clone(), &server, "seed-marker").await;
+        server
+            .send_text(r#"{"type":"error","error":{"code":"websocket_connection_limit_reached"}}"#)
+            .await;
+        server.send_ping(b"idle-limit-barrier").await;
+        let pong = timeout(Duration::from_secs(1), server.recv_client_message())
+            .await
+            .expect("idle Ping processed after limit")
+            .expect("Pong");
+        assert_eq!(
+            pong,
+            tokio_tungstenite::tungstenite::Message::Pong(b"idle-limit-barrier".to_vec())
+        );
+        let tools = hosted.then(|| json!([{"type":"web_search"}]));
+        let response = begin_continuation(app, &server, "seed-marker", tools).await;
+        let response = timeout(Duration::from_secs(1), response)
+            .await
+            .expect("idle limit headers")
+            .expect("response task");
+        assert_eq!(
+            response.status(),
+            if hosted {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(body.contains(if hosted {
+            "websocket_connection_limit_reached"
+        } else {
+            "previous_response_not_found"
+        }));
+        assert_eq!(connector.recorded_sessions().await.len(), 1);
+        assert!(connector.recorded_websockets().await[0].upgrade().is_none());
+        assert!(
+            timeout(Duration::from_secs(1), server.recv_client_message())
+                .await
+                .expect("no additional create")
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn recovery_internal_followup_limit_is_terminal_without_duplicate_tool_execution() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![planned_connection(&server, None, false, None)]);
+    let executor = Arc::new(CountingToolExecutor::default());
+    let app = build_router_with_services(
+        ThreadlineConfig::default(),
+        ThreadlineServices::with_internal_tool_executor(
+            Arc::new(StaticAuthProvider),
+            Arc::new(connector.clone()),
+            Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+        ),
+    );
+    seed_marker(app.clone(), &server, "seed-marker").await;
+    let response = begin_continuation(app.clone(), &server, "seed-marker", None).await;
+    let body = tokio::spawn(async move {
+        let response = response.await.expect("headers");
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+    });
+    server.send_text(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"tool-output\"}"}}"#).await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"intermediate"}}"#)
+        .await;
+    let followup = timeout(Duration::from_secs(1), server.recv_client_message())
+        .await
+        .expect("followup")
+        .expect("followup create");
+    let followup: Value = serde_json::from_str(&followup.into_text().expect("text")).expect("JSON");
+    assert_eq!(followup["previous_response_id"], "intermediate");
+    assert_eq!(followup["input"][0]["type"], "function_call_output");
+    server.send_text(r#"{"type":"response.failed","response":{"id":"failed-id","error":{"code":"websocket_connection_limit_reached"}}}"#).await;
+    let bytes = timeout(Duration::from_secs(1), body)
+        .await
+        .expect("terminal body")
+        .expect("body task");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    let frames = split_sse_frames(&text);
+    assert_eq!(frames.len(), 2);
+    let failed: Value = serde_json::from_str(sse_event_and_data(frames[0]).1).expect("failure");
+    assert_response_failed_payload(&failed, "websocket_connection_limit_reached");
+    assert_done_frame(frames[1]);
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(
+        timeout(Duration::from_secs(1), server.recv_client_message())
+            .await
+            .expect("no additional create")
+            .is_none()
+    );
+    for marker in ["seed-marker", "intermediate", "failed-id"] {
+        let retry = post_responses(
+            app.clone(),
+            json!({"model":"gpt-6-sol","input":"retry","previous_response_id":marker}),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
+    }
 }

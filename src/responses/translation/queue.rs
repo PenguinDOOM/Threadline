@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) fn discard_unaccepted_queued_output(state: &mut ResponseStreamState) {
+    state.pending_upstream_events.clear();
     state.queued_synthetic_output_text_deltas.clear();
     state.queued_forwarded_event = None;
 }

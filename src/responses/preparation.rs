@@ -5,7 +5,7 @@ pub(super) struct PreparedResponseRoute {
     lease: ResponseStreamLease,
     previous_response_id: Option<String>,
     replay_stale_marker_on_pre_first_event_close: bool,
-    reconnect_attempted: bool,
+    recovery_local_tools_only: bool,
     upstream_request: serde_json::Map<String, Value>,
     execute_internal_tools: bool,
     apply_no_observable_output_failure: bool,
@@ -39,9 +39,12 @@ impl PreparedResponseRoute {
             execute_internal_tools: self.execute_internal_tools,
             suppressed_internal_output_indexes: std::collections::HashSet::new(),
             upstream_event_seen: false,
+            headers_committed: false,
+            replay_prohibited: false,
+            recovery_local_tools_only: self.recovery_local_tools_only,
+            pending_upstream_events: std::collections::VecDeque::new(),
             replay_stale_marker_on_pre_first_event_close: self
                 .replay_stale_marker_on_pre_first_event_close,
-            reconnect_attempted: self.reconnect_attempted,
             observable_output: Default::default(),
             downstream_visible_text_sources: std::collections::HashSet::new(),
             downstream_visible_text_delta_count: 0,
@@ -148,20 +151,22 @@ pub(super) async fn start_retained_route(
 ) -> Result<PreparedResponseRoute, ThreadlineError> {
     let is_continuation_request = previous_response_id.is_some();
     let mut upstream_request = base_request.clone();
+    let original_tools_local = translation::recovery::local_tools_only(&upstream_request);
     inject_internal_tools(&mut upstream_request);
     strip_context_management_for_upstream(&mut upstream_request, "normal", classification);
     apply_session_metadata(&mut upstream_request, lease.session());
-    let mut reconnect_attempted = false;
+    let recovery_local_tools_only =
+        original_tools_local && translation::recovery::local_tools_only(&upstream_request);
     let upstream = if let Some(previous_response_id) = &previous_response_id {
-        start_continuation_upstream(&mut lease, &mut upstream_request, previous_response_id).await?
-    } else {
-        start_new_upstream(
-            &state.services,
+        start_continuation_upstream(
             &mut lease,
-            &upstream_request,
-            &mut reconnect_attempted,
+            &mut upstream_request,
+            previous_response_id,
+            recovery_local_tools_only,
         )
         .await?
+    } else {
+        start_new_upstream(&state.services, &mut lease, &upstream_request).await?
     };
 
     Ok(PreparedResponseRoute {
@@ -169,7 +174,7 @@ pub(super) async fn start_retained_route(
         lease: ResponseStreamLease::Retained(lease),
         previous_response_id,
         replay_stale_marker_on_pre_first_event_close: is_continuation_request,
-        reconnect_attempted,
+        recovery_local_tools_only,
         upstream_request,
         execute_internal_tools: true,
         apply_no_observable_output_failure: true,
@@ -280,7 +285,7 @@ async fn start_transient_route(
         lease: ResponseStreamLease::TransientAuxiliary,
         previous_response_id: None,
         replay_stale_marker_on_pre_first_event_close: false,
-        reconnect_attempted: false,
+        recovery_local_tools_only: false,
         upstream_request,
         execute_internal_tools: false,
         apply_no_observable_output_failure: false,

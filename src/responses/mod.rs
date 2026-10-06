@@ -93,7 +93,9 @@ pub(crate) async fn responses_handler(
     )
     .await?;
 
-    let stream = response_stream(prepared.into_stream_state(state.services.clone()));
+    let mut stream_state = prepared.into_stream_state(state.services.clone());
+    translation::recovery::preflight(&mut stream_state).await?;
+    let stream = response_stream(stream_state);
 
     let response = Response::builder()
         .status(StatusCode::OK)

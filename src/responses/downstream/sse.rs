@@ -57,7 +57,10 @@ pub(in crate::responses) fn sanitized_terminal_response(
 
 pub(in crate::responses) fn sse_terminal_response_failed_chunk(payload: &Value) -> Bytes {
     let fallback = ThreadlineError::UpstreamResponseFailed.public_error();
-    let error = payload.get("error");
+    let error = payload
+        .get("error")
+        .filter(|error| error.is_object())
+        .or_else(|| payload.pointer("/response/error"));
     let mut response = sanitized_terminal_response(payload, "failed");
     response.insert(
         "error".to_string(),

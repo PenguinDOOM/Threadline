@@ -3,6 +3,9 @@ use super::*;
 pub(super) async fn receive_upstream_text(
     state: &mut ResponseStreamState,
 ) -> Result<Option<String>, StreamProgress> {
+    if let Some(text) = state.pending_upstream_events.pop_front() {
+        return Ok(Some(text));
+    }
     let upstream_result = match state.upstream.as_ref() {
         Some(upstream) => upstream.recv_text().await,
         None => Ok(None),
@@ -78,76 +81,26 @@ pub(super) async fn receive_timeout_terminal(
 pub(super) async fn receive_closed_transport(
     state: &mut ResponseStreamState,
 ) -> Result<Option<String>, StreamProgress> {
-    match try_reconnect_or_terminal_error(state).await {
-        Ok(Some(reconnected)) => {
-            state.upstream = Some(reconnected);
-            Ok(None)
-        }
-        Ok(None) => {
-            let failed_payload = terminal_failed_payload_from_error(
-                None,
-                None,
-                &ThreadlineError::UpstreamWebSocketClosed,
-            );
-            trace_downstream_sse_event(&downstream_sse_trace_metadata(
-                &failed_payload,
-                DownstreamTraceAction::Terminal,
-                None,
-            ));
-            state.upstream = None;
-            state.lease.finalize_recoverable_turn();
-            state.lease.release();
-            state.final_done_pending = true;
-            Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
-                &failed_payload,
-            )))
-        }
-        Err(error) => {
-            let failed_payload = terminal_failed_payload_from_error(None, None, &error);
-            trace_downstream_sse_event(&downstream_sse_trace_metadata(
-                &failed_payload,
-                DownstreamTraceAction::Terminal,
-                None,
-            ));
-            state.upstream = None;
-            state.lease.mark_upstream_terminal().await;
-            state.lease.release();
-            state.final_done_pending = true;
-            Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
-                &failed_payload,
-            )))
-        }
-    }
-}
-
-pub(super) async fn try_reconnect_or_terminal_error(
-    state: &mut ResponseStreamState,
-) -> Result<Option<Arc<LiveUpstreamWebSocket>>, ThreadlineError> {
-    if invalidate_stale_continuation_before_first_upstream_event(state) {
-        return Err(ThreadlineError::PreviousResponseNotFound);
-    }
-
-    let Some(lease) = state.lease.retained_mut() else {
-        return Ok(None);
-    };
-
-    super::super::attempt_pre_first_event_reconnect(
-        &state.services,
-        lease,
-        &state.base_request,
-        state.previous_response_id.as_deref(),
-        state.upstream_event_seen,
-        &mut state.reconnect_attempted,
-    )
-    .await
+    let failed_payload =
+        terminal_failed_payload_from_error(None, None, &ThreadlineError::UpstreamWebSocketClosed);
+    trace_downstream_sse_event(&downstream_sse_trace_metadata(
+        &failed_payload,
+        DownstreamTraceAction::Terminal,
+        None,
+    ));
+    state.upstream = None;
+    state.lease.finalize_recoverable_turn();
+    state.lease.release();
+    state.final_done_pending = true;
+    Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
+        &failed_payload,
+    )))
 }
 
 pub(super) fn invalidate_stale_continuation_before_first_upstream_event(
     state: &mut ResponseStreamState,
 ) -> bool {
-    let is_continuation =
-        state.previous_response_id.is_some() || state.replay_stale_marker_on_pre_first_event_close;
-    if is_continuation && !state.upstream_event_seen {
+    if recovery::replay_allowed(state, recovery::RecoveryFailure::LivenessTimeout) {
         state.lease.release();
         return true;
     }
@@ -202,33 +155,40 @@ pub(super) fn terminal_failed_payload_from_error(
     )
 }
 
-pub(super) fn translated_upstream_error_payload(parsed: &Value, event_type: &str) -> (bool, Value) {
-    let error = parsed.get("error");
+pub(super) fn translated_upstream_error_payload(
+    parsed: &Value,
+    _event_type: &str,
+) -> (bool, Value) {
+    let error = parsed
+        .pointer("/error/error")
+        .or_else(|| parsed.get("error"))
+        .or_else(|| parsed.pointer("/response/error"));
     let error_code = error
         .and_then(|value| value.get("code"))
         .and_then(safe_scalar_field);
     let error_message = error
         .and_then(|value| value.get("message"))
         .and_then(safe_scalar_field);
-    let status = parsed
-        .get("status")
-        .or_else(|| parsed.get("status_code"))
-        .and_then(safe_scalar_field);
     let is_previous_response_not_found = is_upstream_previous_response_not_found_error(
         error_code.as_deref(),
         error_message.as_deref(),
     );
+    let failure_kind = recovery::failure_kind(parsed);
 
     debug!(
-        event_type,
-        error_code, error_message, status, is_previous_response_not_found, "upstream_error_event"
+        failure_kind = ?failure_kind,
+        is_previous_response_not_found,
+        "upstream_error_event"
     );
     trace_downstream_sse_event(&downstream_sse_trace_metadata(
         parsed,
         DownstreamTraceAction::ErrorTranslated,
         None,
     ));
-    let public_error = if is_previous_response_not_found {
+    let connection_limit = failure_kind == recovery::RecoveryFailure::ConnectionLimit;
+    let public_error = if connection_limit {
+        ThreadlineError::UpstreamWebSocketConnectionLimit.public_error()
+    } else if is_previous_response_not_found {
         ThreadlineError::PreviousResponseNotFound.public_error()
     } else {
         ThreadlineError::UpstreamErrorEvent.public_error()
@@ -238,7 +198,7 @@ pub(super) fn translated_upstream_error_payload(parsed: &Value, event_type: &str
         parsed.get("response"),
         response_id_from_event(parsed),
         public_error.code.into_owned(),
-        if is_previous_response_not_found {
+        if is_previous_response_not_found || connection_limit {
             public_message
         } else {
             error_message.unwrap_or(public_message)

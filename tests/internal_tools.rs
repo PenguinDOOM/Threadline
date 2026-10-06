@@ -1873,18 +1873,18 @@ async fn intermediate_internal_tool_completion_keeps_marker_active_until_followu
         .await
         .expect("seed body");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model": "gpt-6-sol",
             "input": "run hidden internal tool loop",
             "previous_response_id": "response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
 
     let body_task = tokio::spawn(async move {
+        let active = active.await.expect("continuation headers");
+        assert_eq!(active.status(), StatusCode::OK);
         to_bytes(active.into_body(), usize::MAX)
             .await
             .expect("body bytes")
@@ -3937,22 +3937,22 @@ async fn liveness_expiry_while_internal_tool_waits_skips_queued_work_and_keeps_p
         .into_iter()
         .next()
         .expect("seed connection observer");
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"active internal tool",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     server
         .send_text(
             r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"alpha\"}"}}"#,
         )
         .await;
     let body_task = tokio::spawn(async move {
+        let active = active.await.expect("continuation headers");
+        assert_eq!(active.status(), StatusCode::OK);
         to_bytes(active.into_body(), usize::MAX)
             .await
             .expect("active body")
@@ -4150,17 +4150,17 @@ async fn liveness_timeout_after_internal_tool_followup_starts_invalidates_retain
         .upgrade()
         .expect("seed websocket should remain retained before the active turn");
 
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"active internal tool",
             "previous_response_id":"response-1"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let body_task = tokio::spawn(async move {
+        let active = active.await.expect("continuation headers");
+        assert_eq!(active.status(), StatusCode::OK);
         to_bytes(active.into_body(), usize::MAX)
             .await
             .expect("active body")
@@ -4292,19 +4292,19 @@ async fn liveness_timeout_after_completed_internal_tool_followup_keeps_prior_ali
     let _ = to_bytes(seed.into_body(), usize::MAX)
         .await
         .expect("seed body");
-    let active = post_responses(
+    let active = tokio::spawn(post_responses(
         app.clone(),
         json!({
             "model":"gpt-6-sol",
             "input":"active internal tool",
             "previous_response_id":"response-accepted"
         }),
-    )
-    .await;
-    assert_eq!(active.status(), StatusCode::OK);
+    ));
     let active_request = receive_create(&server, &observed_upstream).await;
     assert_eq!(active_request["previous_response_id"], "response-accepted");
     let body_task = tokio::spawn(async move {
+        let active = active.await.expect("continuation headers");
+        assert_eq!(active.status(), StatusCode::OK);
         to_bytes(active.into_body(), usize::MAX)
             .await
             .expect("active body")
