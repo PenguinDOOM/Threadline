@@ -1,4 +1,62 @@
+use super::no_replay::ProbeHttpState;
 use super::*;
+
+pub(super) async fn read_probe_payload(
+    state: &mut ProbeHttpState,
+    request: Request<Body>,
+) -> Result<(axum::http::request::Parts, Value), StatusCode> {
+    let (parts, body) = request.into_parts();
+    let bytes = tokio::select! {
+        bytes = to_bytes(body, 1024 * 1024) => bytes,
+        _ = state.shutdown.changed() => return Err(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let Ok(bytes) = bytes else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    Ok((parts, payload))
+}
+
+use super::timeouts::{start_probe_fixture, start_probe_listener, stop_probe_fixture};
+
+#[tokio::test]
+async fn lifetime_probe_fixture_smoke_without_external_client() {
+    timeout(Duration::from_secs(15), async {
+        for trial in ["success", "retry-failure", "wait", "cancel"] {
+            let mut fixture = start_probe_fixture(trial).await;
+            let (_, mut listener) = start_probe_listener(&fixture).await;
+            let seed = post_responses(fixture.app.clone(), json!({"model":PROBE_MODEL,"input":PROBE_SEED})).await;
+            assert_eq!(seed.status(), StatusCode::OK);
+            let _ = to_bytes(seed.into_body(), usize::MAX).await.expect("seed body");
+            let app = fixture.app.clone();
+            let continuation = tokio::spawn(post_responses(app, json!({"model":PROBE_MODEL,"input":PROBE_CONTINUE,"previous_response_id":"resp_probe_seed"})));
+            if trial == "cancel" {
+                timeout(Duration::from_secs(1), fixture.hold_started.notified()).await.expect("cancel held request");
+                continuation.abort();
+                let _ = continuation.await;
+            } else {
+                let response = continuation.await.expect("continuation task");
+                if trial == "wait" {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let _ = to_bytes(response.into_body(), usize::MAX).await.expect("delayed body");
+                } else {
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    let full = json!([{"role":"user","content":PROBE_SEED}, {"role":"assistant","content":PROBE_SEED_ANSWER}, {"role":"user","content":PROBE_CONTINUE}]);
+                    let retry = post_responses(fixture.app.clone(), json!({"model":PROBE_MODEL,"input":full})).await;
+                    assert_eq!(retry.status(), StatusCode::OK);
+                    let bytes = to_bytes(retry.into_body(), usize::MAX).await.expect("final body");
+                    let text = String::from_utf8(bytes.to_vec()).expect("UTF8");
+                    assert_eq!(text.matches("data: [DONE]").count(), 1);
+                }
+            }
+            (&mut fixture.worker).await.expect("fixture script");
+            assert_eq!(fixture.executor.attempts.load(Ordering::SeqCst), 0);
+            stop_probe_fixture(&mut fixture, &mut listener).await;
+        }
+    }).await.expect("finite offline smoke");
+}
 
 #[tokio::test]
 async fn recovery_native_failure_and_hosted_tools_use_safe_header_decisions() {
@@ -73,11 +131,18 @@ async fn recovery_created_limit_is_http400_but_text_limit_is_terminal_http200() 
         None,
         Some(json!({"type":"response.output_text.delta","delta":"visible"})),
         Some(json!({"type":"response.output_item.added","item":{"type":"message","content":[]}})),
+        Some(json!({"type":"response.reasoning_summary_text.delta","delta":"reasoning"})),
+        Some(
+            json!({"type":"response.output_item.added","item":{"type":"function_call","name":"external","call_id":"external-call","arguments":""}}),
+        ),
+        Some(
+            json!({"type":"response.output_item.done","item":{"type":"compaction","id":"state-item","encrypted_content":"opaque-fixture"}}),
+        ),
     ] {
         let server = Arc::new(ScriptedWebSocketServer::start().await);
         let connector =
             RecordingConnector::new(vec![planned_connection(&server, None, false, None)]);
-        let app = build_test_router(Arc::new(connector.clone()));
+        let (app, executor) = build_counting_test_router(connector.clone());
         seed_marker(app.clone(), &server, "seed-marker").await;
         let response = begin_continuation(app.clone(), &server, "seed-marker", None).await;
         server
@@ -98,20 +163,7 @@ async fn recovery_created_limit_is_http400_but_text_limit_is_terminal_http200() 
         if let Some(expected_event) = &boundary_event {
             assert_eq!(status, StatusCode::OK);
             let body = String::from_utf8(body.to_vec()).expect("utf8");
-            let frames = split_sse_frames(&body);
-            assert_eq!(frames.len(), 4);
-            assert_eq!(sse_event_and_data(frames[0]).0, "response.created");
-            let boundary: Value =
-                serde_json::from_str(sse_event_and_data(frames[1]).1).expect("boundary event");
-            assert_eq!(&boundary, expected_event);
-            let failed: Value =
-                serde_json::from_str(sse_event_and_data(frames[2]).1).expect("failure");
-            assert_response_failed_payload(&failed, "websocket_connection_limit_reached");
-            assert_eq!(
-                failed["response"]["error"]["message"],
-                "The upstream websocket connection limit was reached."
-            );
-            assert_done_frame(frames[3]);
+            assert_boundary_limit_terminal(&body, expected_event);
         } else {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             let body: Value = serde_json::from_slice(&body).expect("json error");
@@ -120,6 +172,7 @@ async fn recovery_created_limit_is_http400_but_text_limit_is_terminal_http200() 
                 json!({"error":{"code":"previous_response_not_found","message":"Threadline could not find the retained session for that previous_response_id.","type":"invalid_request_error"}})
             );
         }
+        assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
         assert_eq!(connector.recorded_sessions().await.len(), 1);
         assert!(connector.recorded_websockets().await[0].upgrade().is_none());
         assert!(
@@ -134,6 +187,120 @@ async fn recovery_created_limit_is_http400_but_text_limit_is_terminal_http200() 
         )
         .await;
         assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+fn assert_boundary_limit_terminal(body: &str, expected_event: &Value) {
+    let frames = split_sse_frames(body);
+    assert_eq!(frames.len(), 4);
+    assert_eq!(sse_event_and_data(frames[0]).0, "response.created");
+    let boundary: Value =
+        serde_json::from_str(sse_event_and_data(frames[1]).1).expect("boundary event");
+    assert_eq!(&boundary, expected_event);
+    let failed: Value = serde_json::from_str(sse_event_and_data(frames[2]).1).expect("failure");
+    assert_response_failed_payload(&failed, "websocket_connection_limit_reached");
+    assert_eq!(
+        failed["response"]["error"]["message"],
+        "The upstream websocket connection limit was reached."
+    );
+    assert_done_frame(frames[3]);
+}
+
+#[tokio::test]
+async fn recovery_nested_exact_errors_but_not_message_heuristics_allow_http400() {
+    for (event, recovery) in [
+        (
+            json!({"type":"error","error":{"error":{"code":"websocket_connection_limit_reached"}}}),
+            true,
+        ),
+        (
+            json!({"type":"error","error":{"code":"previous_response_not_found"}}),
+            true,
+        ),
+        (
+            json!({"type":"error","error":{"message":"Previous response with id fixture not found"}}),
+            false,
+        ),
+        (
+            json!({"type":"error","error":{"code":"unknown_error","message":"60 minutes websocket_connection_limit_reached"}}),
+            false,
+        ),
+    ] {
+        assert_nested_recovery_case(event, recovery).await;
+    }
+}
+
+async fn assert_nested_recovery_case(event: Value, recovery: bool) {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![planned_connection(&server, None, false, None)]);
+    let app = build_test_router(Arc::new(connector.clone()));
+    seed_marker(app.clone(), &server, "seed-marker").await;
+    let response = begin_continuation(app, &server, "seed-marker", None).await;
+    server.send_text(&event.to_string()).await;
+    let response = timeout(Duration::from_secs(1), response)
+        .await
+        .expect("headers")
+        .expect("task");
+    assert_eq!(
+        response.status(),
+        if recovery {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::OK
+        }
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    if recovery {
+        let error: Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(error["error"]["code"], "previous_response_not_found");
+    } else {
+        let text = String::from_utf8(bytes.to_vec()).expect("UTF8");
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert_eq!(text.matches("data: [DONE]").count(), 1);
+    }
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+}
+
+#[tokio::test]
+async fn recovery_unknown_and_payload_created_handoff_then_synthetic_final_once() {
+    for boundary in [
+        json!({"type":"response.future_state","state":"fixture"}),
+        json!({"type":"response.created","response":{"id":"active","output":[{"type":"message","content":[]}]}}),
+    ] {
+        let server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector =
+            RecordingConnector::new(vec![planned_connection(&server, None, false, None)]);
+        let app = build_test_router(Arc::new(connector));
+        seed_marker(app.clone(), &server, "seed-marker").await;
+        let response = begin_continuation(app, &server, "seed-marker", None).await;
+        server.send_text(&boundary.to_string()).await;
+        let response = timeout(Duration::from_secs(1), response)
+            .await
+            .expect("boundary headers")
+            .expect("task");
+        assert_eq!(response.status(), StatusCode::OK);
+        server
+            .send_text(
+                &assistant_text_completed_event("final-marker", "synthetic once").to_string(),
+            )
+            .await;
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(bytes.to_vec()).expect("UTF8");
+        let frames = split_sse_frames(&text);
+        assert_eq!(frames.len(), 4);
+        let forwarded: Value =
+            serde_json::from_str(sse_event_and_data(frames[0]).1).expect("event");
+        assert_eq!(forwarded, boundary);
+        assert_eq!(
+            sse_event_and_data(frames[1]).0,
+            "response.output_text.delta"
+        );
+        assert_eq!(sse_event_and_data(frames[2]).0, "response.completed");
+        assert_done_frame(frames[3]);
     }
 }
 

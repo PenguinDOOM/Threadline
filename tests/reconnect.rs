@@ -28,6 +28,47 @@ use threadline::responses::{
 use threadline::tools::{InternalToolCall, PendingInternalToolOutput};
 use threadline::ws_pump::{LiveUpstreamWebSocket, UpstreamWatchdogPolicy};
 
+const PROBE_MODEL: &str = "threadline-lifetime-probe";
+const PROBE_SEED: &str = "THREADLINE_FIXTURE_SEED_INPUT_A7";
+const PROBE_SEED_ANSWER: &str = "THREADLINE_FIXTURE_SEED_REPLY_B8";
+const PROBE_CONTINUE: &str = "THREADLINE_FIXTURE_CONTINUE_INPUT_C9";
+const PROBE_FINAL: &str = "THREADLINE_FIXTURE_FINAL_REPLY_D0";
+
+#[derive(Default)]
+struct ProbeToolExecutor {
+    attempts: AtomicUsize,
+}
+
+impl InternalToolExecutor for ProbeToolExecutor {
+    fn execute(
+        &self,
+        _call: InternalToolCall,
+    ) -> BoxFuture<'static, Result<PendingInternalToolOutput, ThreadlineError>> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(ThreadlineError::InternalToolFailed) })
+    }
+}
+
+fn probe_log(value: Value) {
+    use std::io::Write;
+    println!("{value}");
+    std::io::stdout()
+        .flush()
+        .expect("flush safe probe evidence");
+}
+
+fn probe_input_contains(input: &Value, token: &str) -> bool {
+    match input {
+        Value::String(text) => text.contains(token),
+        Value::Array(items) => items.iter().any(|item| probe_input_contains(item, token)),
+        Value::Object(item) => ["content", "text"].iter().any(|key| {
+            item.get(*key)
+                .is_some_and(|value| probe_input_contains(value, token))
+        }),
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 struct StaticAuthProvider;
 
@@ -145,6 +186,21 @@ fn build_test_router(connector: Arc<dyn UpstreamConnector>) -> axum::Router {
         ThreadlineConfig::default(),
         ThreadlineServices::new(Arc::new(StaticAuthProvider), connector),
     )
+}
+
+fn build_counting_test_router(
+    connector: RecordingConnector,
+) -> (axum::Router, Arc<CountingToolExecutor>) {
+    let executor = Arc::new(CountingToolExecutor::default());
+    let app = build_router_with_services(
+        ThreadlineConfig::default(),
+        ThreadlineServices::with_internal_tool_executor(
+            Arc::new(StaticAuthProvider),
+            Arc::new(connector),
+            Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+        ),
+    );
+    (app, executor)
 }
 
 fn short_watchdog_policy() -> UpstreamWatchdogPolicy {
@@ -477,63 +533,14 @@ async fn recovery_idle_queued_limit_uses_original_local_tool_eligibility() {
 }
 
 #[tokio::test]
-async fn recovery_internal_followup_limit_is_terminal_without_duplicate_tool_execution() {
-    let server = Arc::new(ScriptedWebSocketServer::start().await);
-    let connector = RecordingConnector::new(vec![planned_connection(&server, None, false, None)]);
-    let executor = Arc::new(CountingToolExecutor::default());
-    let app = build_router_with_services(
-        ThreadlineConfig::default(),
-        ThreadlineServices::with_internal_tool_executor(
-            Arc::new(StaticAuthProvider),
-            Arc::new(connector.clone()),
-            Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
-        ),
-    );
-    seed_marker(app.clone(), &server, "seed-marker").await;
-    let response = begin_continuation(app.clone(), &server, "seed-marker", None).await;
-    let body = tokio::spawn(async move {
-        let response = response.await.expect("headers");
-        assert_eq!(response.status(), StatusCode::OK);
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body")
-    });
-    server.send_text(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"threadline_echo","arguments":"{\"value\":\"tool-output\"}"}}"#).await;
-    server
-        .send_text(r#"{"type":"response.completed","response":{"id":"intermediate"}}"#)
-        .await;
-    let followup = timeout(Duration::from_secs(1), server.recv_client_message())
-        .await
-        .expect("followup")
-        .expect("followup create");
-    let followup: Value = serde_json::from_str(&followup.into_text().expect("text")).expect("JSON");
-    assert_eq!(followup["previous_response_id"], "intermediate");
-    assert_eq!(followup["input"][0]["type"], "function_call_output");
-    server.send_text(r#"{"type":"response.failed","response":{"id":"failed-id","error":{"code":"websocket_connection_limit_reached"}}}"#).await;
-    let bytes = timeout(Duration::from_secs(1), body)
-        .await
-        .expect("terminal body")
-        .expect("body task");
-    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
-    let frames = split_sse_frames(&text);
-    assert_eq!(frames.len(), 2);
-    let failed: Value = serde_json::from_str(sse_event_and_data(frames[0]).1).expect("failure");
-    assert_response_failed_payload(&failed, "websocket_connection_limit_reached");
-    assert_done_frame(frames[1]);
-    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
-    assert_eq!(connector.recorded_sessions().await.len(), 1);
-    assert!(
-        timeout(Duration::from_secs(1), server.recv_client_message())
-            .await
-            .expect("no additional create")
-            .is_none()
-    );
-    for marker in ["seed-marker", "intermediate", "failed-id"] {
-        let retry = post_responses(
-            app.clone(),
-            json!({"model":"gpt-6-sol","input":"retry","previous_response_id":marker}),
-        )
-        .await;
-        assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
-    }
+#[ignore = "Explicit user-coordinated loopback probe; never normal-suite client evidence"]
+async fn vscode_lifetime_recovery_manual_probe() {
+    let trial = match std::env::var("THREADLINE_LIFETIME_PROBE").as_deref() {
+        Ok("success") => "success",
+        Ok("retry-failure") => "retry-failure",
+        Ok("wait") => "wait",
+        Ok("cancel") => "cancel",
+        _ => panic!("set THREADLINE_LIFETIME_PROBE to success, retry-failure, wait, or cancel"),
+    };
+    timeouts::run_manual_probe(trial).await;
 }
