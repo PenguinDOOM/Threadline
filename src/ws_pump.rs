@@ -224,7 +224,7 @@ struct PumpState<'a> {
     limits: UpstreamInboundLimits,
     terminal_state: &'a Arc<StdMutex<UpstreamTerminalState>>,
     watchdog_policy: UpstreamWatchdogPolicy,
-    diagnostics: &'a CloseDiagnostics,
+    diagnostics: &'a mut CloseDiagnostics,
 }
 
 struct PumpLivenessState<'a> {

@@ -138,6 +138,10 @@ Only an empty reason, `going away`, and `normal closure` are displayed as reason
 
 Connection age starts when the constructor receives the already-upgraded WebSocket stream, before the pump is spawned, and ends when the first terminal state is committed. It uses monotonic elapsed milliseconds and excludes DNS, TCP, TLS, and HTTP upgrade time. These diagnostics report the first observed transport or pump termination path, not its root cause. They do not cover owner Drop, panic, process termination, guarantee successful stderr delivery, or guarantee nonblocking stderr writes. They add no logging framework and do not change existing logging policy.
 
+Each diagnostic line also reports `last_rx_age_ms`, `last_tx_age_ms`, `last_ping_age_ms`, and `last_pong_age_ms`. These are monotonic integer milliseconds from the latest qualifying activity to the same first terminal commit snapshot; `-` means no qualifying activity was observed. RX records successfully received Text, Binary, Ping, Pong, or Close messages before dispatch. It excludes raw frames, read errors, EOF, and underlying bytes. TX records an explicit Text or Ping send only when the pump observes it complete successfully; enqueue, send start, failure, timeout, control-frame flushes, and implicit flushes are excluded. This is not a measure of all wire writes or confirmation that the peer received data. A successful keepalive Ping records the same instant for TX and PING. PONG records only a matching current challenge accepted by the existing watchdog, including an early matching Pong received before the Ping send completes; other Pong messages can update RX but not PONG.
+
+These ages do not identify TCP FIN/RST, which side or component closed the connection, the cause, or exact wire timing. Task scheduling and buffering can affect when activity is observed, and a peer Close commonly has an RX age near zero. The added fields contain no payload, nonce, credentials, identifiers, or absolute timestamps.
+
 ## Main And Utility Startup
 
 The recommended startup path is one Threadline process with two listener ports:

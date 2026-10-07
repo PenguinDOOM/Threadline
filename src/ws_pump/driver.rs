@@ -10,14 +10,14 @@ pub(super) struct OwnedPumpState {
 }
 
 impl OwnedPumpState {
-    fn borrowed(&self) -> PumpState<'_> {
+    pub(super) fn borrowed(&mut self) -> PumpState<'_> {
         PumpState {
             inbound_tx: &self.inbound_tx,
             byte_budget: &self.byte_budget,
             limits: self.limits,
             terminal_state: &self.terminal_state,
             watchdog_policy: self.watchdog_policy,
-            diagnostics: &self.diagnostics,
+            diagnostics: &mut self.diagnostics,
         }
     }
 }
@@ -25,7 +25,7 @@ impl OwnedPumpState {
 pub(super) async fn run_pump<S>(
     stream: WebSocketStream<S>,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
-    owned: OwnedPumpState,
+    mut owned: OwnedPumpState,
     ping_interval: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -37,25 +37,24 @@ pub(super) async fn run_pump<S>(
         ping_interval_secs = ping_interval.as_secs_f64(),
         "ws_pump_started"
     );
-    let pump_state = owned.borrowed();
+    let mut state = owned.borrowed();
     while check_liveness_deadline(
-        pump_state.terminal_state,
+        state.terminal_state,
         schedule.pending_challenge.as_ref(),
         None,
-        pump_state.watchdog_policy,
-        pump_state.diagnostics,
+        state.watchdog_policy,
+        state.diagnostics,
     ) {
         if let Some(keep_running) =
-            dispatch_control(&mut writer, &mut reader, &pump_state, &mut schedule).await
+            dispatch_control(&mut writer, &mut reader, &mut state, &mut schedule).await
         {
             if !keep_running {
                 break;
             }
             continue;
         }
-        let event = wait_for_event(&mut reader, &mut outbound_rx, &pump_state, &schedule).await;
-        if !handle_waiting_event(event, &mut writer, &mut reader, &pump_state, &mut schedule).await
-        {
+        let event = wait_for_event(&mut reader, &mut outbound_rx, &state, &schedule).await;
+        if !handle_waiting_event(event, &mut writer, &mut reader, &mut state, &mut schedule).await {
             break;
         }
     }
@@ -116,7 +115,7 @@ impl PumpSchedule {
 async fn dispatch_control<S>(
     writer: &mut SplitSink<WebSocketStream<S>, Message>,
     reader: &mut SplitStream<WebSocketStream<S>>,
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
     schedule: &mut PumpSchedule,
 ) -> Option<bool>
 where
@@ -145,7 +144,7 @@ where
 async fn dispatch_due_ping<S>(
     writer: &mut SplitSink<WebSocketStream<S>, Message>,
     reader: &mut SplitStream<WebSocketStream<S>>,
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
     schedule: &mut PumpSchedule,
 ) -> bool
 where
@@ -228,7 +227,7 @@ async fn handle_waiting_event<S>(
     event: WaitingEvent,
     writer: &mut SplitSink<WebSocketStream<S>, Message>,
     reader: &mut SplitStream<WebSocketStream<S>>,
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
     schedule: &mut PumpSchedule,
 ) -> bool
 where
@@ -266,7 +265,7 @@ where
 
 pub(super) fn handle_inbound_and_schedule(
     inbound: Option<Result<Message, TungsteniteError>>,
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
     liveness_state: PumpLivenessState<'_>,
 ) -> bool {
     let challenge_was_pending = liveness_state.pending_challenge.is_some();

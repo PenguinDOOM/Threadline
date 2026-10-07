@@ -144,23 +144,23 @@ async fn websocket_pump_ignores_stale_and_unsolicited_pong_until_the_original_de
     let terminal_state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
     let policy = UpstreamWatchdogPolicy::new(Duration::from_secs(5), Duration::from_secs(8))
         .expect("valid watchdog policy");
-    let pump_state = PumpState {
+    let mut diagnostics = CloseDiagnostics::DISABLED;
+    let mut state = PumpState {
         inbound_tx: &inbound_tx,
         byte_budget: &byte_budget,
         limits,
         terminal_state: &terminal_state,
         watchdog_policy: policy,
-        diagnostics: &CloseDiagnostics::DISABLED,
+        diagnostics: &mut diagnostics,
     };
-    let sent_at = Instant::now();
     let mut challenge = Some(PendingPongChallenge {
         nonce: b"current-challenge".to_vec(),
-        sent_at: Some(sent_at),
+        sent_at: Some(Instant::now()),
         acknowledged_early: false,
     });
     let mut control_flush_needed = false;
 
-    assert_irrelevant_frames_remain_live(&pump_state, &mut challenge, &mut control_flush_needed)
+    assert_irrelevant_frames_remain_live(&mut state, &mut challenge, &mut control_flush_needed)
         .await;
     assert!(control_flush_needed);
     assert_eq!(

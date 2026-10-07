@@ -1,5 +1,95 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_overflow_records_the_successfully_received_message() {
+    let mut diagnostics = CloseDiagnostics::new(true);
+    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    let limits = UpstreamInboundLimits::new(1, 4).unwrap();
+    let (inbound_tx, _inbound_rx) = mpsc::channel(limits.max_messages());
+    let byte_budget = Arc::new(Semaphore::new(limits.max_bytes()));
+    let mut pump_state = PumpState {
+        inbound_tx: &inbound_tx,
+        byte_budget: &byte_budget,
+        limits,
+        terminal_state: &state,
+        watchdog_policy: UpstreamWatchdogPolicy::DEFAULT,
+        diagnostics: &mut diagnostics,
+    };
+    advance(Duration::from_millis(100)).await;
+    assert!(handle_inbound_message(
+        Some(Ok(Message::Text("one".to_string()))),
+        &mut pump_state,
+        &mut None,
+        &mut false
+    ));
+    advance(Duration::from_millis(50)).await;
+    assert!(!handle_inbound_message(
+        Some(Ok(Message::Binary(vec![1, 2]))),
+        &mut pump_state,
+        &mut None,
+        &mut false
+    ));
+    assert_eq!(diagnostics.last_rx_at, Some(Instant::now()));
+    assert!(matches!(
+        *state.lock().unwrap(),
+        UpstreamTerminalState::InboundBufferOverflow(_)
+    ));
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    let output = String::from_utf8(capture.bytes.clone()).unwrap();
+    assert!(output.contains("terminal=inbound_buffer_overflow connection_age_ms=150 last_rx_age_ms=0 last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_rx_tracks_control_messages_and_excludes_frame_error_eof() {
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+    for message in [
+        Message::Ping(vec![1]),
+        Message::Pong(vec![2]),
+        Message::Close(None),
+    ] {
+        let mut diagnostics = CloseDiagnostics::new(true);
+        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        advance(Duration::from_millis(25)).await;
+        let received_at = Instant::now();
+        let keep_running = handle_test_inbound(Some(Ok(message)), &state, &mut diagnostics);
+        assert_eq!(diagnostics.last_rx_at, Some(received_at));
+        assert_eq!(diagnostics.last_pong_at, None);
+        if !keep_running {
+            assert!(
+                String::from_utf8(diagnostics.capture().bytes.clone())
+                    .unwrap()
+                    .contains("last_rx_age_ms=0")
+            );
+        }
+    }
+    for inbound in [
+        Some(Ok(Message::Frame(Frame::pong(Vec::new())))),
+        Some(Err(TungsteniteError::ConnectionClosed)),
+        None,
+    ] {
+        let mut diagnostics = CloseDiagnostics::new(true);
+        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        advance(Duration::from_millis(25)).await;
+        assert!(handle_test_inbound(
+            Some(Ok(Message::Ping(vec![1]))),
+            &state,
+            &mut diagnostics
+        ));
+        let received_at = diagnostics.last_rx_at;
+        advance(Duration::from_millis(75)).await;
+        handle_test_inbound(inbound, &state, &mut diagnostics);
+        assert_eq!(diagnostics.last_rx_at, received_at);
+        record_close(
+            &state,
+            empty_close_metadata(),
+            UpstreamCloseSource::PumpExitFallback,
+            &diagnostics,
+        );
+        assert!(String::from_utf8(diagnostics.capture().bytes.clone()).unwrap().contains("connection_age_ms=100 last_rx_age_ms=75 last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
+    }
+}
+
 pub(super) async fn reply_to_ready_challenges(
     mut server_writer: TestPeerWriter,
     mut server_reader: TestPeerReader,
@@ -237,7 +327,7 @@ pub(super) async fn assert_read_progress_after_early_pong(
 }
 
 pub(super) async fn assert_irrelevant_frames_remain_live(
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
     challenge: &mut Option<PendingPongChallenge>,
     control_flush_needed: &mut bool,
 ) {

@@ -26,6 +26,10 @@ impl UpstreamCloseSource {
 #[derive(Clone)]
 pub(super) struct CloseDiagnostics {
     pub(super) started_at: Option<Instant>,
+    pub(super) last_rx_at: Option<Instant>,
+    pub(super) last_tx_at: Option<Instant>,
+    pub(super) last_ping_at: Option<Instant>,
+    pub(super) last_pong_at: Option<Instant>,
     #[cfg(test)]
     pub(super) capture: Option<Arc<StdMutex<TestDiagnosticWriter>>>,
 }
@@ -34,6 +38,10 @@ impl CloseDiagnostics {
     #[cfg(test)]
     pub(super) const DISABLED: Self = Self {
         started_at: None,
+        last_rx_at: None,
+        last_tx_at: None,
+        last_ping_at: None,
+        last_pong_at: None,
         #[cfg(test)]
         capture: None,
     };
@@ -41,8 +49,51 @@ impl CloseDiagnostics {
     pub(super) fn new(enabled: bool) -> Self {
         Self {
             started_at: enabled.then(Instant::now),
+            last_rx_at: None,
+            last_tx_at: None,
+            last_ping_at: None,
+            last_pong_at: None,
             #[cfg(test)]
             capture: Some(Arc::new(StdMutex::new(TestDiagnosticWriter::default()))),
+        }
+    }
+
+    pub(super) fn record_rx(&mut self) -> Option<Instant> {
+        self.started_at?;
+        let received_at = Instant::now();
+        self.last_rx_at = Some(received_at);
+        Some(received_at)
+    }
+
+    pub(super) fn record_pong(&mut self, received_at: Option<Instant>) {
+        if self.started_at.is_some() {
+            self.last_pong_at = received_at;
+        }
+    }
+
+    pub(super) fn record_write(&mut self, kind: UpstreamOutboundKind) {
+        if self.started_at.is_none() || kind == UpstreamOutboundKind::ControlFlush {
+            return;
+        }
+        let completed_at = Instant::now();
+        self.last_tx_at = Some(completed_at);
+        if kind == UpstreamOutboundKind::Ping {
+            self.last_ping_at = Some(completed_at);
+        }
+    }
+
+    fn snapshot(&self, started_at: Instant, terminal_at: Instant) -> TerminalActivitySnapshot {
+        let age = |observed_at: Instant| {
+            terminal_at
+                .saturating_duration_since(observed_at)
+                .as_millis()
+        };
+        TerminalActivitySnapshot {
+            connection_age_ms: age(started_at),
+            last_rx_age_ms: self.last_rx_at.map(age),
+            last_tx_age_ms: self.last_tx_at.map(age),
+            last_ping_age_ms: self.last_ping_at.map(age),
+            last_pong_age_ms: self.last_pong_at.map(age),
         }
     }
 
@@ -55,11 +106,39 @@ impl CloseDiagnostics {
             .expect("diagnostic capture lock")
     }
 
-    pub(super) fn emit(&self, diagnostic: &SafeTerminalDiagnostic, age_ms: u128) {
+    pub(super) fn emit(&self, diagnostic: &SafeTerminalDiagnostic, ages: TerminalActivitySnapshot) {
         #[cfg(test)]
-        write_terminal_diagnostic(&mut *self.capture(), diagnostic, age_ms);
+        write_terminal_diagnostic(&mut *self.capture(), diagnostic, ages);
         #[cfg(not(test))]
-        write_terminal_diagnostic(&mut std::io::stderr().lock(), diagnostic, age_ms);
+        write_terminal_diagnostic(&mut std::io::stderr().lock(), diagnostic, ages);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TerminalActivitySnapshot {
+    connection_age_ms: u128,
+    last_rx_age_ms: Option<u128>,
+    last_tx_age_ms: Option<u128>,
+    last_ping_age_ms: Option<u128>,
+    last_pong_age_ms: Option<u128>,
+}
+
+impl std::fmt::Display for TerminalActivitySnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "connection_age_ms={}", self.connection_age_ms)?;
+        for (key, value) in [
+            ("last_rx_age_ms", self.last_rx_age_ms),
+            ("last_tx_age_ms", self.last_tx_age_ms),
+            ("last_ping_age_ms", self.last_ping_age_ms),
+            ("last_pong_age_ms", self.last_pong_age_ms),
+        ] {
+            write!(formatter, " {key}=")?;
+            match value {
+                Some(value) => write!(formatter, "{value}")?,
+                None => formatter.write_str("-")?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -228,7 +307,7 @@ pub(super) enum SafeTerminalDiagnostic {
 pub(super) fn write_terminal_diagnostic(
     writer: &mut impl std::io::Write,
     diagnostic: &SafeTerminalDiagnostic,
-    age_ms: u128,
+    ages: TerminalActivitySnapshot,
 ) {
     let line = match diagnostic {
         SafeTerminalDiagnostic::Closed {
@@ -236,12 +315,12 @@ pub(super) fn write_terminal_diagnostic(
             code,
             reason,
             error,
-        } => closed_diagnostic_line(*source, *code, reason, error.as_ref(), age_ms),
+        } => closed_diagnostic_line(*source, *code, reason, error.as_ref(), ages),
         SafeTerminalDiagnostic::LivenessTimeout(metadata) => {
-            liveness_diagnostic_line(metadata, age_ms)
+            liveness_diagnostic_line(metadata, ages)
         }
         SafeTerminalDiagnostic::InboundBufferOverflow(metadata) => {
-            overflow_diagnostic_line(metadata, age_ms)
+            overflow_diagnostic_line(metadata, ages)
         }
     };
     let _ = writer.write(line.as_bytes());
@@ -252,7 +331,7 @@ pub(super) fn closed_diagnostic_line(
     code: Option<u16>,
     reason: &str,
     error: Option<&SafeTransportError>,
-    age_ms: u128,
+    ages: TerminalActivitySnapshot,
 ) -> String {
     let code = code.map_or_else(|| "-".to_string(), |code| code.to_string());
     let kind = error.map_or("-", |error| error.kind);
@@ -262,12 +341,15 @@ pub(super) fn closed_diagnostic_line(
         .and_then(|error| error.raw_os_error)
         .map_or_else(|| "-".to_string(), |code| code.to_string());
     format!(
-        "[threadline] websocket closed source={} code={code} reason={reason} error={kind} protocol_kind={protocol_kind} connection_age_ms={age_ms} io_kind={io_kind} raw_os_error={raw_os_error}\n",
+        "[threadline] websocket closed source={} code={code} reason={reason} error={kind} protocol_kind={protocol_kind} {ages} io_kind={io_kind} raw_os_error={raw_os_error}\n",
         source.as_str()
     )
 }
 
-pub(super) fn liveness_diagnostic_line(metadata: &UpstreamLivenessTimeout, age_ms: u128) -> String {
+pub(super) fn liveness_diagnostic_line(
+    metadata: &UpstreamLivenessTimeout,
+    ages: TerminalActivitySnapshot,
+) -> String {
     let cause = match metadata.cause {
         UpstreamLivenessTimeoutCause::PongDeadline => "pong_deadline",
         UpstreamLivenessTimeoutCause::WriteDeadline => "write_deadline",
@@ -279,20 +361,23 @@ pub(super) fn liveness_diagnostic_line(metadata: &UpstreamLivenessTimeout, age_m
         Some(UpstreamOutboundKind::ControlFlush) => "control_flush",
     };
     format!(
-        "[threadline] websocket terminal terminal=liveness_timeout connection_age_ms={age_ms} cause={cause} timeout_ms={} elapsed_ms={} outbound_kind={outbound_kind}\n",
+        "[threadline] websocket terminal terminal=liveness_timeout {ages} cause={cause} timeout_ms={} elapsed_ms={} outbound_kind={outbound_kind}\n",
         metadata.timeout.as_millis(),
         metadata.elapsed.as_millis()
     )
 }
 
-pub(super) fn overflow_diagnostic_line(metadata: &InboundBufferOverflow, age_ms: u128) -> String {
+pub(super) fn overflow_diagnostic_line(
+    metadata: &InboundBufferOverflow,
+    ages: TerminalActivitySnapshot,
+) -> String {
     let cause = match metadata.cause {
         InboundBufferOverflowCause::MessageCount => "message_count",
         InboundBufferOverflowCause::PayloadBytes => "payload_bytes",
         InboundBufferOverflowCause::TransportSize => "transport_size",
     };
     format!(
-        "[threadline] websocket terminal terminal=inbound_buffer_overflow connection_age_ms={age_ms} cause={cause} queued_messages={} queued_bytes={} incoming_bytes={} max_messages={} max_bytes={}\n",
+        "[threadline] websocket terminal terminal=inbound_buffer_overflow {ages} cause={cause} queued_messages={} queued_bytes={} incoming_bytes={} max_messages={} max_bytes={}\n",
         metadata.queued_messages,
         metadata.queued_bytes,
         metadata.incoming_bytes,
@@ -314,9 +399,7 @@ pub(super) fn commit_terminal(
     }
     *state = next;
     let diagnostic = diagnostics.started_at.map(|started_at| {
-        let age_ms = Instant::now()
-            .saturating_duration_since(started_at)
-            .as_millis();
+        let ages = diagnostics.snapshot(started_at, Instant::now());
         let diagnostic = match &*state {
             UpstreamTerminalState::Closed(metadata) => SafeTerminalDiagnostic::Closed {
                 source: source.expect("ordinary close has an observation source"),
@@ -334,11 +417,11 @@ pub(super) fn commit_terminal(
                 unreachable!("terminal commit requires a terminal state")
             }
         };
-        (diagnostic, age_ms)
+        (diagnostic, ages)
     });
     drop(state);
-    if let Some((diagnostic, age_ms)) = diagnostic {
-        diagnostics.emit(&diagnostic, age_ms);
+    if let Some((diagnostic, ages)) = diagnostic {
+        diagnostics.emit(&diagnostic, ages);
     }
     true
 }

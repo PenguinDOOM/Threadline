@@ -3,7 +3,7 @@ use super::*;
 pub(super) async fn drive_write_operation<S>(
     writer: &mut SplitSink<WebSocketStream<S>, Message>,
     reader: &mut SplitStream<WebSocketStream<S>>,
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
     message: Message,
     outbound_kind: UpstreamOutboundKind,
     liveness_state: PumpLivenessState<'_>,
@@ -32,7 +32,7 @@ where
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(earliest_deadline) => {},
-            result = &mut send => return finish_write_operation(result, pump_state),
+            result = &mut send => return finish_write_operation(result, pump_state, outbound_kind),
             inbound = reader.next() => {
                 if !handle_inbound_and_schedule(inbound, pump_state, PumpLivenessState {
                     pending_challenge: liveness_state.pending_challenge,
@@ -80,9 +80,10 @@ impl WriteOperation {
     }
 }
 
-fn finish_write_operation(
+pub(super) fn finish_write_operation(
     result: Result<(), TungsteniteError>,
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
+    outbound_kind: UpstreamOutboundKind,
 ) -> bool {
     if let Err(error) = result {
         record_error(
@@ -93,12 +94,13 @@ fn finish_write_operation(
         );
         return false;
     }
+    pump_state.diagnostics.record_write(outbound_kind);
     true
 }
 
 pub(super) fn handle_inbound_message(
     inbound: Option<Result<Message, TungsteniteError>>,
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
     pending_challenge: &mut Option<PendingPongChallenge>,
     control_flush_needed: &mut bool,
 ) -> bool {
@@ -139,10 +141,15 @@ fn enqueue_inbound_payload(payload: String, pump_state: &PumpState<'_>) -> bool 
 
 fn handle_inbound_frame(
     message: Message,
-    pump_state: &PumpState<'_>,
+    pump_state: &mut PumpState<'_>,
     pending_challenge: &mut Option<PendingPongChallenge>,
     control_flush_needed: &mut bool,
 ) -> bool {
+    let received_at = if matches!(&message, Message::Frame(_)) {
+        None
+    } else {
+        pump_state.diagnostics.record_rx()
+    };
     match message {
         Message::Text(text) => enqueue_inbound_payload(text.to_string(), pump_state),
         Message::Binary(bytes) => enqueue_inbound_payload(
@@ -155,7 +162,9 @@ fn handle_inbound_frame(
             true
         }
         Message::Pong(payload) => {
-            acknowledge_pong(&payload, pending_challenge, pump_state.watchdog_policy);
+            if acknowledge_pong(&payload, pending_challenge, pump_state.watchdog_policy) {
+                pump_state.diagnostics.record_pong(received_at);
+            }
             debug!(payload_len = payload.len(), "ws_pump_pong_received");
             true
         }

@@ -1,15 +1,126 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_activity_ages_share_reset_terminal_time() {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+    let (client, _server) = raw_pair(1024).await;
+    let (mut writer, mut reader) = client.split();
+    let (mut owned, mut inbound_rx) = test_diagnostic_pump_state(true);
+    let mut pump_state = owned.borrowed();
+    assert_explicit_send_activity(&mut writer, &mut reader, &mut pump_state).await;
+    assert_received_activity(&mut pump_state, &mut inbound_rx).await;
+    advance(Duration::from_millis(600)).await;
+    assert!(!handle_inbound_message(
+        Some(Err(TungsteniteError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        ))),
+        &mut pump_state,
+        &mut None,
+        &mut false,
+    ));
+    let capture = owned.diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    assert_eq!(
+        String::from_utf8(capture.bytes.clone()).unwrap(),
+        "[threadline] websocket closed source=read_error code=- reason=- error=protocol protocol_kind=reset_without_closing_handshake connection_age_ms=1000 last_rx_age_ms=600 last_tx_age_ms=800 last_ping_age_ms=800 last_pong_age_ms=750 io_kind=- raw_os_error=-\n"
+    );
+}
+
+async fn assert_explicit_send_activity(
+    writer: &mut SplitSink<WebSocketStream<DuplexStream>, Message>,
+    reader: &mut SplitStream<WebSocketStream<DuplexStream>>,
+    pump_state: &mut PumpState<'_>,
+) {
+    advance(Duration::from_millis(100)).await;
+    assert!(
+        drive_test_write_operation(
+            writer,
+            reader,
+            pump_state,
+            Message::Text("payload-secret".to_string()),
+            UpstreamOutboundKind::Text,
+        )
+        .await
+    );
+    let text_at = Instant::now();
+    assert_eq!(pump_state.diagnostics.last_tx_at, Some(text_at));
+    assert_eq!(pump_state.diagnostics.last_ping_at, None);
+    advance(Duration::from_millis(100)).await;
+    assert!(
+        drive_test_write_operation(
+            writer,
+            reader,
+            pump_state,
+            Message::Ping(b"nonce-secret".to_vec()),
+            UpstreamOutboundKind::Ping,
+        )
+        .await
+    );
+    assert_eq!(pump_state.diagnostics.last_tx_at, Some(Instant::now()));
+    assert_eq!(
+        pump_state.diagnostics.last_ping_at,
+        pump_state.diagnostics.last_tx_at
+    );
+}
+
+async fn assert_received_activity(
+    pump_state: &mut PumpState<'_>,
+    inbound_rx: &mut mpsc::Receiver<InboundEnvelope>,
+) {
+    let mut challenge = Some(PendingPongChallenge {
+        nonce: b"nonce-secret".to_vec(),
+        sent_at: Some(Instant::now()),
+        acknowledged_early: false,
+    });
+    advance(Duration::from_millis(50)).await;
+    assert!(handle_inbound_message(
+        Some(Ok(Message::Pong(b"nonce-secret".to_vec()))),
+        pump_state,
+        &mut challenge,
+        &mut false,
+    ));
+    assert!(challenge.is_none());
+    assert_eq!(
+        pump_state.diagnostics.last_pong_at,
+        pump_state.diagnostics.last_rx_at
+    );
+    advance(Duration::from_millis(100)).await;
+    assert!(handle_inbound_message(
+        Some(Ok(Message::Text("text-secret".to_string()))),
+        pump_state,
+        &mut None,
+        &mut false,
+    ));
+    assert_eq!(pump_state.diagnostics.last_rx_at, Some(Instant::now()));
+    assert_eq!(
+        inbound_rx.try_recv().unwrap().payload.into_string(),
+        "text-secret"
+    );
+    advance(Duration::from_millis(50)).await;
+    assert!(handle_inbound_message(
+        Some(Ok(Message::Binary(b"binary-secret".to_vec()))),
+        pump_state,
+        &mut None,
+        &mut false,
+    ));
+    assert_eq!(pump_state.diagnostics.last_rx_at, Some(Instant::now()));
+    assert_eq!(
+        inbound_rx.try_recv().unwrap().payload.into_string(),
+        "binary-secret"
+    );
+}
+
 #[test]
 fn close_diagnostics_eof_and_fallback_keep_the_first_observed_source() {
     for (inbound, source) in [
         (None, "stream_eof"),
         (Some(Ok(Message::Close(None))), "peer_close_frame"),
     ] {
-        let diagnostics = CloseDiagnostics::new(true);
+        let mut diagnostics = CloseDiagnostics::new(true);
         let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
-        assert!(!handle_test_inbound(inbound, &state, &diagnostics));
-        assert!(!handle_test_inbound(None, &state, &diagnostics));
+        assert!(!handle_test_inbound(inbound, &state, &mut diagnostics));
+        assert!(!handle_test_inbound(None, &state, &mut diagnostics));
         record_close(
             &state,
             empty_close_metadata(),
@@ -154,9 +265,13 @@ fn assert_read_error_diagnostic_case(
     expected_raw_os_error: &str,
 ) {
     let original = error.to_string();
-    let diagnostics = CloseDiagnostics::new(true);
+    let mut diagnostics = CloseDiagnostics::new(true);
     let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
-    assert!(!handle_test_inbound(Some(Err(error)), &state, &diagnostics));
+    assert!(!handle_test_inbound(
+        Some(Err(error)),
+        &state,
+        &mut diagnostics
+    ));
     record_close(
         &state,
         empty_close_metadata(),
@@ -182,7 +297,7 @@ fn assert_read_error_diagnostic_case(
     assert_eq!(
         output,
         format!(
-            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
+            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} last_rx_age_ms=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
         )
     );
     assert!(output.ends_with('\n'));
@@ -217,7 +332,7 @@ fn close_diagnostics_redact_hostile_reasons_frames_and_error_payloads() {
 fn assert_redacted_peer_close(hostile: &str, reason: &'static str) {
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-    let diagnostics = CloseDiagnostics::new(true);
+    let mut diagnostics = CloseDiagnostics::new(true);
     let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
     for frame in [
         Message::Text(hostile.to_string()),
@@ -225,7 +340,12 @@ fn assert_redacted_peer_close(hostile: &str, reason: &'static str) {
         Message::Ping(hostile.as_bytes().to_vec()),
         Message::Pong(hostile.as_bytes().to_vec()),
     ] {
-        assert!(handle_test_inbound(Some(Ok(frame)), &state, &diagnostics));
+        assert!(handle_test_inbound(
+            Some(Ok(frame)),
+            &state,
+            &mut diagnostics
+        ));
+        assert!(diagnostics.last_rx_at.is_some());
         assert_eq!(diagnostics.capture().calls, 0);
     }
     assert!(!handle_test_inbound(
@@ -234,7 +354,7 @@ fn assert_redacted_peer_close(hostile: &str, reason: &'static str) {
             reason: reason.into()
         })))),
         &state,
-        &diagnostics
+        &mut diagnostics
     ));
     assert_eq!(
         *state.lock().unwrap(),
@@ -335,7 +455,7 @@ async fn close_diagnostics_constructor_peer_close_is_independent_of_off_subscrib
         if enabled {
             assert_eq!(
                 String::from_utf8(capture.bytes.clone()).unwrap(),
-                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 io_kind=- raw_os_error=-\n"
+                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=0 last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- io_kind=- raw_os_error=-\n"
             );
         } else {
             assert!(capture.bytes.is_empty());

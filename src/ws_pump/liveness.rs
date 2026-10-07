@@ -122,7 +122,7 @@ pub(super) fn acknowledge_pong(
     payload: &[u8],
     pending_challenge: &mut Option<PendingPongChallenge>,
     policy: UpstreamWatchdogPolicy,
-) {
+) -> bool {
     if pending_challenge.as_mut().is_some_and(|challenge| {
         challenge.nonce == payload
             && challenge
@@ -137,5 +137,7 @@ pub(super) fn acknowledge_pong(
         } else {
             challenge.acknowledged_early = true;
         }
+        return true;
     }
+    false
 }

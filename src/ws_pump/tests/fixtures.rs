@@ -1,14 +1,32 @@
 use super::*;
 
+pub(super) fn test_diagnostic_pump_state(
+    enabled: bool,
+) -> (OwnedPumpState, mpsc::Receiver<InboundEnvelope>) {
+    let limits = UpstreamInboundLimits::DEFAULT;
+    let (inbound_tx, inbound_rx) = mpsc::channel(limits.max_messages());
+    (
+        OwnedPumpState {
+            inbound_tx,
+            byte_budget: Arc::new(Semaphore::new(limits.max_bytes())),
+            limits,
+            terminal_state: Arc::new(StdMutex::new(UpstreamTerminalState::Open)),
+            watchdog_policy: UpstreamWatchdogPolicy::DEFAULT,
+            diagnostics: CloseDiagnostics::new(enabled),
+        },
+        inbound_rx,
+    )
+}
+
 pub(super) fn handle_test_inbound(
     inbound: Option<Result<Message, TungsteniteError>>,
     state: &Arc<StdMutex<UpstreamTerminalState>>,
-    diagnostics: &CloseDiagnostics,
+    diagnostics: &mut CloseDiagnostics,
 ) -> bool {
     let limits = UpstreamInboundLimits::DEFAULT;
     let (inbound_tx, _inbound_rx) = mpsc::channel(limits.max_messages());
     let byte_budget = Arc::new(Semaphore::new(limits.max_bytes()));
-    let pump_state = PumpState {
+    let mut pump_state = PumpState {
         inbound_tx: &inbound_tx,
         byte_budget: &byte_budget,
         limits,
@@ -16,7 +34,7 @@ pub(super) fn handle_test_inbound(
         watchdog_policy: UpstreamWatchdogPolicy::DEFAULT,
         diagnostics,
     };
-    handle_inbound_message(inbound, &pump_state, &mut None, &mut false)
+    handle_inbound_message(inbound, &mut pump_state, &mut None, &mut false)
 }
 
 pub(super) fn empty_close_metadata() -> UpstreamCloseMetadata {
@@ -25,6 +43,33 @@ pub(super) fn empty_close_metadata() -> UpstreamCloseMetadata {
         reason: None,
         error: None,
     }
+}
+
+pub(super) async fn drive_test_write_operation<S>(
+    writer: &mut SplitSink<WebSocketStream<S>, Message>,
+    reader: &mut SplitStream<WebSocketStream<S>>,
+    pump_state: &mut PumpState<'_>,
+    message: Message,
+    kind: UpstreamOutboundKind,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut next_ping_due = Instant::now() + UPSTREAM_PING_INTERVAL;
+    drive_write_operation(
+        writer,
+        reader,
+        pump_state,
+        message,
+        kind,
+        PumpLivenessState {
+            pending_challenge: &mut None,
+            control_flush_needed: &mut false,
+            next_ping_due: &mut next_ping_due,
+            ping_interval: UPSTREAM_PING_INTERVAL,
+        },
+    )
+    .await
 }
 
 pub(super) async fn connect_test_pump() -> LiveUpstreamWebSocket {
