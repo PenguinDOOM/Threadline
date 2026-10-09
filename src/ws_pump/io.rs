@@ -145,10 +145,13 @@ fn handle_inbound_frame(
     pending_challenge: &mut Option<PendingPongChallenge>,
     control_flush_needed: &mut bool,
 ) -> bool {
-    let received_at = if matches!(&message, Message::Frame(_)) {
-        None
-    } else {
-        pump_state.diagnostics.record_rx()
+    let received_at = match &message {
+        Message::Text(_) => pump_state.diagnostics.record_rx_kind(RxKind::Text),
+        Message::Binary(_) => pump_state.diagnostics.record_rx_kind(RxKind::Binary),
+        Message::Ping(_) => pump_state.diagnostics.record_rx_kind(RxKind::Ping),
+        Message::Pong(_) => pump_state.diagnostics.record_rx_kind(RxKind::Pong),
+        Message::Close(_) => pump_state.diagnostics.record_rx_kind(RxKind::Close),
+        Message::Frame(_) => None,
     };
     match message {
         Message::Text(text) => enqueue_inbound_payload(text.to_string(), pump_state),

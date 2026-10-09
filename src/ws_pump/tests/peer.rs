@@ -29,7 +29,7 @@ async fn close_diagnostics_overflow_records_the_successfully_received_message() 
         &mut None,
         &mut false
     ));
-    assert_eq!(diagnostics.last_rx_at, Some(Instant::now()));
+    assert_eq!(diagnostics.last_rx, Some((Instant::now(), RxKind::Binary)));
     assert!(matches!(
         *state.lock().unwrap(),
         UpstreamTerminalState::InboundBufferOverflow(_)
@@ -37,29 +37,29 @@ async fn close_diagnostics_overflow_records_the_successfully_received_message() 
     let capture = diagnostics.capture();
     assert_eq!(capture.calls, 1);
     let output = String::from_utf8(capture.bytes.clone()).unwrap();
-    assert!(output.contains("terminal=inbound_buffer_overflow connection_age_ms=150 last_rx_age_ms=0 last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
+    assert!(output.contains("terminal=inbound_buffer_overflow connection_age_ms=150 last_rx_age_ms=0 last_rx_kind=binary last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
 }
 
 #[tokio::test(start_paused = true)]
 async fn close_diagnostics_rx_tracks_control_messages_and_excludes_frame_error_eof() {
     use tokio_tungstenite::tungstenite::protocol::frame::Frame;
-    for message in [
-        Message::Ping(vec![1]),
-        Message::Pong(vec![2]),
-        Message::Close(None),
+    for (message, expected_kind) in [
+        (Message::Ping(vec![1]), RxKind::Ping),
+        (Message::Pong(vec![2]), RxKind::Pong),
+        (Message::Close(None), RxKind::Close),
     ] {
         let mut diagnostics = CloseDiagnostics::new(true);
         let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
         advance(Duration::from_millis(25)).await;
         let received_at = Instant::now();
         let keep_running = handle_test_inbound(Some(Ok(message)), &state, &mut diagnostics);
-        assert_eq!(diagnostics.last_rx_at, Some(received_at));
+        assert_eq!(diagnostics.last_rx, Some((received_at, expected_kind)));
         assert_eq!(diagnostics.last_pong_at, None);
         if !keep_running {
             assert!(
                 String::from_utf8(diagnostics.capture().bytes.clone())
                     .unwrap()
-                    .contains("last_rx_age_ms=0")
+                    .contains("last_rx_age_ms=0 last_rx_kind=close")
             );
         }
     }
@@ -76,17 +76,17 @@ async fn close_diagnostics_rx_tracks_control_messages_and_excludes_frame_error_e
             &state,
             &mut diagnostics
         ));
-        let received_at = diagnostics.last_rx_at;
+        let received_at = diagnostics.last_rx;
         advance(Duration::from_millis(75)).await;
         handle_test_inbound(inbound, &state, &mut diagnostics);
-        assert_eq!(diagnostics.last_rx_at, received_at);
+        assert_eq!(diagnostics.last_rx, received_at);
         record_close(
             &state,
             empty_close_metadata(),
             UpstreamCloseSource::PumpExitFallback,
             &diagnostics,
         );
-        assert!(String::from_utf8(diagnostics.capture().bytes.clone()).unwrap().contains("connection_age_ms=100 last_rx_age_ms=75 last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
+        assert!(String::from_utf8(diagnostics.capture().bytes.clone()).unwrap().contains("connection_age_ms=100 last_rx_age_ms=75 last_rx_kind=ping last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
     }
 }
 

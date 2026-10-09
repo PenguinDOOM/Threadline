@@ -70,9 +70,9 @@ async fn close_diagnostics_pending_and_timed_out_writes_preserve_prior_activity(
         }
         assert_eq!(owned.diagnostics.last_tx_at, Some(previous_at));
         assert_eq!(owned.diagnostics.last_ping_at, Some(previous_at));
-        assert_eq!(owned.diagnostics.last_rx_at, None);
+        assert_eq!(owned.diagnostics.last_rx, None);
         let output = String::from_utf8(owned.diagnostics.capture().bytes.clone()).unwrap();
-        assert!(output.contains("connection_age_ms=2100 last_rx_age_ms=- last_tx_age_ms=2100 last_ping_age_ms=2100 last_pong_age_ms=-"));
+        assert!(output.contains("connection_age_ms=2100 last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=2100 last_ping_age_ms=2100 last_pong_age_ms=-"));
         assert!(output.contains("cause=write_deadline timeout_ms=2000 elapsed_ms=2000"));
         assert!(!output.contains("secret"));
     }
@@ -157,7 +157,7 @@ fn assert_sticky_terminal_output(diagnostics: &CloseDiagnostics, overflow_first:
     let capture = diagnostics.capture();
     assert_eq!(capture.calls, 1);
     let output = String::from_utf8(capture.bytes.clone()).unwrap();
-    assert!(output.contains("connection_age_ms=1500 last_rx_age_ms=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
+    assert!(output.contains("connection_age_ms=1500 last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
     assert!(!output.contains("source="));
     if overflow_first {
         assert!(output.contains("terminal=inbound_buffer_overflow"));
@@ -198,7 +198,7 @@ async fn close_diagnostics_first_commit_freezes_lifetime_and_unlocks_before_writ
     advance(Duration::from_millis(200)).await;
     diagnostics.record_write(UpstreamOutboundKind::Ping);
     advance(Duration::from_millis(50)).await;
-    let received_at = diagnostics.record_rx();
+    let received_at = diagnostics.record_rx_kind(RxKind::Pong);
     diagnostics.record_pong(received_at);
     advance(Duration::from_millis(984)).await;
     let metadata = UpstreamCloseMetadata {
@@ -216,7 +216,7 @@ async fn close_diagnostics_first_commit_freezes_lifetime_and_unlocks_before_writ
     let first_bytes = diagnostics.capture().bytes.clone();
     advance(Duration::from_secs(10)).await;
     diagnostics.record_write(UpstreamOutboundKind::Ping);
-    let received_at = diagnostics.record_rx();
+    let received_at = diagnostics.record_rx_kind(RxKind::Pong);
     diagnostics.record_pong(received_at);
     for inbound in [None, Some(Err(TungsteniteError::ConnectionClosed))] {
         assert!(!handle_test_inbound(inbound, &state, &mut diagnostics));
@@ -237,7 +237,7 @@ async fn close_diagnostics_first_commit_freezes_lifetime_and_unlocks_before_writ
     assert_eq!(capture.bytes, first_bytes);
     assert_eq!(
         String::from_utf8(capture.bytes.clone()).unwrap(),
-        "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=984 last_tx_age_ms=1034 last_ping_age_ms=1034 last_pong_age_ms=984 io_kind=- raw_os_error=-\n"
+        "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=984 last_rx_kind=pong last_tx_age_ms=1034 last_ping_age_ms=1034 last_pong_age_ms=984 io_kind=- raw_os_error=-\n"
     );
 }
 
@@ -247,7 +247,7 @@ async fn close_diagnostics_disabled_never_calls_writer_and_preserves_metadata() 
     assert_disabled_activity(&mut owned.borrowed()).await;
     let diagnostics = &owned.diagnostics;
     let state = &owned.terminal_state;
-    assert_eq!(diagnostics.last_rx_at, None);
+    assert_eq!(diagnostics.last_rx, None);
     assert_eq!(diagnostics.last_tx_at, None);
     assert_eq!(diagnostics.last_ping_at, None);
     assert_eq!(diagnostics.last_pong_at, None);

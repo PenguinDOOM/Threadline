@@ -1,5 +1,26 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RxKind {
+    Text,
+    Binary,
+    Ping,
+    Pong,
+    Close,
+}
+
+impl RxKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Binary => "binary",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+            Self::Close => "close",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum UpstreamCloseSource {
     PeerCloseFrame,
@@ -26,7 +47,7 @@ impl UpstreamCloseSource {
 #[derive(Clone)]
 pub(super) struct CloseDiagnostics {
     pub(super) started_at: Option<Instant>,
-    pub(super) last_rx_at: Option<Instant>,
+    pub(super) last_rx: Option<(Instant, RxKind)>,
     pub(super) last_tx_at: Option<Instant>,
     pub(super) last_ping_at: Option<Instant>,
     pub(super) last_pong_at: Option<Instant>,
@@ -38,7 +59,7 @@ impl CloseDiagnostics {
     #[cfg(test)]
     pub(super) const DISABLED: Self = Self {
         started_at: None,
-        last_rx_at: None,
+        last_rx: None,
         last_tx_at: None,
         last_ping_at: None,
         last_pong_at: None,
@@ -49,7 +70,7 @@ impl CloseDiagnostics {
     pub(super) fn new(enabled: bool) -> Self {
         Self {
             started_at: enabled.then(Instant::now),
-            last_rx_at: None,
+            last_rx: None,
             last_tx_at: None,
             last_ping_at: None,
             last_pong_at: None,
@@ -58,10 +79,10 @@ impl CloseDiagnostics {
         }
     }
 
-    pub(super) fn record_rx(&mut self) -> Option<Instant> {
+    pub(super) fn record_rx_kind(&mut self, kind: RxKind) -> Option<Instant> {
         self.started_at?;
         let received_at = Instant::now();
-        self.last_rx_at = Some(received_at);
+        self.last_rx = Some((received_at, kind));
         Some(received_at)
     }
 
@@ -90,7 +111,8 @@ impl CloseDiagnostics {
         };
         TerminalActivitySnapshot {
             connection_age_ms: age(started_at),
-            last_rx_age_ms: self.last_rx_at.map(age),
+            last_rx_age_ms: self.last_rx.map(|(received_at, _)| age(received_at)),
+            last_rx_kind: self.last_rx.map(|(_, kind)| kind.as_str()),
             last_tx_age_ms: self.last_tx_at.map(age),
             last_ping_age_ms: self.last_ping_at.map(age),
             last_pong_age_ms: self.last_pong_at.map(age),
@@ -118,6 +140,7 @@ impl CloseDiagnostics {
 pub(super) struct TerminalActivitySnapshot {
     connection_age_ms: u128,
     last_rx_age_ms: Option<u128>,
+    last_rx_kind: Option<&'static str>,
     last_tx_age_ms: Option<u128>,
     last_ping_age_ms: Option<u128>,
     last_pong_age_ms: Option<u128>,
@@ -126,19 +149,24 @@ pub(super) struct TerminalActivitySnapshot {
 impl std::fmt::Display for TerminalActivitySnapshot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "connection_age_ms={}", self.connection_age_ms)?;
-        for (key, value) in [
-            ("last_rx_age_ms", self.last_rx_age_ms),
-            ("last_tx_age_ms", self.last_tx_age_ms),
-            ("last_ping_age_ms", self.last_ping_age_ms),
-            ("last_pong_age_ms", self.last_pong_age_ms),
-        ] {
-            write!(formatter, " {key}=")?;
-            match value {
-                Some(value) => write!(formatter, "{value}")?,
-                None => formatter.write_str("-")?,
-            }
-        }
+        write_optional_field(formatter, "last_rx_age_ms", self.last_rx_age_ms)?;
+        write_optional_field(formatter, "last_rx_kind", self.last_rx_kind)?;
+        write_optional_field(formatter, "last_tx_age_ms", self.last_tx_age_ms)?;
+        write_optional_field(formatter, "last_ping_age_ms", self.last_ping_age_ms)?;
+        write_optional_field(formatter, "last_pong_age_ms", self.last_pong_age_ms)?;
         Ok(())
+    }
+}
+
+fn write_optional_field<T: std::fmt::Display>(
+    formatter: &mut std::fmt::Formatter<'_>,
+    key: &str,
+    value: Option<T>,
+) -> std::fmt::Result {
+    write!(formatter, " {key}=")?;
+    match value {
+        Some(value) => write!(formatter, "{value}"),
+        None => formatter.write_str("-"),
     }
 }
 

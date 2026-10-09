@@ -23,7 +23,7 @@ async fn close_diagnostics_activity_ages_share_reset_terminal_time() {
     assert_eq!(capture.calls, 1);
     assert_eq!(
         String::from_utf8(capture.bytes.clone()).unwrap(),
-        "[threadline] websocket closed source=read_error code=- reason=- error=protocol protocol_kind=reset_without_closing_handshake connection_age_ms=1000 last_rx_age_ms=600 last_tx_age_ms=800 last_ping_age_ms=800 last_pong_age_ms=750 io_kind=- raw_os_error=-\n"
+        "[threadline] websocket closed source=read_error code=- reason=- error=protocol protocol_kind=reset_without_closing_handshake connection_age_ms=1000 last_rx_age_ms=600 last_rx_kind=binary last_tx_age_ms=800 last_ping_age_ms=800 last_pong_age_ms=750 io_kind=- raw_os_error=-\n"
     );
 }
 
@@ -83,7 +83,10 @@ async fn assert_received_activity(
     assert!(challenge.is_none());
     assert_eq!(
         pump_state.diagnostics.last_pong_at,
-        pump_state.diagnostics.last_rx_at
+        pump_state
+            .diagnostics
+            .last_rx
+            .map(|(received_at, _)| received_at)
     );
     advance(Duration::from_millis(100)).await;
     assert!(handle_inbound_message(
@@ -92,7 +95,10 @@ async fn assert_received_activity(
         &mut None,
         &mut false,
     ));
-    assert_eq!(pump_state.diagnostics.last_rx_at, Some(Instant::now()));
+    assert_eq!(
+        pump_state.diagnostics.last_rx,
+        Some((Instant::now(), RxKind::Text))
+    );
     assert_eq!(
         inbound_rx.try_recv().unwrap().payload.into_string(),
         "text-secret"
@@ -104,7 +110,10 @@ async fn assert_received_activity(
         &mut None,
         &mut false,
     ));
-    assert_eq!(pump_state.diagnostics.last_rx_at, Some(Instant::now()));
+    assert_eq!(
+        pump_state.diagnostics.last_rx,
+        Some((Instant::now(), RxKind::Binary))
+    );
     assert_eq!(
         inbound_rx.try_recv().unwrap().payload.into_string(),
         "binary-secret"
@@ -297,7 +306,7 @@ fn assert_read_error_diagnostic_case(
     assert_eq!(
         output,
         format!(
-            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} last_rx_age_ms=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
+            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
         )
     );
     assert!(output.ends_with('\n'));
@@ -345,7 +354,7 @@ fn assert_redacted_peer_close(hostile: &str, reason: &'static str) {
             &state,
             &mut diagnostics
         ));
-        assert!(diagnostics.last_rx_at.is_some());
+        assert!(diagnostics.last_rx.is_some());
         assert_eq!(diagnostics.capture().calls, 0);
     }
     assert!(!handle_test_inbound(
@@ -455,7 +464,7 @@ async fn close_diagnostics_constructor_peer_close_is_independent_of_off_subscrib
         if enabled {
             assert_eq!(
                 String::from_utf8(capture.bytes.clone()).unwrap(),
-                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=0 last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- io_kind=- raw_os_error=-\n"
+                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=0 last_rx_kind=close last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- io_kind=- raw_os_error=-\n"
             );
         } else {
             assert!(capture.bytes.is_empty());

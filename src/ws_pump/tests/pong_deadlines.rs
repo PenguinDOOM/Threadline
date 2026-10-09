@@ -22,7 +22,10 @@ async fn close_diagnostics_pong_tracks_only_existing_acknowledgements() {
         assert_eq!(pump_state.diagnostics.last_pong_at, Some(Instant::now()));
         assert_eq!(
             pump_state.diagnostics.last_pong_at,
-            pump_state.diagnostics.last_rx_at
+            pump_state
+                .diagnostics
+                .last_rx
+                .map(|(received_at, _)| received_at)
         );
     }
     assert!(!finish_write_operation(
@@ -34,9 +37,9 @@ async fn close_diagnostics_pong_tracks_only_existing_acknowledgements() {
     assert_eq!(owned.diagnostics.last_tx_at, None);
     assert_eq!(owned.diagnostics.last_pong_at, Some(Instant::now()));
     let output = String::from_utf8(owned.diagnostics.capture().bytes.clone()).unwrap();
-    assert!(
-        output.contains("last_rx_age_ms=0 last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=0")
-    );
+    assert!(output.contains(
+        "last_rx_age_ms=0 last_rx_kind=pong last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=0"
+    ));
     assert!(!output.contains("secret"));
 }
 
@@ -60,7 +63,13 @@ async fn assert_regular_pong_activity(pump_state: &mut PumpState<'_>) {
         &mut challenge,
         &mut false
     ));
-    assert_eq!(pump_state.diagnostics.last_rx_at, Some(Instant::now()));
+    assert_eq!(
+        pump_state
+            .diagnostics
+            .last_rx
+            .map(|(received_at, _)| received_at),
+        Some(Instant::now())
+    );
     assert_eq!(pump_state.diagnostics.last_pong_at, None);
     advance(Duration::from_millis(10)).await;
     assert!(handle_inbound_message(
@@ -79,7 +88,13 @@ async fn assert_regular_pong_activity(pump_state: &mut PumpState<'_>) {
         &mut challenge,
         &mut false
     ));
-    assert_eq!(pump_state.diagnostics.last_rx_at, Some(Instant::now()));
+    assert_eq!(
+        pump_state
+            .diagnostics
+            .last_rx
+            .map(|(received_at, _)| received_at),
+        Some(Instant::now())
+    );
     assert_eq!(pump_state.diagnostics.last_pong_at, Some(acknowledged_at));
 }
 
@@ -189,7 +204,13 @@ async fn websocket_pump_rejects_matching_pong_at_the_deadline() {
         &mut control_flush_needed,
     ));
     assert!(challenge.is_some());
-    assert_eq!(pump_state.diagnostics.last_rx_at, Some(Instant::now()));
+    assert_eq!(
+        pump_state
+            .diagnostics
+            .last_rx
+            .map(|(received_at, _)| received_at),
+        Some(Instant::now())
+    );
     assert_eq!(pump_state.diagnostics.last_pong_at, None);
     assert!(!check_liveness_deadline(
         &terminal_state,
@@ -206,7 +227,7 @@ async fn websocket_pump_rejects_matching_pong_at_the_deadline() {
         })
     ));
     let output = String::from_utf8(diagnostics.capture().bytes.clone()).unwrap();
-    assert!(output.contains("connection_age_ms=5000 last_rx_age_ms=0 last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
+    assert!(output.contains("connection_age_ms=5000 last_rx_age_ms=0 last_rx_kind=pong last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -241,7 +262,10 @@ async fn websocket_pump_latches_matching_pong_before_ping_send_completes() {
     ));
     assert_eq!(
         pump_state.diagnostics.last_pong_at,
-        pump_state.diagnostics.last_rx_at
+        pump_state
+            .diagnostics
+            .last_rx
+            .map(|(received_at, _)| received_at)
     );
     assert_eq!(pump_state.diagnostics.last_ping_at, None);
     assert_eq!(pump_state.diagnostics.last_tx_at, None);
@@ -325,7 +349,7 @@ async fn assert_early_pong_activity_ages(
     assert_eq!(capture.calls, 1);
     assert_eq!(
         String::from_utf8(capture.bytes.clone()).unwrap(),
-        "[threadline] websocket closed source=peer_close_frame code=- reason=- error=- protocol_kind=- connection_age_ms=18000 last_rx_age_ms=0 last_tx_age_ms=6000 last_ping_age_ms=6000 last_pong_age_ms=8000 io_kind=- raw_os_error=-\n"
+        "[threadline] websocket closed source=peer_close_frame code=- reason=- error=- protocol_kind=- connection_age_ms=18000 last_rx_age_ms=0 last_rx_kind=close last_tx_age_ms=6000 last_ping_age_ms=6000 last_pong_age_ms=8000 io_kind=- raw_os_error=-\n"
     );
 }
 
