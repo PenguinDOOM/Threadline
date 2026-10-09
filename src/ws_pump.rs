@@ -13,6 +13,9 @@ use driver::*;
 mod handle;
 
 mod diagnostics;
+pub(crate) use diagnostics::ResponseEvent;
+#[cfg(test)]
+pub(crate) use diagnostics::ResponseState;
 use diagnostics::*;
 
 use std::sync::{Arc, Mutex as StdMutex};
@@ -175,6 +178,8 @@ pub struct LiveUpstreamWebSocket {
     outbound_tx: mpsc::Sender<OutboundCommand>,
     inbound_rx: Mutex<mpsc::Receiver<InboundEnvelope>>,
     terminal_state: Arc<StdMutex<UpstreamTerminalState>>,
+    #[cfg(not(test))]
+    response_diagnostics: ResponseDiagnostics,
     task: JoinHandle<()>,
     #[cfg(test)]
     after_text_send: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -186,6 +191,13 @@ pub struct LiveUpstreamWebSocket {
 
 enum OutboundCommand {
     Text(String),
+    ResponseCreate(String),
+}
+
+#[derive(Clone, Copy)]
+enum TextSendKind {
+    Generic,
+    ResponseCreate,
 }
 
 struct InboundEnvelope {

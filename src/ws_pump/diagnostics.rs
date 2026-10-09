@@ -1,6 +1,65 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResponseState {
+    NotStarted,
+    CreatePending,
+    CreateSent,
+    InProgress,
+    Completed,
+    Failed,
+    Incomplete,
+    Unknown,
+}
+
+impl ResponseState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::CreatePending => "create_pending",
+            Self::CreateSent => "create_sent",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Incomplete => "incomplete",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ResponseEvent {
+    Started,
+    Completed,
+    Failed,
+    Incomplete,
+    Progress,
+    Unknown,
+}
+
+pub(super) struct ResponseObservation {
+    state: ResponseState,
+    unclassified: usize,
+    write_pending: bool,
+    ambiguous: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ResponseDiagnostics {
+    pub(super) record: Option<Arc<StdMutex<ResponseObservation>>>,
+}
+
+impl ResponseObservation {
+    fn snapshot(&self) -> ResponseState {
+        if self.ambiguous || self.unclassified != 0 {
+            ResponseState::Unknown
+        } else {
+            self.state
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RxKind {
     Text,
     Binary,
@@ -51,6 +110,7 @@ pub(super) struct CloseDiagnostics {
     pub(super) last_tx_at: Option<Instant>,
     pub(super) last_ping_at: Option<Instant>,
     pub(super) last_pong_at: Option<Instant>,
+    pub(super) response: ResponseDiagnostics,
     #[cfg(test)]
     pub(super) capture: Option<Arc<StdMutex<TestDiagnosticWriter>>>,
 }
@@ -63,6 +123,7 @@ impl CloseDiagnostics {
         last_tx_at: None,
         last_ping_at: None,
         last_pong_at: None,
+        response: ResponseDiagnostics { record: None },
         #[cfg(test)]
         capture: None,
     };
@@ -74,6 +135,16 @@ impl CloseDiagnostics {
             last_tx_at: None,
             last_ping_at: None,
             last_pong_at: None,
+            response: ResponseDiagnostics {
+                record: enabled.then(|| {
+                    Arc::new(StdMutex::new(ResponseObservation {
+                        state: ResponseState::NotStarted,
+                        unclassified: 0,
+                        write_pending: false,
+                        ambiguous: false,
+                    }))
+                }),
+            },
             #[cfg(test)]
             capture: Some(Arc::new(StdMutex::new(TestDiagnosticWriter::default()))),
         }
@@ -85,7 +156,114 @@ impl CloseDiagnostics {
         self.last_rx = Some((received_at, kind));
         Some(received_at)
     }
+}
 
+impl ResponseDiagnostics {
+    fn observe(
+        &self,
+        terminal: &Arc<StdMutex<UpstreamTerminalState>>,
+        update: impl FnOnce(&mut ResponseObservation),
+    ) {
+        let Some(response) = &self.record else {
+            return;
+        };
+        let terminal = terminal.lock().expect("terminal state lock");
+        if matches!(*terminal, UpstreamTerminalState::Open) {
+            update(&mut response.lock().expect("response observation lock"));
+        }
+    }
+
+    pub(super) fn record_create_pending(&self, terminal: &Arc<StdMutex<UpstreamTerminalState>>) {
+        self.observe(terminal, |response| {
+            if response.write_pending
+                || response.unclassified != 0
+                || !matches!(
+                    response.state,
+                    ResponseState::NotStarted
+                        | ResponseState::Completed
+                        | ResponseState::Failed
+                        | ResponseState::Incomplete
+                )
+            {
+                response.ambiguous = true;
+            }
+            response.write_pending = true;
+            response.state = ResponseState::CreatePending;
+        });
+    }
+
+    pub(super) fn record_create_sent(&self, terminal: &Arc<StdMutex<UpstreamTerminalState>>) {
+        self.observe(terminal, |response| {
+            if response.ambiguous {
+                return;
+            }
+            if !response.write_pending {
+                response.ambiguous = true;
+            } else {
+                response.write_pending = false;
+                if response.state == ResponseState::CreatePending {
+                    response.state = ResponseState::CreateSent;
+                }
+            }
+        });
+    }
+
+    pub(super) fn record_generic_send(&self, terminal: &Arc<StdMutex<UpstreamTerminalState>>) {
+        self.observe(terminal, |response| response.ambiguous = true);
+    }
+
+    pub(super) fn record_unclassified(&self, terminal: &Arc<StdMutex<UpstreamTerminalState>>) {
+        self.observe(terminal, |response| {
+            if let Some(count) = response.unclassified.checked_add(1) {
+                response.unclassified = count;
+            } else {
+                response.ambiguous = true;
+            }
+        });
+    }
+
+    pub(super) fn record_response_event(
+        &self,
+        terminal: &Arc<StdMutex<UpstreamTerminalState>>,
+        event: ResponseEvent,
+    ) {
+        self.observe(terminal, |response| {
+            if let Some(count) = response.unclassified.checked_sub(1) {
+                response.unclassified = count;
+            } else {
+                response.ambiguous = true;
+            }
+            response.state = match event {
+                ResponseEvent::Started => ResponseState::InProgress,
+                ResponseEvent::Completed => ResponseState::Completed,
+                ResponseEvent::Failed => ResponseState::Failed,
+                ResponseEvent::Incomplete => ResponseState::Incomplete,
+                ResponseEvent::Progress => response.state,
+                ResponseEvent::Unknown => ResponseState::Unknown,
+            };
+        });
+    }
+
+    pub(super) fn response_state(&self) -> Option<ResponseState> {
+        self.record.as_ref().map(|response| {
+            response
+                .lock()
+                .expect("response observation lock")
+                .snapshot()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_set_unclassified(
+        &self,
+        terminal: &Arc<StdMutex<UpstreamTerminalState>>,
+        count: usize,
+    ) {
+        self.observe(terminal, |response| response.unclassified = count);
+    }
+}
+
+impl CloseDiagnostics {
     pub(super) fn record_pong(&mut self, received_at: Option<Instant>) {
         if self.started_at.is_some() {
             self.last_pong_at = received_at;
@@ -116,6 +294,10 @@ impl CloseDiagnostics {
             last_tx_age_ms: self.last_tx_at.map(age),
             last_ping_age_ms: self.last_ping_at.map(age),
             last_pong_age_ms: self.last_pong_at.map(age),
+            response_state: self
+                .response
+                .response_state()
+                .expect("enabled response observation"),
         }
     }
 
@@ -144,6 +326,7 @@ pub(super) struct TerminalActivitySnapshot {
     last_tx_age_ms: Option<u128>,
     last_ping_age_ms: Option<u128>,
     last_pong_age_ms: Option<u128>,
+    response_state: ResponseState,
 }
 
 impl std::fmt::Display for TerminalActivitySnapshot {
@@ -154,6 +337,11 @@ impl std::fmt::Display for TerminalActivitySnapshot {
         write_optional_field(formatter, "last_tx_age_ms", self.last_tx_age_ms)?;
         write_optional_field(formatter, "last_ping_age_ms", self.last_ping_age_ms)?;
         write_optional_field(formatter, "last_pong_age_ms", self.last_pong_age_ms)?;
+        write!(
+            formatter,
+            " response_state={}",
+            self.response_state.as_str()
+        )?;
         Ok(())
     }
 }
@@ -177,6 +365,7 @@ pub(super) struct TestDiagnosticWriter {
     pub(super) bytes: Vec<u8>,
     pub(super) fail: bool,
     pub(super) terminal_state: Option<Arc<StdMutex<UpstreamTerminalState>>>,
+    pub(super) response: Option<Arc<StdMutex<ResponseObservation>>>,
 }
 
 #[cfg(test)]
@@ -187,6 +376,12 @@ impl std::io::Write for TestDiagnosticWriter {
             assert!(
                 state.try_lock().is_ok(),
                 "writer must not hold terminal lock"
+            );
+        }
+        if let Some(response) = &self.response {
+            assert!(
+                response.try_lock().is_ok(),
+                "writer must not hold response observation lock"
             );
         }
         if self.fail {

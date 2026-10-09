@@ -239,9 +239,13 @@ where
             schedule.prefer_inbound = false;
             handle_inbound_and_schedule(inbound, pump_state, schedule.liveness())
         }
-        WaitingEvent::Outbound(Some(OutboundCommand::Text(text))) => {
+        WaitingEvent::Outbound(Some(command)) => {
             schedule.prefer_inbound = true;
-            drive_write_operation(
+            let (text, response_create) = match command {
+                OutboundCommand::Text(text) => (text, false),
+                OutboundCommand::ResponseCreate(text) => (text, true),
+            };
+            let written = drive_write_operation(
                 writer,
                 reader,
                 pump_state,
@@ -249,7 +253,14 @@ where
                 UpstreamOutboundKind::Text,
                 schedule.liveness(),
             )
-            .await
+            .await;
+            if written && response_create {
+                pump_state
+                    .diagnostics
+                    .response
+                    .record_create_sent(pump_state.terminal_state);
+            }
+            written
         }
         WaitingEvent::Outbound(None) => {
             record_close(

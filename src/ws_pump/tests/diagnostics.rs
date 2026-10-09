@@ -1,5 +1,216 @@
 use super::*;
 
+#[test]
+fn close_diagnostics_response_observation_lifecycle() {
+    let diagnostics = CloseDiagnostics::new(true).response;
+    let terminal = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    assert_eq!(
+        diagnostics.response_state(),
+        Some(ResponseState::NotStarted)
+    );
+    for (event, expected) in [
+        (ResponseEvent::Started, ResponseState::InProgress),
+        (ResponseEvent::Progress, ResponseState::InProgress),
+        (ResponseEvent::Completed, ResponseState::Completed),
+        (ResponseEvent::Failed, ResponseState::Failed),
+        (ResponseEvent::Incomplete, ResponseState::Incomplete),
+        (ResponseEvent::Unknown, ResponseState::Unknown),
+    ] {
+        diagnostics.record_unclassified(&terminal);
+        assert_eq!(diagnostics.response_state(), Some(ResponseState::Unknown));
+        diagnostics.record_response_event(&terminal, event);
+        assert_eq!(diagnostics.response_state(), Some(expected));
+    }
+    let diagnostics = CloseDiagnostics::new(true).response;
+    diagnostics.record_create_pending(&terminal);
+    assert_eq!(
+        diagnostics.response_state(),
+        Some(ResponseState::CreatePending)
+    );
+    diagnostics.record_create_sent(&terminal);
+    assert_eq!(
+        diagnostics.response_state(),
+        Some(ResponseState::CreateSent)
+    );
+    assert!(CloseDiagnostics::new(false).response.record.is_none());
+}
+
+#[test]
+fn close_diagnostics_response_observation_freezes_before_unlocked_write() {
+    for observer_first in [true, false] {
+        for next in terminal_observation_cases() {
+            assert_terminal_observation_freezes(observer_first, next);
+        }
+    }
+}
+
+#[test]
+fn close_diagnostics_counter_faults_and_disabled_observation_are_conservative() {
+    for overflow in [false, true] {
+        let diagnostics = CloseDiagnostics::new(true);
+        let terminal = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        if overflow {
+            diagnostics
+                .response
+                .test_set_unclassified(&terminal, usize::MAX);
+            diagnostics.response.record_unclassified(&terminal);
+            diagnostics.response.test_set_unclassified(&terminal, 1);
+        }
+        diagnostics
+            .response
+            .record_response_event(&terminal, ResponseEvent::Completed);
+        assert_eq!(
+            diagnostics.response.response_state(),
+            Some(ResponseState::Unknown)
+        );
+        diagnostics.response.record_create_pending(&terminal);
+        diagnostics.response.record_create_sent(&terminal);
+        assert_eq!(
+            diagnostics.response.response_state(),
+            Some(ResponseState::Unknown)
+        );
+    }
+    let diagnostics = CloseDiagnostics::new(false);
+    let terminal = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    let guard = terminal.lock().unwrap();
+    diagnostics.response.record_create_pending(&terminal);
+    diagnostics.response.record_create_sent(&terminal);
+    diagnostics.response.record_generic_send(&terminal);
+    diagnostics.response.record_unclassified(&terminal);
+    diagnostics
+        .response
+        .record_response_event(&terminal, ResponseEvent::Unknown);
+    assert!(diagnostics.response.record.is_none());
+    assert_eq!(diagnostics.response.response_state(), None);
+    assert!(diagnostics.started_at.is_none());
+    assert_eq!(diagnostics.capture().calls, 0);
+    drop(guard);
+}
+
+#[tokio::test]
+async fn close_diagnostics_cancelled_enqueue_keeps_pending_and_next_create_unknown() {
+    let (pump, mut server, started, open, waker) =
+        LiveUpstreamWebSocket::test_diagnostic_write_gate().await;
+    let writing = started.notified();
+    tokio::pin!(writing);
+    writing.as_mut().enable();
+    pump.outbound_tx
+        .try_send(OutboundCommand::Text("writer-blocker".into()))
+        .unwrap();
+    writing.await;
+    fill_gated_outbound_channel(&pump);
+    {
+        let create = pump.send_response_create_text("cancelled-create".into());
+        tokio::pin!(create);
+        assert!(futures_util::poll!(&mut create).is_pending());
+        assert_eq!(
+            pump.diagnostic_response_state(),
+            Some(ResponseState::CreatePending)
+        );
+    }
+    assert_eq!(
+        pump.diagnostic_response_state(),
+        Some(ResponseState::CreatePending)
+    );
+    open.store(true, Ordering::SeqCst);
+    waker.wake();
+    for _ in 0..=OUTBOUND_CHANNEL_CAPACITY {
+        assert!(matches!(
+            server.next().await.unwrap().unwrap(),
+            Message::Text(_)
+        ));
+    }
+    pump.send_response_create_text("next-create".into())
+        .await
+        .unwrap();
+    assert!(matches!(
+        server.next().await.unwrap().unwrap(),
+        Message::Text(_)
+    ));
+    assert_eq!(
+        pump.diagnostic_response_state(),
+        Some(ResponseState::Unknown)
+    );
+}
+
+#[tokio::test]
+async fn close_diagnostics_enqueue_overflow_keeps_unclassified_input_unknown() {
+    for (binary, max_bytes) in [(false, 1), (true, 1), (false, 1024)] {
+        let (client, mut server) = raw_pair(8192).await;
+        let mut pump = LiveUpstreamWebSocket::from_stream_with_close_diagnostics(
+            client,
+            UpstreamWatchdogPolicy::DEFAULT,
+            UpstreamInboundLimits::new(1, max_bytes).unwrap(),
+            true,
+        );
+        let payload = r#"{"type":"response.completed","id":"overflow-secret"}"#;
+        let message = if binary {
+            Message::Binary(payload.as_bytes().to_vec())
+        } else {
+            Message::Text(payload.into())
+        };
+        server.send(message.clone()).await.unwrap();
+        if max_bytes == 1024 {
+            server.send(message).await.unwrap();
+        }
+        (&mut pump.task).await.unwrap();
+        assert!(matches!(
+            pump.terminal_state(),
+            UpstreamTerminalState::InboundBufferOverflow(_)
+        ));
+        let (calls, output) = pump.diagnostic_output();
+        assert_eq!(calls, 1);
+        assert!(output.contains("terminal=inbound_buffer_overflow"));
+        assert!(output.contains("response_state=unknown"));
+        assert!(!output.contains("secret"));
+    }
+}
+
+#[tokio::test]
+async fn close_diagnostics_queued_completion_stays_unknown_through_control_and_reset() {
+    for binary in [false, true] {
+        let (client, mut server) = raw_pair(8192).await;
+        let mut pump = LiveUpstreamWebSocket::from_stream_with_close_diagnostics(
+            client,
+            UpstreamWatchdogPolicy::DEFAULT,
+            UpstreamInboundLimits::DEFAULT,
+            true,
+        );
+        let completed = r#"{"type":"response.completed","id":"response-secret"}"#;
+        server
+            .send(if binary {
+                Message::Binary(completed.as_bytes().to_vec())
+            } else {
+                Message::Text(completed.into())
+            })
+            .await
+            .unwrap();
+        server
+            .send(Message::Pong(b"nonce-secret".to_vec()))
+            .await
+            .unwrap();
+        server
+            .send(Message::Ping(b"ping-secret".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.next().await.unwrap().unwrap(),
+            Message::Pong(b"ping-secret".to_vec())
+        );
+        assert_eq!(
+            pump.diagnostic_response_state(),
+            Some(ResponseState::Unknown)
+        );
+        drop(server);
+        (&mut pump.task).await.unwrap();
+        let (calls, output) = pump.diagnostic_output();
+        assert_eq!(calls, 1);
+        assert!(output.contains("protocol_kind=reset_without_closing_handshake"));
+        assert!(output.contains("response_state=unknown"));
+        assert!(!output.contains("secret"));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn close_diagnostics_activity_ages_share_reset_terminal_time() {
     use tokio_tungstenite::tungstenite::error::ProtocolError;
@@ -23,7 +234,7 @@ async fn close_diagnostics_activity_ages_share_reset_terminal_time() {
     assert_eq!(capture.calls, 1);
     assert_eq!(
         String::from_utf8(capture.bytes.clone()).unwrap(),
-        "[threadline] websocket closed source=read_error code=- reason=- error=protocol protocol_kind=reset_without_closing_handshake connection_age_ms=1000 last_rx_age_ms=600 last_rx_kind=binary last_tx_age_ms=800 last_ping_age_ms=800 last_pong_age_ms=750 io_kind=- raw_os_error=-\n"
+        "[threadline] websocket closed source=read_error code=- reason=- error=protocol protocol_kind=reset_without_closing_handshake connection_age_ms=1000 last_rx_age_ms=600 last_rx_kind=binary last_tx_age_ms=800 last_ping_age_ms=800 last_pong_age_ms=750 response_state=unknown io_kind=- raw_os_error=-\n"
     );
 }
 
@@ -306,7 +517,7 @@ fn assert_read_error_diagnostic_case(
     assert_eq!(
         output,
         format!(
-            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
+            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- response_state=not_started io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
         )
     );
     assert!(output.ends_with('\n'));
@@ -336,89 +547,6 @@ fn close_diagnostics_redact_hostile_reasons_frames_and_error_payloads() {
     ] {
         assert_redacted_write_buffer_error(frame);
     }
-}
-
-fn assert_redacted_peer_close(hostile: &str, reason: &'static str) {
-    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-    let mut diagnostics = CloseDiagnostics::new(true);
-    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
-    for frame in [
-        Message::Text(hostile.to_string()),
-        Message::Binary(hostile.as_bytes().to_vec()),
-        Message::Ping(hostile.as_bytes().to_vec()),
-        Message::Pong(hostile.as_bytes().to_vec()),
-    ] {
-        assert!(handle_test_inbound(
-            Some(Ok(frame)),
-            &state,
-            &mut diagnostics
-        ));
-        assert!(diagnostics.last_rx.is_some());
-        assert_eq!(diagnostics.capture().calls, 0);
-    }
-    assert!(!handle_test_inbound(
-        Some(Ok(Message::Close(Some(CloseFrame {
-            code: CloseCode::Away,
-            reason: reason.into()
-        })))),
-        &state,
-        &mut diagnostics
-    ));
-    assert_eq!(
-        *state.lock().unwrap(),
-        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
-            code: Some(1001),
-            reason: Some(reason.to_string()),
-            error: None,
-        })
-    );
-    let capture = diagnostics.capture();
-    assert_eq!(capture.calls, 1);
-    let output = String::from_utf8(capture.bytes.clone()).unwrap();
-    let expected = match reason {
-        "" | "going away" | "normal closure" => reason,
-        _ => "[redacted]",
-    };
-    assert!(output.contains(&format!("reason={expected} error=- protocol_kind=-")));
-    assert!(!output.contains("secret"));
-    assert!(!output.contains(['\r', '\x1b']));
-    assert_eq!(output.lines().count(), 1);
-}
-
-fn assert_redacted_write_buffer_error(frame: Message) {
-    let diagnostics = CloseDiagnostics::new(true);
-    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
-    let error = TungsteniteError::WriteBufferFull(frame);
-    let original = error.to_string();
-    record_error(
-        &state,
-        &error,
-        UpstreamCloseSource::WriteError,
-        &diagnostics,
-    );
-    record_close(
-        &state,
-        empty_close_metadata(),
-        UpstreamCloseSource::PumpExitFallback,
-        &diagnostics,
-    );
-    assert_eq!(
-        *state.lock().unwrap(),
-        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
-            code: None,
-            reason: None,
-            error: Some(original)
-        })
-    );
-    let capture = diagnostics.capture();
-    assert_eq!(capture.calls, 1);
-    let output = String::from_utf8(capture.bytes.clone()).unwrap();
-    assert!(output.contains("source=write_error"));
-    assert!(output.contains("error=write_buffer_full protocol_kind=-"));
-    assert!(!output.contains("secret"));
-    assert!(!output.contains(['\r', '\x1b']));
-    assert_eq!(output.lines().count(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -464,7 +592,7 @@ async fn close_diagnostics_constructor_peer_close_is_independent_of_off_subscrib
         if enabled {
             assert_eq!(
                 String::from_utf8(capture.bytes.clone()).unwrap(),
-                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=0 last_rx_kind=close last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- io_kind=- raw_os_error=-\n"
+                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=0 last_rx_kind=close last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- response_state=not_started io_kind=- raw_os_error=-\n"
             );
         } else {
             assert!(capture.bytes.is_empty());

@@ -140,6 +140,23 @@ Connection age starts when the constructor receives the already-upgraded WebSock
 
 Each diagnostic line also reports `last_rx_age_ms`, `last_tx_age_ms`, `last_ping_age_ms`, and `last_pong_age_ms`. These are monotonic integer milliseconds from the latest qualifying activity to the same first terminal commit snapshot; `-` means no qualifying activity was observed. RX records successfully received Text, Binary, Ping, Pong, or Close messages before dispatch. It excludes raw frames, read errors, EOF, and underlying bytes. TX records an explicit Text or Ping send only when the pump observes it complete successfully; enqueue, send start, failure, timeout, control-frame flushes, and implicit flushes are excluded. This is not a measure of all wire writes or confirmation that the peer received data. A successful keepalive Ping records the same instant for TX and PING. PONG records only a matching current challenge accepted by the existing watchdog, including an early matching Pong received before the Ping send completes; other Pong messages can update RX but not PONG.
 
+`last_rx_kind` is the kind of the latest successfully received tungstenite message, recorded with the same instant as `last_rx_age_ms`: `text`, `binary`, `ping`, `pong`, or `close`; `-` means none was observed. Read errors and EOF do not replace it. This identifies a message kind, not its contents, underlying bytes, or generated tokens.
+
+`response_state` is a fixed, connection-local observation of upstream Responses events when close diagnostics are enabled. It is not the server's true current state, an HTTP/SSE turn state, or an agent/model state. Its values mean:
+
+| Value | Meaning |
+| --- | --- |
+| `not_started` | No Responses create send has started on this connection, with no known classification uncertainty. |
+| `create_pending` | A normalized and serialized create send was polled before waiting to enqueue it. This does not mean enqueue or write succeeded, or that the server accepted it. |
+| `create_sent` | The corresponding writer send completed successfully; server acceptance is not confirmed. |
+| `in_progress` | `response.created` or `response.in_progress` was observed. This does not establish that output tokens were generated. |
+| `completed` | `response.completed` was observed for the latest response, including an internal-tool intermediate response; a subsequent create moves the observation to `create_pending`. |
+| `failed` | `response.failed` was observed. |
+| `incomplete` | `response.incomplete` was observed. |
+| `unknown` | Unclassified or unrecognized input, a generic error, malformed event, or ambiguous attribution prevents a reliable state label. |
+
+Known progress events do not advance the state, and Ping/Pong does not classify a response. An `unknown` caused by buffered or dequeued-but-not-yet-parsed input can resolve when the normal parser classifies it; attribution ambiguity is sticky for the lifetime of that connection. Both fields use fixed values only: diagnostics do not log raw frames, payloads, event data, tokens, or response identifiers. The first-terminal snapshot remains frozen; dropping the owner aborts the pump and does not guarantee a diagnostic line.
+
 These ages do not identify TCP FIN/RST, which side or component closed the connection, the cause, or exact wire timing. Task scheduling and buffering can affect when activity is observed, and a peer Close commonly has an RX age near zero. The added fields contain no payload, nonce, credentials, identifiers, or absolute timestamps.
 
 ## Main And Utility Startup

@@ -349,7 +349,7 @@ async fn assert_early_pong_activity_ages(
     assert_eq!(capture.calls, 1);
     assert_eq!(
         String::from_utf8(capture.bytes.clone()).unwrap(),
-        "[threadline] websocket closed source=peer_close_frame code=- reason=- error=- protocol_kind=- connection_age_ms=18000 last_rx_age_ms=0 last_rx_kind=close last_tx_age_ms=6000 last_ping_age_ms=6000 last_pong_age_ms=8000 io_kind=- raw_os_error=-\n"
+        "[threadline] websocket closed source=peer_close_frame code=- reason=- error=- protocol_kind=- connection_age_ms=18000 last_rx_age_ms=0 last_rx_kind=close last_tx_age_ms=6000 last_ping_age_ms=6000 last_pong_age_ms=8000 response_state=unknown io_kind=- raw_os_error=-\n"
     );
 }
 

@@ -80,7 +80,7 @@ async fn pending_internal_tool_followup_send_liveness_timeout_invalidates_retain
         .expect("invalidation should reclaim retained capacity");
 }
 
-async fn armed_followup_lease(
+pub(super) async fn armed_followup_lease(
     registry: &Arc<RetainedSessionRegistry>,
     upstream: Arc<LiveUpstreamWebSocket>,
 ) -> crate::registry::RetainedSessionLease {
@@ -102,7 +102,7 @@ async fn armed_followup_lease(
     active_lease
 }
 
-fn followup_stream_state(
+pub(super) fn followup_stream_state(
     upstream: Arc<LiveUpstreamWebSocket>,
     active_lease: crate::registry::RetainedSessionLease,
 ) -> ResponseStreamState {

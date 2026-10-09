@@ -171,7 +171,7 @@ pub(crate) async fn send_response_create(
     let payload = build_response_create_payload(Value::Object(request_payload.clone()))?;
     let text = serde_json::to_string(&payload).expect("serialize response.create payload");
     upstream
-        .send_text(text)
+        .send_response_create_text(text)
         .await
         .map_err(map_upstream_websocket_error)
 }
@@ -203,7 +203,7 @@ pub(crate) async fn send_followup_tool_outputs(
     )?;
     let text = serde_json::to_string(&payload).expect("serialize followup response.create payload");
     upstream
-        .send_text(text)
+        .send_response_create_text(text)
         .await
         .map_err(map_upstream_websocket_error)
 }

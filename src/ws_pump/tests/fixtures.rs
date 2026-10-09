@@ -45,6 +45,167 @@ pub(super) fn empty_close_metadata() -> UpstreamCloseMetadata {
     }
 }
 
+pub(super) fn terminal_observation_cases() -> [UpstreamTerminalState; 3] {
+    [
+        UpstreamTerminalState::Closed(empty_close_metadata()),
+        UpstreamTerminalState::LivenessTimeout(UpstreamLivenessTimeout {
+            cause: UpstreamLivenessTimeoutCause::WriteDeadline,
+            timeout: Duration::from_secs(1),
+            elapsed: Duration::from_secs(1),
+            outbound_kind: Some(UpstreamOutboundKind::Text),
+        }),
+        UpstreamTerminalState::InboundBufferOverflow(InboundBufferOverflow {
+            cause: InboundBufferOverflowCause::MessageCount,
+            queued_messages: 1,
+            queued_bytes: 1,
+            incoming_bytes: 1,
+            max_messages: 1,
+            max_bytes: 1,
+        }),
+    ]
+}
+
+pub(super) fn assert_terminal_observation_freezes(
+    observer_first: bool,
+    next: UpstreamTerminalState,
+) {
+    let diagnostics = CloseDiagnostics::new(true);
+    let terminal = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    diagnostics.capture().terminal_state = Some(Arc::clone(&terminal));
+    diagnostics.capture().response = diagnostics.response.record.clone();
+    if observer_first {
+        diagnostics.response.record_unclassified(&terminal);
+        diagnostics
+            .response
+            .record_response_event(&terminal, ResponseEvent::Completed);
+    }
+    assert!(commit_terminal(
+        &terminal,
+        next.clone(),
+        &diagnostics,
+        Some(UpstreamCloseSource::ReadError),
+        None
+    ));
+    let frozen = diagnostics.response.response_state();
+    let bytes = diagnostics.capture().bytes.clone();
+    diagnostics.response.record_unclassified(&terminal);
+    diagnostics
+        .response
+        .record_response_event(&terminal, ResponseEvent::Started);
+    diagnostics.response.record_create_pending(&terminal);
+    diagnostics.response.record_create_sent(&terminal);
+    diagnostics.response.record_generic_send(&terminal);
+    assert!(!commit_terminal(
+        &terminal,
+        UpstreamTerminalState::Closed(empty_close_metadata()),
+        &diagnostics,
+        Some(UpstreamCloseSource::PumpExitFallback),
+        None
+    ));
+    assert_eq!(*terminal.lock().unwrap(), next);
+    assert_eq!(diagnostics.response.response_state(), frozen);
+    assert_eq!(
+        frozen,
+        Some(if observer_first {
+            ResponseState::Completed
+        } else {
+            ResponseState::NotStarted
+        })
+    );
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    assert_eq!(capture.bytes, bytes);
+    let output = String::from_utf8(bytes).unwrap();
+    assert!(output.contains(if observer_first {
+        " response_state=completed"
+    } else {
+        " response_state=not_started"
+    }));
+}
+
+pub(super) fn assert_redacted_peer_close(hostile: &str, reason: &'static str) {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    let mut diagnostics = CloseDiagnostics::new(true);
+    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    for frame in [
+        Message::Text(hostile.to_string()),
+        Message::Binary(hostile.as_bytes().to_vec()),
+        Message::Ping(hostile.as_bytes().to_vec()),
+        Message::Pong(hostile.as_bytes().to_vec()),
+    ] {
+        assert!(handle_test_inbound(
+            Some(Ok(frame)),
+            &state,
+            &mut diagnostics
+        ));
+        assert!(diagnostics.last_rx.is_some());
+        assert_eq!(diagnostics.capture().calls, 0);
+    }
+    assert!(!handle_test_inbound(
+        Some(Ok(Message::Close(Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: reason.into()
+        })))),
+        &state,
+        &mut diagnostics
+    ));
+    assert_eq!(
+        *state.lock().unwrap(),
+        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+            code: Some(1001),
+            reason: Some(reason.to_string()),
+            error: None,
+        })
+    );
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    let output = String::from_utf8(capture.bytes.clone()).unwrap();
+    let expected = match reason {
+        "" | "going away" | "normal closure" => reason,
+        _ => "[redacted]",
+    };
+    assert!(output.contains(&format!("reason={expected} error=- protocol_kind=-")));
+    assert!(!output.contains("secret"));
+    assert!(!output.contains(['\r', '\x1b']));
+    assert_eq!(output.lines().count(), 1);
+}
+
+pub(super) fn assert_redacted_write_buffer_error(frame: Message) {
+    let diagnostics = CloseDiagnostics::new(true);
+    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    let error = TungsteniteError::WriteBufferFull(frame);
+    let original = error.to_string();
+    record_error(
+        &state,
+        &error,
+        UpstreamCloseSource::WriteError,
+        &diagnostics,
+    );
+    record_close(
+        &state,
+        empty_close_metadata(),
+        UpstreamCloseSource::PumpExitFallback,
+        &diagnostics,
+    );
+    assert_eq!(
+        *state.lock().unwrap(),
+        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+            code: None,
+            reason: None,
+            error: Some(original)
+        })
+    );
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    let output = String::from_utf8(capture.bytes.clone()).unwrap();
+    assert!(output.contains("source=write_error"));
+    assert!(output.contains("error=write_buffer_full protocol_kind=-"));
+    assert!(!output.contains("secret"));
+    assert!(!output.contains(['\r', '\x1b']));
+    assert_eq!(output.lines().count(), 1);
+}
+
 pub(super) async fn drive_test_write_operation<S>(
     writer: &mut SplitSink<WebSocketStream<S>, Message>,
     reader: &mut SplitStream<WebSocketStream<S>>,
@@ -303,3 +464,24 @@ impl Visit for EventFields {
 
 pub(super) type TestPeerWriter = SplitSink<WebSocketStream<DuplexStream>, Message>;
 pub(super) type TestPeerReader = SplitStream<WebSocketStream<DuplexStream>>;
+
+pub(crate) type DiagnosticGatedPump = (
+    LiveUpstreamWebSocket,
+    WebSocketStream<DuplexStream>,
+    Arc<Notify>,
+    Arc<AtomicBool>,
+    Arc<AtomicWaker>,
+);
+
+impl LiveUpstreamWebSocket {
+    pub(crate) async fn test_diagnostic_write_gate() -> DiagnosticGatedPump {
+        let (client, server, started, open, waker) = write_gate_pair(8192, None).await;
+        let pump = Self::from_stream_with_close_diagnostics(
+            client,
+            UpstreamWatchdogPolicy::DEFAULT,
+            UpstreamInboundLimits::DEFAULT,
+            true,
+        );
+        (pump, server, started, open, waker)
+    }
+}

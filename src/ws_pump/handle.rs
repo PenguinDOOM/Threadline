@@ -108,6 +108,8 @@ impl LiveUpstreamWebSocket {
         let (inbound_tx, inbound_rx) = mpsc::channel(limits.max_messages());
         let byte_budget = Arc::new(Semaphore::new(limits.max_bytes()));
         let terminal_state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        #[cfg(not(test))]
+        let response_diagnostics = diagnostics.response.clone();
         #[cfg(test)]
         let test_diagnostics = diagnostics.clone();
 
@@ -129,6 +131,8 @@ impl LiveUpstreamWebSocket {
             outbound_tx,
             inbound_rx: Mutex::new(inbound_rx),
             terminal_state,
+            #[cfg(not(test))]
+            response_diagnostics,
             task,
             #[cfg(test)]
             after_text_send: None,
@@ -213,7 +217,35 @@ impl LiveUpstreamWebSocket {
     }
 
     pub async fn send_text(&self, text: impl Into<String>) -> Result<(), UpstreamWebSocketError> {
+        self.send_command(text, TextSendKind::Generic).await
+    }
+
+    pub(crate) async fn send_response_create_text(
+        &self,
+        text: String,
+    ) -> Result<(), UpstreamWebSocketError> {
+        self.send_command(text, TextSendKind::ResponseCreate).await
+    }
+
+    async fn send_command(
+        &self,
+        text: impl Into<String>,
+        kind: TextSendKind,
+    ) -> Result<(), UpstreamWebSocketError> {
         self.terminal_error()?;
+        let text = text.into();
+        let command = match kind {
+            TextSendKind::ResponseCreate => {
+                self.response_diagnostics()
+                    .record_create_pending(&self.terminal_state);
+                OutboundCommand::ResponseCreate(text)
+            }
+            TextSendKind::Generic => {
+                self.response_diagnostics()
+                    .record_generic_send(&self.terminal_state);
+                OutboundCommand::Text(text)
+            }
+        };
         #[cfg(test)]
         if let Some(pending_text_send) = &self.pending_text_send {
             pending_text_send
@@ -236,22 +268,50 @@ impl LiveUpstreamWebSocket {
                         .unwrap_or(UpstreamWebSocketError::OutboundQueueClosed));
                 }
             };
-            permit.send(OutboundCommand::Text(text.into()));
+            permit.send(command);
             return self.terminal_error();
         }
-        self.outbound_tx
-            .send(OutboundCommand::Text(text.into()))
-            .await
-            .map_err(|_| {
-                self.terminal_error()
-                    .err()
-                    .unwrap_or(UpstreamWebSocketError::OutboundQueueClosed)
-            })?;
+        self.outbound_tx.send(command).await.map_err(|_| {
+            self.terminal_error()
+                .err()
+                .unwrap_or(UpstreamWebSocketError::OutboundQueueClosed)
+        })?;
         #[cfg(test)]
         if let Some(after_text_send) = &self.after_text_send {
             after_text_send();
         }
         self.terminal_error()
+    }
+
+    pub(crate) fn observe_response_event(&self, event: ResponseEvent) {
+        self.response_diagnostics()
+            .record_response_event(&self.terminal_state, event);
+    }
+
+    fn response_diagnostics(&self) -> &ResponseDiagnostics {
+        #[cfg(test)]
+        {
+            &self.diagnostics.response
+        }
+        #[cfg(not(test))]
+        {
+            &self.response_diagnostics
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_response_state(&self) -> Option<ResponseState> {
+        let _terminal = self.terminal_state.lock().unwrap();
+        self.response_diagnostics().response_state()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_output(&self) -> (usize, String) {
+        let capture = self.diagnostics.capture();
+        (
+            capture.calls,
+            String::from_utf8(capture.bytes.clone()).unwrap(),
+        )
     }
 
     pub async fn recv_text(&self) -> Result<Option<String>, UpstreamWebSocketError> {

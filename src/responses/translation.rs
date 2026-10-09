@@ -447,5 +447,6 @@ mod tests {
 
     mod diagnostics;
     mod lifecycle;
+    mod response_state;
     mod sanitization;
 }

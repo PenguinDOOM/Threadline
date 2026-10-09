@@ -36,6 +36,7 @@ pub(super) async fn parse_upstream_event(
     state.upstream_event_seen = true;
 
     if next.trim() == "[DONE]" {
+        observe_response_event(state, crate::ws_pump::ResponseEvent::Unknown);
         let failed_payload = terminal_failed_payload(
             None,
             None,
@@ -59,6 +60,7 @@ pub(super) async fn parse_upstream_event(
     let parsed = match serde_json::from_str::<Value>(next) {
         Ok(parsed) => parsed,
         Err(_) => {
+            observe_response_event(state, crate::ws_pump::ResponseEvent::Unknown);
             state.upstream = None;
             state.lease.mark_upstream_terminal().await;
             state.done = true;
@@ -68,7 +70,35 @@ pub(super) async fn parse_upstream_event(
         }
     };
 
+    observe_response_event(state, classify_response_event(&parsed));
     Ok(parsed)
+}
+
+fn observe_response_event(state: &ResponseStreamState, event: crate::ws_pump::ResponseEvent) {
+    if let Some(upstream) = &state.upstream {
+        upstream.observe_response_event(event);
+    }
+}
+
+fn classify_response_event(parsed: &Value) -> crate::ws_pump::ResponseEvent {
+    use crate::ws_pump::ResponseEvent;
+    match parsed.get("type").and_then(Value::as_str) {
+        Some("response.created" | "response.in_progress") => ResponseEvent::Started,
+        Some("response.completed") => ResponseEvent::Completed,
+        Some("response.failed") => ResponseEvent::Failed,
+        Some("response.incomplete") => ResponseEvent::Incomplete,
+        Some(
+            "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done",
+        ) => ResponseEvent::Progress,
+        _ => ResponseEvent::Unknown,
+    }
 }
 
 pub(super) async fn process_upstream_event(

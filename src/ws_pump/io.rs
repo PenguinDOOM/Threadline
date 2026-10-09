@@ -154,11 +154,23 @@ fn handle_inbound_frame(
         Message::Frame(_) => None,
     };
     match message {
-        Message::Text(text) => enqueue_inbound_payload(text.to_string(), pump_state),
-        Message::Binary(bytes) => enqueue_inbound_payload(
-            String::from_utf8_lossy(bytes.as_ref()).into_owned(),
-            pump_state,
-        ),
+        Message::Text(text) => {
+            pump_state
+                .diagnostics
+                .response
+                .record_unclassified(pump_state.terminal_state);
+            enqueue_inbound_payload(text.to_string(), pump_state)
+        }
+        Message::Binary(bytes) => {
+            pump_state
+                .diagnostics
+                .response
+                .record_unclassified(pump_state.terminal_state);
+            enqueue_inbound_payload(
+                String::from_utf8_lossy(bytes.as_ref()).into_owned(),
+                pump_state,
+            )
+        }
         Message::Ping(payload) => {
             *control_flush_needed = true;
             debug!(payload_len = payload.len(), "ws_pump_ping_received");
