@@ -143,7 +143,9 @@ pub(super) async fn execute_internal_tool_event(
             .await;
     }
     let call_id = call.call_id().to_owned();
+    state.observe_consumer_phase(ConsumerPhase::ExecutingInternalTool);
     let execution_result = state.services.execute_internal_tool(call).await;
+    state.observe_consumer_phase(ConsumerPhase::ProcessingEvent);
     if let Some(error) = start_work_error(state) {
         return reject_internal_tool_transport(
             state,
@@ -305,10 +307,12 @@ pub(super) async fn send_internal_tool_followup(
         )));
     };
     state.followup_send_started = true;
+    upstream.observe_consumer_phase(ConsumerPhase::SendingFollowup);
     let followup_result =
         send_followup_tool_outputs(upstream, &state.base_request, response_id, followup_input)
             .await;
     state.followup_send_started = false;
+    upstream.observe_consumer_phase(ConsumerPhase::ProcessingEvent);
     if let Err(error) = followup_result {
         let error = queue_transport_error(upstream.terminal_state()).unwrap_or(error);
         if matches!(error, ThreadlineError::UpstreamWebSocketPolicyViolation) {

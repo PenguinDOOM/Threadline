@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use super::ResponseStreamState;
 use crate::errors::ThreadlineError;
-use crate::ws_pump::{UpstreamTerminalState, UpstreamWebSocketError};
+use crate::ws_pump::{ConsumerPhase, UpstreamTerminalState, UpstreamWebSocketError};
 
 const PRELUDE_MAX_EVENTS: usize = 8;
 const PRELUDE_MAX_BYTES: usize = 64 * 1024;
@@ -15,6 +15,7 @@ pub(in crate::responses) async fn preflight(
         return Ok(());
     }
 
+    state.observe_consumer_phase(ConsumerPhase::Preflight);
     let mut bytes = 0;
     loop {
         let text = match receive_preflight(state).await {

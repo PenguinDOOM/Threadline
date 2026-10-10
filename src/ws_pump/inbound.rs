@@ -27,14 +27,20 @@ pub(super) fn try_enqueue_inbound(
         .expect("validated inbound byte limit always fits the semaphore permit count");
     let byte_permit = byte_budget.clone().try_acquire_many_owned(permit_count);
     let cause = match byte_permit {
-        Ok(byte_permit) => match sender.try_send(InboundEnvelope {
-            payload: payload.into_boxed_str(),
-            _byte_permit: byte_permit,
-        }) {
-            Ok(()) => return true,
-            Err(mpsc::error::TrySendError::Full(_)) => InboundBufferOverflowCause::MessageCount,
-            Err(mpsc::error::TrySendError::Closed(_)) => return false,
-        },
+        Ok(byte_permit) => {
+            match diagnostics
+                .response
+                .record_enqueue(terminal_state, incoming_bytes, || {
+                    sender.try_send(InboundEnvelope {
+                        payload: payload.into_boxed_str(),
+                        _byte_permit: byte_permit,
+                    })
+                }) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Full(_)) => InboundBufferOverflowCause::MessageCount,
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
         Err(_) => InboundBufferOverflowCause::PayloadBytes,
     };
     record_inbound_overflow(

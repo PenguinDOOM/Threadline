@@ -36,6 +36,7 @@ pub(super) async fn parse_upstream_event(
     state: &mut ResponseStreamState,
     next: &str,
 ) -> Result<Value, StreamProgress> {
+    state.observe_consumer_phase(ConsumerPhase::ProcessingEvent);
     state.upstream_event_seen = true;
 
     if next.trim() == "[DONE]" {

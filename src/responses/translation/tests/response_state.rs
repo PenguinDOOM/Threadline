@@ -43,6 +43,124 @@ async fn send_server_event(server: &mut WebSocketStream<DuplexStream>, event: se
     server.send(Message::Text(event.to_string())).await.unwrap();
 }
 
+async fn diagnostic_read_barrier(server: &mut WebSocketStream<DuplexStream>) {
+    server.send(Message::Ping(vec![7])).await.unwrap();
+    assert_eq!(
+        server.next().await.unwrap().unwrap(),
+        Message::Pong(vec![7])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_paused_sse_preserves_burst_fifo_and_terminal_snapshot() {
+    let (upstream, state, mut server) = diagnostic_stream_pair().await;
+    let mut body = Box::pin(response_stream(state));
+    assert!(futures_util::poll!(body.next()).is_pending());
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    assert!(futures_util::poll!(body.next()).is_pending());
+    assert!(upstream.diagnostic_activity().contains(
+        "consumer_phase=awaiting_upstream last_consumer_poll_age_ms=0 last_dequeue_age_ms=-"
+    ));
+    send_server_event(&mut server, json!({"type":"response.created"})).await;
+    assert!(
+        String::from_utf8(body.next().await.unwrap().unwrap().to_vec())
+            .unwrap()
+            .contains("response.created")
+    );
+    let events = [
+        json!({"type":"response.output_text.delta","delta":"first"}),
+        json!({"type":"response.output_text.delta","delta":"second"}),
+        json!({"type":"response.completed","response":{"id":"resp_burst","output":[]}}),
+    ];
+    let bytes: usize = events.iter().map(|event| event.to_string().len()).sum();
+    for event in events {
+        send_server_event(&mut server, event).await;
+    }
+    diagnostic_read_barrier(&mut server).await;
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    diagnostic_read_barrier(&mut server).await;
+    assert!(upstream.diagnostic_activity().contains("consumer_phase=awaiting_downstream_poll last_consumer_poll_age_ms=250 last_dequeue_age_ms=250 internal_tool_age_ms=- queue_messages_high_water=3"));
+    server.send(Message::Close(None)).await.unwrap();
+    while !upstream.is_closed() {
+        tokio::task::yield_now().await;
+    }
+    let before = upstream.diagnostic_output();
+    assert_eq!(before.0, 1);
+    assert!(before.1.contains(&format!(
+        "queue_bytes_high_water={bytes} last_data_age_ms=250"
+    )));
+    assert!(before.1.contains("response_state=unknown last_classified_response_state=in_progress unclassified_data_count=3 response_ambiguous=false"));
+    let mut chunks = Vec::new();
+    while let Some(chunk) = body.next().await {
+        chunks.push(String::from_utf8(chunk.unwrap().to_vec()).unwrap());
+    }
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|chunk| chunk.starts_with("event: response.output_text.delta"))
+            .count(),
+        2
+    );
+    assert!(chunks[0].contains("first"));
+    assert!(chunks[1].contains("second"));
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|chunk| chunk.starts_with("event: response.completed"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|chunk| chunk.contains("data: [DONE]"))
+            .count(),
+        1
+    );
+    assert!(!chunks.iter().any(|chunk| chunk.contains("response.failed")));
+    assert_eq!(upstream.diagnostic_output(), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_retained_idle_data_is_distinct_from_control_traffic() {
+    let (upstream, mut state, mut server) = diagnostic_stream_pair().await;
+    send_server_event(&mut server, json!({"type":"response.completed","response":{"id":"resp_idle","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}})).await;
+    let completed = parse_received_event(&mut state).await;
+    progression::process_upstream_event(
+        &mut state,
+        completed,
+        &mut super::super::InternalToolLedger::default(),
+    )
+    .await;
+    assert!(
+        upstream
+            .diagnostic_activity()
+            .contains("consumer_phase=retained_idle")
+    );
+    state.lease.release();
+    server
+        .send(Message::Text("idle-data".into()))
+        .await
+        .unwrap();
+    diagnostic_read_barrier(&mut server).await;
+    tokio::time::advance(std::time::Duration::from_millis(400)).await;
+    diagnostic_read_barrier(&mut server).await;
+    server.send(Message::Close(None)).await.unwrap();
+    while !upstream.is_closed() {
+        tokio::task::yield_now().await;
+    }
+    let before = upstream.diagnostic_output();
+    assert!(before.1.contains("last_rx_age_ms=0 last_rx_kind=close"));
+    assert!(before.1.contains("last_data_age_ms=400"));
+    assert!(before.1.contains("response_state=unknown last_classified_response_state=completed unclassified_data_count=1 response_ambiguous=false consumer_phase=retained_idle"));
+    assert_eq!(
+        upstream.recv_text().await.unwrap().as_deref(),
+        Some("idle-data")
+    );
+    upstream.observe_response_event(crate::ws_pump::ResponseEvent::Unknown);
+    assert_eq!(upstream.diagnostic_output(), before);
+}
+
 fn assert_diagnostic_state(upstream: &LiveUpstreamWebSocket, expected: ResponseState) {
     assert_eq!(upstream.diagnostic_response_state(), Some(expected));
 }
@@ -293,7 +411,7 @@ impl crate::responses::InternalToolExecutor for AwaitedDiagnosticTool {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn close_diagnostics_internal_tool_await_and_followup_track_each_response() {
     let (pump, mut server, started, open, waker) =
         LiveUpstreamWebSocket::test_diagnostic_write_gate().await;
@@ -430,7 +548,9 @@ async fn assert_diagnostic_tool_await(
     started: &tokio::sync::Notify,
     release: &tokio::sync::Notify,
 ) {
-    send_server_event(server, json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_test","name":"threadline_echo","arguments":json!({"value":"done"}).to_string()}})).await;
+    let tool_event = json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_test","name":"threadline_echo","arguments":json!({"value":"done"}).to_string()}});
+    let tool_bytes = tool_event.to_string().len();
+    send_server_event(server, tool_event).await;
     let tool = parse_received_event(state).await;
     let mut ledger = super::super::InternalToolLedger::default();
     let execution = progression::process_upstream_event(state, tool, &mut ledger);
@@ -438,12 +558,10 @@ async fn assert_diagnostic_tool_await(
     assert!(futures_util::poll!(&mut execution).is_pending());
     started.notified().await;
     assert_diagnostic_state(upstream, ResponseState::InProgress);
-    server
-        .send(Message::Text(
-            json!({"type":"response.completed","response":{"id":"resp_middle"}}).to_string(),
-        ))
-        .await
-        .unwrap();
+    let completed =
+        json!({"type":"response.completed","response":{"id":"resp_middle"}}).to_string();
+    let completed_bytes = completed.len();
+    server.send(Message::Text(completed)).await.unwrap();
     server
         .send(Message::Ping(b"completion-barrier".to_vec()))
         .await
@@ -456,8 +574,21 @@ async fn assert_diagnostic_tool_await(
         upstream.diagnostic_response_state(),
         Some(ResponseState::Unknown)
     );
+    tokio::time::advance(std::time::Duration::from_millis(250)).await;
+    let activity = upstream.diagnostic_activity();
+    assert!(activity.contains("consumer_phase=executing_internal_tool"));
+    assert!(activity.contains("last_dequeue_age_ms=250 internal_tool_age_ms=250"));
+    assert!(activity.contains(&format!(
+        "queue_messages_high_water=1 queue_bytes_high_water={}",
+        completed_bytes.max(tool_bytes)
+    )));
     release.notify_one();
     execution.await;
+    assert!(
+        upstream
+            .diagnostic_activity()
+            .contains("internal_tool_age_ms=-")
+    );
 }
 
 #[tokio::test]

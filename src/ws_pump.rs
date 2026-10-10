@@ -13,10 +13,10 @@ use driver::*;
 mod handle;
 
 mod diagnostics;
-pub(crate) use diagnostics::ResponseEvent;
 #[cfg(test)]
 pub(crate) use diagnostics::ResponseState;
 use diagnostics::*;
+pub(crate) use diagnostics::{ConsumerPhase, ResponseEvent};
 
 use std::sync::{Arc, Mutex as StdMutex};
 

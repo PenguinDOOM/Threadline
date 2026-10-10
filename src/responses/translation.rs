@@ -30,7 +30,7 @@ use crate::tools::{
     InternalToolCall, PendingInternalToolOutput, build_followup_input,
     event_contains_internal_tool_name, is_internal_tool_name,
 };
-use crate::ws_pump::LiveUpstreamWebSocket;
+use crate::ws_pump::{ConsumerPhase, LiveUpstreamWebSocket};
 
 use super::downstream::{
     safe_scalar_field, sse_done_chunk, sse_error_chunk, sse_json_chunk,
@@ -382,18 +382,44 @@ pub(super) struct ResponseStreamState {
 
 pub(super) use recovery::queue_transport_error;
 
+impl ResponseStreamState {
+    fn observe_consumer_phase(&self, phase: ConsumerPhase) {
+        if let Some(upstream) = &self.upstream {
+            upstream.observe_consumer_phase(phase);
+        }
+    }
+}
+
 pub(super) fn response_stream(
     state: ResponseStreamState,
 ) -> impl futures_util::Stream<Item = Result<Bytes, Infallible>> {
+    state.observe_consumer_phase(ConsumerPhase::AwaitingDownstreamPoll);
     stream::unfold(
         (state, InternalToolLedger::default()),
-        |(mut state, mut ledger)| async move {
-            loop {
-                match next_stream_progress(&mut state, &mut ledger).await {
-                    StreamProgress::Continue => continue,
-                    StreamProgress::Yield(chunk) => return Some((Ok(chunk), (state, ledger))),
-                    StreamProgress::Finished => return None,
+        |(mut state, mut ledger)| {
+            let upstream = state.upstream.as_ref().map(Arc::downgrade);
+            let progress = async move {
+                state.observe_consumer_phase(ConsumerPhase::ProcessingEvent);
+                loop {
+                    match next_stream_progress(&mut state, &mut ledger).await {
+                        StreamProgress::Continue => continue,
+                        StreamProgress::Yield(chunk) => {
+                            state.observe_consumer_phase(ConsumerPhase::AwaitingDownstreamPoll);
+                            return Some((Ok(chunk), (state, ledger)));
+                        }
+                        StreamProgress::Finished => return None,
+                    }
                 }
+            };
+            async move {
+                tokio::pin!(progress);
+                futures_util::future::poll_fn(|context| {
+                    if let Some(upstream) = upstream.as_ref().and_then(std::sync::Weak::upgrade) {
+                        upstream.observe_consumer_poll();
+                    }
+                    std::future::Future::poll(progress.as_mut(), context)
+                })
+                .await
             }
         },
     )

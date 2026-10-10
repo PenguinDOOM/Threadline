@@ -234,7 +234,7 @@ async fn close_diagnostics_activity_ages_share_reset_terminal_time() {
     assert_eq!(capture.calls, 1);
     assert_eq!(
         String::from_utf8(capture.bytes.clone()).unwrap(),
-        "[threadline] websocket closed source=read_error code=- reason=- error=protocol protocol_kind=reset_without_closing_handshake connection_age_ms=1000 last_rx_age_ms=600 last_rx_kind=binary last_tx_age_ms=800 last_ping_age_ms=800 last_pong_age_ms=750 response_state=unknown io_kind=- raw_os_error=-\n"
+        "[threadline] websocket closed source=read_error code=- reason=- error=protocol protocol_kind=reset_without_closing_handshake connection_age_ms=1000 last_rx_age_ms=600 last_rx_kind=binary last_tx_age_ms=800 last_ping_age_ms=800 last_pong_age_ms=750 response_state=unknown last_classified_response_state=not_started unclassified_data_count=2 response_ambiguous=false consumer_phase=not_started last_consumer_poll_age_ms=- last_dequeue_age_ms=- internal_tool_age_ms=- queue_messages_high_water=2 queue_bytes_high_water=24 last_data_age_ms=600 io_kind=- raw_os_error=-\n"
     );
 }
 
@@ -532,7 +532,7 @@ fn assert_read_error_diagnostic_case(
     assert_eq!(
         output,
         format!(
-            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- response_state=not_started io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
+            "[threadline] websocket closed source=read_error code=- reason=- error={expected_error} protocol_kind={expected_protocol_kind} connection_age_ms={age} last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- response_state=not_started last_classified_response_state=not_started unclassified_data_count=0 response_ambiguous=false consumer_phase=not_started last_consumer_poll_age_ms=- last_dequeue_age_ms=- internal_tool_age_ms=- queue_messages_high_water=0 queue_bytes_high_water=0 last_data_age_ms=- io_kind={expected_io_kind} raw_os_error={expected_raw_os_error}\n"
         )
     );
     assert!(output.ends_with('\n'));
@@ -607,7 +607,7 @@ async fn close_diagnostics_constructor_peer_close_is_independent_of_off_subscrib
         if enabled {
             assert_eq!(
                 String::from_utf8(capture.bytes.clone()).unwrap(),
-                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=0 last_rx_kind=close last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- response_state=not_started io_kind=- raw_os_error=-\n"
+                "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=0 last_rx_kind=close last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=- response_state=not_started last_classified_response_state=not_started unclassified_data_count=0 response_ambiguous=false consumer_phase=not_started last_consumer_poll_age_ms=- last_dequeue_age_ms=- internal_tool_age_ms=- queue_messages_high_water=0 queue_bytes_high_water=0 last_data_age_ms=- io_kind=- raw_os_error=-\n"
             );
         } else {
             assert!(capture.bytes.is_empty());

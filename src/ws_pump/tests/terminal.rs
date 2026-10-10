@@ -321,7 +321,7 @@ async fn close_diagnostics_first_commit_freezes_lifetime_and_unlocks_before_writ
     assert_eq!(capture.bytes, first_bytes);
     assert_eq!(
         String::from_utf8(capture.bytes.clone()).unwrap(),
-        "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=984 last_rx_kind=pong last_tx_age_ms=1034 last_ping_age_ms=1034 last_pong_age_ms=984 response_state=not_started io_kind=- raw_os_error=-\n"
+        "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=984 last_rx_kind=pong last_tx_age_ms=1034 last_ping_age_ms=1034 last_pong_age_ms=984 response_state=not_started last_classified_response_state=not_started unclassified_data_count=0 response_ambiguous=false consumer_phase=not_started last_consumer_poll_age_ms=- last_dequeue_age_ms=- internal_tool_age_ms=- queue_messages_high_water=0 queue_bytes_high_water=0 last_data_age_ms=- io_kind=- raw_os_error=-\n"
     );
 }
 

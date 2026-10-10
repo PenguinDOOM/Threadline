@@ -1,6 +1,179 @@
 use super::*;
 
 #[tokio::test(start_paused = true)]
+async fn close_diagnostics_active_lifetime_does_not_abort_before_normal_peer_close() {
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    let (client, mut server) = raw_pair(1024).await;
+    let pump = LiveUpstreamWebSocket::from_stream_with_policy_and_limits(
+        client,
+        Duration::from_secs(7200),
+        UpstreamWatchdogPolicy::DEFAULT,
+        UpstreamInboundLimits::DEFAULT,
+        CloseDiagnostics::new(true),
+    );
+    pump.send_response_create_text("{}".into()).await.unwrap();
+    assert!(matches!(
+        server.next().await.unwrap().unwrap(),
+        Message::Text(_)
+    ));
+    server.send(Message::Text("started".into())).await.unwrap();
+    assert_eq!(pump.recv_text().await.unwrap().as_deref(), Some("started"));
+    pump.observe_response_event(ResponseEvent::Started);
+    pump.observe_consumer_phase(ConsumerPhase::AwaitingUpstream);
+    advance(Duration::from_secs(3600)).await;
+    assert_eq!(pump.terminal_state(), UpstreamTerminalState::Open);
+    assert_eq!(
+        pump.diagnostic_response_state(),
+        Some(ResponseState::InProgress)
+    );
+    server
+        .send(Message::Text("unclassified".into()))
+        .await
+        .unwrap();
+    server.send(Message::Ping(vec![8])).await.unwrap();
+    assert_eq!(
+        server.next().await.unwrap().unwrap(),
+        Message::Pong(vec![8])
+    );
+    server
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        })))
+        .await
+        .unwrap();
+    while !pump.is_closed() {
+        tokio::task::yield_now().await;
+    }
+    let before = pump.diagnostic_output();
+    assert_eq!(before.0, 1);
+    assert!(before.1.contains("source=peer_close_frame code=1000"));
+    assert!(before.1.contains("connection_age_ms=3600000"));
+    assert!(before.1.contains("response_state=unknown last_classified_response_state=in_progress unclassified_data_count=1 response_ambiguous=false consumer_phase=awaiting_upstream"));
+    assert_eq!(
+        pump.recv_text().await.unwrap().as_deref(),
+        Some("unclassified")
+    );
+    pump.observe_response_event(ResponseEvent::Completed);
+    assert_eq!(pump.diagnostic_output(), before);
+}
+
+#[tokio::test]
+async fn close_diagnostics_disabled_skips_consumer_and_queue_observation() {
+    let mut diagnostics = CloseDiagnostics::new(false);
+    let terminal = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    diagnostics.response.record_consumer_poll(&terminal);
+    diagnostics
+        .response
+        .record_consumer_phase(&terminal, ConsumerPhase::ExecutingInternalTool);
+    assert_eq!(diagnostics.record_rx_kind(RxKind::Text), None);
+    let (sender, mut receiver) = mpsc::channel(2);
+    let budget = Arc::new(Semaphore::new(8));
+    let limits = UpstreamInboundLimits::new(2, 8).unwrap();
+    for text in ["one", "two"] {
+        assert!(try_enqueue_inbound(
+            &sender,
+            &budget,
+            limits,
+            text.into(),
+            &terminal,
+            &diagnostics
+        ));
+    }
+    assert!(!try_enqueue_inbound(
+        &sender,
+        &budget,
+        limits,
+        "x".into(),
+        &terminal,
+        &diagnostics
+    ));
+    for text in ["one", "two"] {
+        let envelope = receiver.try_recv().unwrap();
+        diagnostics
+            .response
+            .record_dequeue(&terminal, envelope.payload.len());
+        assert_eq!(&*envelope.payload, text);
+    }
+    assert_eq!(budget.available_permits(), 8);
+    assert!(diagnostics.response.record.is_none());
+    assert!(diagnostics.started_at.is_none());
+    assert!(diagnostics.last_data_at.is_none());
+    assert_eq!(diagnostics.capture().calls, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_consumer_ages_and_high_water_freeze_after_terminal() {
+    let (client, _server) = raw_pair(1024).await;
+    let mut pump = LiveUpstreamWebSocket::from_stream_with_close_diagnostics(
+        client,
+        UpstreamWatchdogPolicy::DEFAULT,
+        UpstreamInboundLimits::DEFAULT,
+        true,
+    );
+    pump.observe_consumer_poll();
+    pump.observe_consumer_phase(ConsumerPhase::ExecutingInternalTool);
+    let (sender, receiver) = mpsc::channel(2);
+    let budget = Arc::new(Semaphore::new(16));
+    let limits = UpstreamInboundLimits::new(2, 16).unwrap();
+    for text in ["one", "second"] {
+        assert!(try_enqueue_inbound(
+            &sender,
+            &budget,
+            limits,
+            text.into(),
+            &pump.terminal_state,
+            &pump.diagnostics
+        ));
+    }
+    pump.inbound_rx = Mutex::new(receiver);
+    advance(Duration::from_millis(200)).await;
+    assert_eq!(pump.recv_text().await.unwrap().as_deref(), Some("one"));
+    advance(Duration::from_millis(300)).await;
+    record_close(
+        &pump.terminal_state,
+        empty_close_metadata(),
+        UpstreamCloseSource::StreamEof,
+        &pump.diagnostics,
+    );
+    let before = pump.diagnostic_output();
+    assert!(before.1.contains("consumer_phase=executing_internal_tool last_consumer_poll_age_ms=500 last_dequeue_age_ms=300 internal_tool_age_ms=500 queue_messages_high_water=2 queue_bytes_high_water=9 last_data_age_ms=-"));
+    assert_eq!(pump.recv_text().await.unwrap().as_deref(), Some("second"));
+    pump.observe_consumer_poll();
+    pump.observe_consumer_phase(ConsumerPhase::RetainedIdle);
+    assert_eq!(pump.diagnostic_output(), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_unknown_retains_classification_evidence_after_terminal() {
+    let diagnostics = CloseDiagnostics::new(true);
+    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    diagnostics.response.record_unclassified(&state);
+    diagnostics
+        .response
+        .record_response_event(&state, ResponseEvent::Completed);
+    diagnostics.response.record_unclassified(&state);
+    record_close(
+        &state,
+        empty_close_metadata(),
+        UpstreamCloseSource::StreamEof,
+        &diagnostics,
+    );
+    let before = diagnostics.capture().bytes.clone();
+    let output = String::from_utf8(before.clone()).unwrap();
+    assert!(output.contains("response_state=unknown last_classified_response_state=completed unclassified_data_count=1 response_ambiguous=false"));
+    diagnostics
+        .response
+        .record_response_event(&state, ResponseEvent::Unknown);
+    diagnostics.response.record_generic_send(&state);
+    assert_eq!(diagnostics.capture().bytes, before);
+    assert_eq!(
+        diagnostics.response.response_state(),
+        Some(ResponseState::Unknown)
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn close_diagnostics_overflow_records_the_successfully_received_message() {
     let mut diagnostics = CloseDiagnostics::new(true);
     let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));

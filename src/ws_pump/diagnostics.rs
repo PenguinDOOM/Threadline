@@ -37,11 +37,48 @@ pub(crate) enum ResponseEvent {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConsumerPhase {
+    NotStarted,
+    Preflight,
+    ProcessingEvent,
+    AwaitingUpstream,
+    AwaitingDownstreamPoll,
+    ExecutingInternalTool,
+    AwaitingIntermediateCompletion,
+    SendingFollowup,
+    RetainedIdle,
+}
+
+impl ConsumerPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Preflight => "preflight",
+            Self::ProcessingEvent => "processing_event",
+            Self::AwaitingUpstream => "awaiting_upstream",
+            Self::AwaitingDownstreamPoll => "awaiting_downstream_poll",
+            Self::ExecutingInternalTool => "executing_internal_tool",
+            Self::AwaitingIntermediateCompletion => "awaiting_intermediate_completion",
+            Self::SendingFollowup => "sending_followup",
+            Self::RetainedIdle => "retained_idle",
+        }
+    }
+}
+
 pub(super) struct ResponseObservation {
     state: ResponseState,
     unclassified: usize,
     write_pending: bool,
     ambiguous: bool,
+    consumer_phase: ConsumerPhase,
+    last_consumer_poll_at: Option<Instant>,
+    last_dequeue_at: Option<Instant>,
+    internal_tool_started_at: Option<Instant>,
+    queued_messages: usize,
+    queued_bytes: usize,
+    queue_messages_high_water: usize,
+    queue_bytes_high_water: usize,
 }
 
 #[derive(Clone)]
@@ -110,6 +147,7 @@ pub(super) struct CloseDiagnostics {
     pub(super) last_tx_at: Option<Instant>,
     pub(super) last_ping_at: Option<Instant>,
     pub(super) last_pong_at: Option<Instant>,
+    pub(super) last_data_at: Option<Instant>,
     pub(super) response: ResponseDiagnostics,
     #[cfg(test)]
     pub(super) capture: Option<Arc<StdMutex<TestDiagnosticWriter>>>,
@@ -123,6 +161,7 @@ impl CloseDiagnostics {
         last_tx_at: None,
         last_ping_at: None,
         last_pong_at: None,
+        last_data_at: None,
         response: ResponseDiagnostics { record: None },
         #[cfg(test)]
         capture: None,
@@ -135,6 +174,7 @@ impl CloseDiagnostics {
             last_tx_at: None,
             last_ping_at: None,
             last_pong_at: None,
+            last_data_at: None,
             response: ResponseDiagnostics {
                 record: enabled.then(|| {
                     Arc::new(StdMutex::new(ResponseObservation {
@@ -142,6 +182,14 @@ impl CloseDiagnostics {
                         unclassified: 0,
                         write_pending: false,
                         ambiguous: false,
+                        consumer_phase: ConsumerPhase::NotStarted,
+                        last_consumer_poll_at: None,
+                        last_dequeue_at: None,
+                        internal_tool_started_at: None,
+                        queued_messages: 0,
+                        queued_bytes: 0,
+                        queue_messages_high_water: 0,
+                        queue_bytes_high_water: 0,
                     }))
                 }),
             },
@@ -154,11 +202,71 @@ impl CloseDiagnostics {
         self.started_at?;
         let received_at = Instant::now();
         self.last_rx = Some((received_at, kind));
+        if matches!(kind, RxKind::Text | RxKind::Binary) {
+            self.last_data_at = Some(received_at);
+        }
         Some(received_at)
     }
 }
 
 impl ResponseDiagnostics {
+    pub(super) fn record_consumer_phase(
+        &self,
+        terminal: &Arc<StdMutex<UpstreamTerminalState>>,
+        phase: ConsumerPhase,
+    ) {
+        self.observe(terminal, |response| {
+            if response.consumer_phase != phase {
+                response.internal_tool_started_at =
+                    (phase == ConsumerPhase::ExecutingInternalTool).then(Instant::now);
+                response.consumer_phase = phase;
+            }
+        });
+    }
+
+    pub(super) fn record_consumer_poll(&self, terminal: &Arc<StdMutex<UpstreamTerminalState>>) {
+        self.observe(terminal, |response| {
+            response.last_consumer_poll_at = Some(Instant::now());
+        });
+    }
+
+    pub(super) fn record_enqueue(
+        &self,
+        terminal: &Arc<StdMutex<UpstreamTerminalState>>,
+        bytes: usize,
+        enqueue: impl FnOnce() -> Result<(), mpsc::error::TrySendError<InboundEnvelope>>,
+    ) -> Result<(), mpsc::error::TrySendError<InboundEnvelope>> {
+        let Some(record) = &self.record else {
+            return enqueue();
+        };
+        let terminal = terminal.lock().expect("terminal state lock");
+        if !matches!(*terminal, UpstreamTerminalState::Open) {
+            return enqueue();
+        }
+        let mut response = record.lock().expect("response observation lock");
+        enqueue()?;
+        response.queued_messages += 1;
+        response.queued_bytes += bytes;
+        response.queue_messages_high_water = response
+            .queue_messages_high_water
+            .max(response.queued_messages);
+        response.queue_bytes_high_water =
+            response.queue_bytes_high_water.max(response.queued_bytes);
+        Ok(())
+    }
+
+    pub(super) fn record_dequeue(
+        &self,
+        terminal: &Arc<StdMutex<UpstreamTerminalState>>,
+        bytes: usize,
+    ) {
+        self.observe(terminal, |response| {
+            response.queued_messages = response.queued_messages.saturating_sub(1);
+            response.queued_bytes = response.queued_bytes.saturating_sub(bytes);
+            response.last_dequeue_at = Some(Instant::now());
+        });
+    }
+
     fn observe(
         &self,
         terminal: &Arc<StdMutex<UpstreamTerminalState>>,
@@ -244,6 +352,7 @@ impl ResponseDiagnostics {
         });
     }
 
+    #[cfg(test)]
     pub(super) fn response_state(&self) -> Option<ResponseState> {
         self.record.as_ref().map(|response| {
             response
@@ -281,7 +390,18 @@ impl CloseDiagnostics {
         }
     }
 
-    fn snapshot(&self, started_at: Instant, terminal_at: Instant) -> TerminalActivitySnapshot {
+    pub(super) fn snapshot(
+        &self,
+        started_at: Instant,
+        terminal_at: Instant,
+    ) -> TerminalActivitySnapshot {
+        let response = self
+            .response
+            .record
+            .as_ref()
+            .expect("enabled response observation")
+            .lock()
+            .expect("response observation lock");
         let age = |observed_at: Instant| {
             terminal_at
                 .saturating_duration_since(observed_at)
@@ -294,10 +414,17 @@ impl CloseDiagnostics {
             last_tx_age_ms: self.last_tx_at.map(age),
             last_ping_age_ms: self.last_ping_at.map(age),
             last_pong_age_ms: self.last_pong_at.map(age),
-            response_state: self
-                .response
-                .response_state()
-                .expect("enabled response observation"),
+            response_state: response.snapshot(),
+            last_classified_response_state: response.state,
+            unclassified_data_count: response.unclassified,
+            response_ambiguous: response.ambiguous,
+            consumer_phase: response.consumer_phase,
+            last_consumer_poll_age_ms: response.last_consumer_poll_at.map(age),
+            last_dequeue_age_ms: response.last_dequeue_at.map(age),
+            internal_tool_age_ms: response.internal_tool_started_at.map(age),
+            queue_messages_high_water: response.queue_messages_high_water,
+            queue_bytes_high_water: response.queue_bytes_high_water,
+            last_data_age_ms: self.last_data_at.map(age),
         }
     }
 
@@ -327,6 +454,16 @@ pub(super) struct TerminalActivitySnapshot {
     last_ping_age_ms: Option<u128>,
     last_pong_age_ms: Option<u128>,
     response_state: ResponseState,
+    last_classified_response_state: ResponseState,
+    unclassified_data_count: usize,
+    response_ambiguous: bool,
+    consumer_phase: ConsumerPhase,
+    last_consumer_poll_age_ms: Option<u128>,
+    last_dequeue_age_ms: Option<u128>,
+    internal_tool_age_ms: Option<u128>,
+    queue_messages_high_water: usize,
+    queue_bytes_high_water: usize,
+    last_data_age_ms: Option<u128>,
 }
 
 impl std::fmt::Display for TerminalActivitySnapshot {
@@ -342,6 +479,31 @@ impl std::fmt::Display for TerminalActivitySnapshot {
             " response_state={}",
             self.response_state.as_str()
         )?;
+        write!(
+            formatter,
+            " last_classified_response_state={} unclassified_data_count={} response_ambiguous={}",
+            self.last_classified_response_state.as_str(),
+            self.unclassified_data_count,
+            self.response_ambiguous
+        )?;
+        write!(
+            formatter,
+            " consumer_phase={}",
+            self.consumer_phase.as_str()
+        )?;
+        write_optional_field(
+            formatter,
+            "last_consumer_poll_age_ms",
+            self.last_consumer_poll_age_ms,
+        )?;
+        write_optional_field(formatter, "last_dequeue_age_ms", self.last_dequeue_age_ms)?;
+        write_optional_field(formatter, "internal_tool_age_ms", self.internal_tool_age_ms)?;
+        write!(
+            formatter,
+            " queue_messages_high_water={} queue_bytes_high_water={}",
+            self.queue_messages_high_water, self.queue_bytes_high_water
+        )?;
+        write_optional_field(formatter, "last_data_age_ms", self.last_data_age_ms)?;
         Ok(())
     }
 }

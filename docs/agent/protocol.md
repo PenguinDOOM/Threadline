@@ -189,6 +189,30 @@ Final completion has an explicit acceptance boundary. After internal-tool handli
 
 For an idle retained session whose completion was already accepted, a later overflow is retained as a non-recoverable reason. The next acquire detaches the live handle lazily, preserves the aliases long enough to return the dedicated overflow error, and never reconnects or reuses that session. Repeated acquires return the same error until normal eviction removes the entry, after which `previous_response_not_found` is expected. A bounded queue may remain allocated until that lazy cleanup; immediate deallocation is not part of the contract. Normal idle close without overflow keeps its existing recoverable marker metadata.
 
+### Opt-in terminal activity diagnostics
+
+When `--ws-close-diagnostics` is enabled, the terminal close diagnostic includes fixed, connection-local activity metadata. These fields describe observations made by Threadline; they do not determine protocol, retention, or error behavior. The diagnostic is frozen when the terminal state is first recorded. Later queue drains, parser activity, or consumer observations do not change or re-emit that terminal snapshot.
+
+The response-state fields are:
+
+* `response_state` is the existing conservative snapshot. It is `unknown` while unclassified data remains or observation is ambiguous; otherwise it reports the classified state.
+* `last_classified_response_state` is the most recently classified state before that conservative `unknown` mask. It may describe a local `response.create` write state or a parsed upstream response event; it is not proof that upstream execution began or completed.
+* `unclassified_data_count` counts received Text/Binary data messages not yet classified by the normal response-event parser. Dequeueing a message, handling control traffic, or reaching terminal state does not decrement it.
+* `response_ambiguous` is a sticky indication that response-state attribution became ambiguous, for example after a generic send or overlapping/inconsistent create observations.
+
+`consumer_phase` reports the most recently observed local consumer phase: `not_started`, `preflight`, `processing_event`, `awaiting_upstream`, `awaiting_downstream_poll`, `executing_internal_tool`, `awaiting_intermediate_completion`, `sending_followup`, or `retained_idle`. `awaiting_downstream_poll` records that the response stream consumer has not polled again; it does not establish why polling stopped or prove user or network activity. A synchronous blocking internal-tool executor can also delay observation of later transport state.
+
+The activity ages are elapsed milliseconds at the frozen terminal observation time. An unobserved timestamp is printed as `-`:
+
+* `last_consumer_poll_age_ms` measures time since the response-stream consumer last polled for progress.
+* `last_dequeue_age_ms` measures time since the latest upstream data message was removed from the inbound queue by a consumer.
+* `internal_tool_age_ms` measures time since the current internal-tool execution phase began; it is `-` unless that phase was observed.
+* `last_data_age_ms` measures time since the latest received Text or Binary message. Ping, Pong, and Close control frames do not update it.
+
+`queue_messages_high_water` and `queue_bytes_high_water` are the maximum simultaneously queued data-message count and converted payload bytes observed between accepted enqueue and consumer dequeue. They are not cumulative traffic counters. The byte value follows the inbound queue accounting described above, including Binary lossy conversion.
+
+These fields are emitted only by the opt-in terminal diagnostic and are not substitutes for control state. They do not establish root cause, user intent, or successful upstream execution. The existing per-connection inbound limits remain 256 messages and 16 MiB by default; these diagnostics do not change those limits or bound RSS/global memory. No diagnostic rotation, active-session migration, queue optimization, or always-on timer is implied. They do not claim to fix production overflow or guarantee 60 minutes of uninterrupted operation.
+
 ## Idle sessions
 
 A retained session may be idle from the downstream perspective while still needing active upstream IO.

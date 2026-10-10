@@ -212,6 +212,7 @@ pub(super) fn accept_final_completion(
     } else {
         state.lease.disarm_active_turn();
     }
+    state.observe_consumer_phase(ConsumerPhase::RetainedIdle);
     state.upstream = None;
     state.queued_final_completed = Some(QueuedCompletedEvent {
         payload: sanitized_completed,

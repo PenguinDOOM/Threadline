@@ -6,6 +6,11 @@ pub(super) async fn receive_upstream_text(
     if let Some(text) = state.pending_upstream_events.pop_front() {
         return Ok(Some(text));
     }
+    state.observe_consumer_phase(if state.pending_internal_outputs.is_empty() {
+        ConsumerPhase::AwaitingUpstream
+    } else {
+        ConsumerPhase::AwaitingIntermediateCompletion
+    });
     let upstream_result = match state.upstream.as_ref() {
         Some(upstream) => upstream.recv_text().await,
         None => Ok(None),

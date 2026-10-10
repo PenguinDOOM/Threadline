@@ -288,6 +288,16 @@ impl LiveUpstreamWebSocket {
             .record_response_event(&self.terminal_state, event);
     }
 
+    pub(crate) fn observe_consumer_phase(&self, phase: ConsumerPhase) {
+        self.response_diagnostics()
+            .record_consumer_phase(&self.terminal_state, phase);
+    }
+
+    pub(crate) fn observe_consumer_poll(&self) {
+        self.response_diagnostics()
+            .record_consumer_poll(&self.terminal_state);
+    }
+
     fn response_diagnostics(&self) -> &ResponseDiagnostics {
         #[cfg(test)]
         {
@@ -314,9 +324,21 @@ impl LiveUpstreamWebSocket {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn diagnostic_activity(&self) -> String {
+        let _terminal = self.terminal_state.lock().unwrap();
+        self.diagnostics
+            .snapshot(self.diagnostics.started_at.unwrap(), Instant::now())
+            .to_string()
+    }
+
     pub async fn recv_text(&self) -> Result<Option<String>, UpstreamWebSocketError> {
         self.terminal_error()?;
         let envelope = self.inbound_rx.lock().await.recv().await;
+        if let Some(envelope) = &envelope {
+            self.response_diagnostics()
+                .record_dequeue(&self.terminal_state, envelope.payload.len());
+        }
         self.terminal_error()?;
         Ok(envelope.map(|envelope| envelope.payload.into_string()))
     }
