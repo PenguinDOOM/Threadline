@@ -157,6 +157,32 @@ struct PausedInternalToolExecutor {
     executions: Arc<AtomicUsize>,
 }
 
+#[derive(Default)]
+struct CountingInternalToolExecutor {
+    executions: AtomicUsize,
+    mismatched_output: bool,
+}
+
+impl InternalToolExecutor for CountingInternalToolExecutor {
+    fn execute(
+        &self,
+        call: InternalToolCall,
+    ) -> BoxFuture<'static, Result<PendingInternalToolOutput, ThreadlineError>> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        let mismatched = self.mismatched_output;
+        Box::pin(async move {
+            if mismatched {
+                Ok(PendingInternalToolOutput::new(
+                    "different-output-id",
+                    "unused",
+                ))
+            } else {
+                call.execute()
+            }
+        })
+    }
+}
+
 impl PausedInternalToolExecutor {
     fn new() -> Self {
         Self {
@@ -3738,6 +3764,165 @@ async fn overflow_while_internal_tool_execution_is_pending_skips_followup_and_la
     assert!(body_text.contains("upstream_inbound_buffer_overflow"));
     assert!(!body_text.contains("response-intermediate"));
     assert!(!body_text.contains("threadline_echo"));
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+fn internal_echo_event(call_id: &str) -> Value {
+    json!({"type":"response.output_item.done","item":{
+        "type":"function_call","call_id":call_id,"name":"threadline_echo",
+        "arguments":json!({"value":"tool output"}).to_string()
+    }})
+}
+
+async fn assert_internal_failure_body(body: Body, code: &str) {
+    let bytes = timeout(Duration::from_secs(1), to_bytes(body, usize::MAX))
+        .await
+        .expect("terminal deadline")
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("UTF8");
+    assert_eq!(text.matches("event: response.failed").count(), 1);
+    assert_eq!(text.matches("data: [DONE]").count(), 1);
+    assert_eq!(text.matches("event: response.completed").count(), 0);
+    assert!(text.contains(code));
+    assert!(!text.contains("threadline_echo"));
+    assert!(!text.contains("function_call_output"));
+}
+
+#[tokio::test]
+async fn close_before_internal_tool_dispatch_skips_executor_and_followup() {
+    assert_close_tool_boundary(false).await;
+}
+
+#[tokio::test]
+async fn close_during_internal_tool_await_keeps_started_effect_and_skips_later_work() {
+    assert_close_tool_boundary(true).await;
+}
+
+async fn assert_close_tool_boundary(await_started: bool) {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let executor = Arc::new(PausedInternalToolExecutor::new());
+    let app = build_test_router_with_internal_tool_executor(
+        Arc::new(connector.clone()),
+        Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+    );
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"tool"})).await;
+    let _ = server.recv_client_message().await.expect("initial create");
+    let upstream = connector.recorded_websockets().await[0]
+        .upgrade()
+        .expect("pump");
+    server
+        .send_text(&internal_echo_event("first-call").to_string())
+        .await;
+    let mut task = None;
+    let mut body = Some(response.into_body());
+    if await_started {
+        let owned_body = body.take().expect("owned body");
+        task = Some(tokio::spawn(async move {
+            assert_internal_failure_body(owned_body, "upstream_websocket_closed").await
+        }));
+        timeout(Duration::from_secs(1), executor.started.notified())
+            .await
+            .expect("executor started");
+        server
+            .send_text(&internal_echo_event("later-call").to_string())
+            .await;
+        server
+            .send_text(r#"{"type":"response.completed","response":{"id":"intermediate"}}"#)
+            .await;
+    }
+    server.send_close(1000, "private close reason").await;
+    timeout(Duration::from_secs(1), async {
+        while !upstream.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal before consumer resumes");
+    assert_eq!(
+        upstream.terminal_state().close_cause(),
+        Some(threadline::ws_pump::UpstreamCloseCause::Normal)
+    );
+    if let Some(task) = task {
+        executor.resume.notify_one();
+        task.await.expect("body task");
+    } else {
+        assert_internal_failure_body(body.expect("unpolled body"), "upstream_websocket_closed")
+            .await;
+    }
+    assert_eq!(
+        executor.executions.load(Ordering::SeqCst),
+        usize::from(await_started)
+    );
+    assert!(server.take_pending_client_messages().await.is_empty());
+    assert_eq!(connector.sessions.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_internal_call_after_followup_is_rejected_before_second_dispatch() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let executor = Arc::new(CountingInternalToolExecutor::default());
+    let app = build_test_router_with_internal_tool_executor(
+        Arc::new(connector.clone()),
+        Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+    );
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"tool"})).await;
+    let _ = server.recv_client_message().await.expect("initial create");
+    let task = tokio::spawn(assert_internal_failure_body(
+        response.into_body(),
+        "internal_tool_failed",
+    ));
+    server
+        .send_text(&internal_echo_event("repeated-call").to_string())
+        .await;
+    server
+        .send_text(r#"{"type":"response.completed","response":{"id":"intermediate"}}"#)
+        .await;
+    let followup = timeout(Duration::from_secs(1), server.recv_client_message())
+        .await
+        .expect("followup deadline")
+        .expect("followup");
+    let followup: Value = serde_json::from_str(&message_text(followup)).expect("JSON");
+    assert_eq!(followup["input"][0]["type"], "function_call_output");
+    assert_eq!(followup["previous_response_id"], "intermediate");
+    server
+        .send_text(&internal_echo_event("repeated-call").to_string())
+        .await;
+    task.await.expect("body task");
+    assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    assert!(server.take_pending_client_messages().await.is_empty());
+    assert_eq!(connector.sessions.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn mismatched_internal_output_id_fails_without_followup() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let executor = Arc::new(CountingInternalToolExecutor {
+        mismatched_output: true,
+        ..Default::default()
+    });
+    let app = build_test_router_with_internal_tool_executor(
+        Arc::new(connector),
+        Arc::clone(&executor) as Arc<dyn InternalToolExecutor>,
+    );
+    let response = post_responses(app, json!({"model":"gpt-6-sol","input":"tool"})).await;
+    let _ = server.recv_client_message().await.expect("initial create");
+    server
+        .send_text(&internal_echo_event("input-call").to_string())
+        .await;
+    assert_internal_failure_body(response.into_body(), "internal_tool_failed").await;
     assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
     assert!(server.take_pending_client_messages().await.is_empty());
 }

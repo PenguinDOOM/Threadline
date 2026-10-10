@@ -40,7 +40,17 @@ async fn retained_continuation_liveness_timeout_before_preflight_returns_previou
     let app = build_test_router(Arc::new(connector.clone()));
 
     seed_marker_without_reader(app.clone(), &retained_server, "response-1").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let upstream = connector.recorded_websockets().await[0]
+        .upgrade()
+        .expect("retained pump");
+    timeout(Duration::from_secs(1), async {
+        while !upstream.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pre-send timeout observed");
+    drop(upstream);
 
     let response = post_responses(
         app.clone(),
@@ -63,7 +73,7 @@ async fn retained_continuation_liveness_timeout_before_preflight_returns_previou
 }
 
 #[tokio::test]
-async fn retained_continuation_liveness_timeout_before_first_upstream_event_returns_http_not_found_and_invalidates_aliases()
+async fn retained_continuation_liveness_timeout_after_send_returns_http_timeout_and_invalidates_aliases()
  {
     let retained_server = Arc::new(ScriptedWebSocketServer::start_with_stoppable_reader().await);
     let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -106,12 +116,12 @@ async fn retained_continuation_liveness_timeout_before_first_upstream_event_retu
         .await
         .expect("timeout headers")
         .expect("response task");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
     let error: Value = serde_json::from_slice(&bytes).expect("JSON error");
-    assert_eq!(error["error"]["code"], "previous_response_not_found");
+    assert_eq!(error["error"]["code"], "upstream_liveness_timeout");
     assert!(retained_websocket.upgrade().is_none());
 
     assert_retry_marker_invalidated(app).await;

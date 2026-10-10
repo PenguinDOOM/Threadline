@@ -160,8 +160,44 @@ pub struct InboundBufferOverflow {
 pub enum UpstreamTerminalState {
     Open,
     Closed(UpstreamCloseMetadata),
+    TransportClosed {
+        cause: UpstreamCloseCause,
+        metadata: UpstreamCloseMetadata,
+    },
     InboundBufferOverflow(InboundBufferOverflow),
     LivenessTimeout(UpstreamLivenessTimeout),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamCloseCause {
+    Normal,
+    ServiceRestart,
+    PolicyViolation,
+    PeerClose,
+    ProtocolError,
+    Io,
+    Eof,
+    Other,
+}
+
+impl UpstreamTerminalState {
+    pub fn close_cause(&self) -> Option<UpstreamCloseCause> {
+        match self {
+            Self::Closed(metadata) => Some(match metadata.code {
+                Some(1000) => UpstreamCloseCause::Normal,
+                Some(1012) => UpstreamCloseCause::ServiceRestart,
+                Some(1008) => UpstreamCloseCause::PolicyViolation,
+                Some(_) => UpstreamCloseCause::PeerClose,
+                None => UpstreamCloseCause::Other,
+            }),
+            Self::TransportClosed { cause, .. } => Some(*cause),
+            _ => None,
+        }
+    }
+
+    pub fn is_policy_violation(&self) -> bool {
+        self.close_cause() == Some(UpstreamCloseCause::PolicyViolation)
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

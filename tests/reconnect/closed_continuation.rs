@@ -42,7 +42,7 @@ async fn lifetime_probe_fixture_smoke_without_external_client() {
                     assert_eq!(response.status(), StatusCode::OK);
                     let _ = to_bytes(response.into_body(), usize::MAX).await.expect("delayed body");
                 } else {
-                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
                     let full = json!([{"role":"user","content":PROBE_SEED}, {"role":"assistant","content":PROBE_SEED_ANSWER}, {"role":"user","content":PROBE_CONTINUE}]);
                     let retry = post_responses(fixture.app.clone(), json!({"model":PROBE_MODEL,"input":full})).await;
                     assert_eq!(retry.status(), StatusCode::OK);
@@ -61,7 +61,7 @@ async fn lifetime_probe_fixture_smoke_without_external_client() {
 #[tokio::test]
 async fn recovery_native_failure_and_hosted_tools_use_safe_header_decisions() {
     for (tools, output, conflicting, expected_status) in [
-        (None, json!([]), false, StatusCode::BAD_REQUEST),
+        (None, json!([]), false, StatusCode::BAD_GATEWAY),
         (
             Some(json!([{"type":"web_search"}])),
             json!([]),
@@ -126,7 +126,7 @@ async fn recovery_native_failure_and_hosted_tools_use_safe_header_decisions() {
 }
 
 #[tokio::test]
-async fn recovery_created_limit_is_http400_but_text_limit_is_terminal_http200() {
+async fn recovery_created_limit_is_http502_but_text_limit_is_terminal_http200() {
     for boundary_event in [
         None,
         Some(json!({"type":"response.output_text.delta","delta":"visible"})),
@@ -165,11 +165,11 @@ async fn recovery_created_limit_is_http400_but_text_limit_is_terminal_http200() 
             let body = String::from_utf8(body.to_vec()).expect("utf8");
             assert_boundary_limit_terminal(&body, expected_event);
         } else {
-            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
             let body: Value = serde_json::from_slice(&body).expect("json error");
             assert_eq!(
                 body,
-                json!({"error":{"code":"previous_response_not_found","message":"Threadline could not find the retained session for that previous_response_id.","type":"invalid_request_error"}})
+                json!({"error":{"code":"websocket_connection_limit_reached","message":"The upstream websocket connection limit was reached.","type":"server_error"}})
             );
         }
         assert_eq!(executor.executions.load(Ordering::SeqCst), 0);
@@ -207,7 +207,7 @@ fn assert_boundary_limit_terminal(body: &str, expected_event: &Value) {
 }
 
 #[tokio::test]
-async fn recovery_nested_exact_errors_but_not_message_heuristics_allow_http400() {
+async fn recovery_nested_exact_errors_fail_http502_without_message_heuristic_replay() {
     for (event, recovery) in [
         (
             json!({"type":"error","error":{"error":{"code":"websocket_connection_limit_reached"}}}),
@@ -244,7 +244,7 @@ async fn assert_nested_recovery_case(event: Value, recovery: bool) {
     assert_eq!(
         response.status(),
         if recovery {
-            StatusCode::BAD_REQUEST
+            StatusCode::BAD_GATEWAY
         } else {
             StatusCode::OK
         }
@@ -254,7 +254,24 @@ async fn assert_nested_recovery_case(event: Value, recovery: bool) {
         .expect("body");
     if recovery {
         let error: Value = serde_json::from_slice(&bytes).expect("JSON");
-        assert_eq!(error["error"]["code"], "previous_response_not_found");
+        let limit = event.pointer("/error/error/code").and_then(Value::as_str)
+            == Some("websocket_connection_limit_reached");
+        assert_eq!(
+            error["error"]["code"],
+            if limit {
+                "websocket_connection_limit_reached"
+            } else {
+                "upstream_error_event"
+            }
+        );
+        assert_eq!(
+            error["error"]["message"],
+            if limit {
+                "The upstream websocket connection limit was reached."
+            } else {
+                "The upstream websocket emitted an error event."
+            }
+        );
     } else {
         let text = String::from_utf8(bytes.to_vec()).expect("UTF8");
         assert_eq!(text.matches("event: response.failed").count(), 1);
@@ -317,6 +334,19 @@ async fn live_retained_continuation_close_before_first_send_returns_previous_res
 
     seed_marker(app.clone(), &retained_server, "response-1").await;
 
+    retained_server.abort_connection().await;
+    let upstream = connector.recorded_websockets().await[0]
+        .upgrade()
+        .expect("retained pump");
+    timeout(Duration::from_secs(1), async {
+        while !upstream.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pre-send close observed");
+    drop(upstream);
+
     let response_task = tokio::spawn({
         let app = app.clone();
         async move {
@@ -331,8 +361,6 @@ async fn live_retained_continuation_close_before_first_send_returns_previous_res
             .await
         }
     });
-
-    retained_server.abort_connection().await;
 
     let response = timeout(Duration::from_secs(1), response_task)
         .await
@@ -476,7 +504,7 @@ async fn assert_retained_close_without_resend(retained_server: &ScriptedWebSocke
 }
 
 #[tokio::test]
-async fn retained_continuation_close_after_send_before_first_upstream_event_returns_http_not_found_without_reconnect()
+async fn retained_continuation_close_after_send_before_first_upstream_event_returns_http502_without_reconnect()
  {
     let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
     let unexpected_reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -514,12 +542,12 @@ async fn retained_continuation_close_after_send_before_first_upstream_event_retu
         .await
         .expect("headers")
         .expect("response task");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
     let error: Value = serde_json::from_slice(&bytes).expect("JSON error");
-    assert_eq!(error["error"]["code"], "previous_response_not_found");
+    assert_eq!(error["error"]["code"], "upstream_websocket_closed");
 
     assert_no_reconnect(&unexpected_reconnect_server).await;
 

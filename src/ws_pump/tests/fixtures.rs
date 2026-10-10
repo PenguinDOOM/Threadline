@@ -190,11 +190,14 @@ pub(super) fn assert_redacted_write_buffer_error(frame: Message) {
     );
     assert_eq!(
         *state.lock().unwrap(),
-        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
-            code: None,
-            reason: None,
-            error: Some(original)
-        })
+        UpstreamTerminalState::TransportClosed {
+            cause: UpstreamCloseCause::Other,
+            metadata: UpstreamCloseMetadata {
+                code: None,
+                reason: None,
+                error: Some(original)
+            }
+        }
     );
     let capture = diagnostics.capture();
     assert_eq!(capture.calls, 1);

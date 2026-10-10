@@ -479,7 +479,7 @@ async fn recovery_prelude_capacity_handoff_is_fifo_and_exactly_once() {
 }
 
 #[tokio::test]
-async fn recovery_idle_queued_limit_uses_original_local_tool_eligibility() {
+async fn recovery_idle_connection_limit_respects_tool_eligibility() {
     for hosted in [false, true] {
         let server = Arc::new(ScriptedWebSocketServer::start().await);
         let connector =
@@ -509,18 +509,14 @@ async fn recovery_idle_queued_limit_uses_original_local_tool_eligibility() {
             if hosted {
                 StatusCode::OK
             } else {
-                StatusCode::BAD_REQUEST
+                StatusCode::BAD_GATEWAY
             }
         );
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
         let body = String::from_utf8(body.to_vec()).expect("utf8");
-        assert!(body.contains(if hosted {
-            "websocket_connection_limit_reached"
-        } else {
-            "previous_response_not_found"
-        }));
+        assert!(body.contains("websocket_connection_limit_reached"));
         assert_eq!(connector.recorded_sessions().await.len(), 1);
         assert!(connector.recorded_websockets().await[0].upgrade().is_none());
         assert!(

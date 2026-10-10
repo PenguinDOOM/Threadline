@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) async fn next_stream_progress(state: &mut ResponseStreamState) -> StreamProgress {
+pub(super) async fn next_stream_progress(
+    state: &mut ResponseStreamState,
+    ledger: &mut InternalToolLedger,
+) -> StreamProgress {
     if let Some(chunk) = reject_unaccepted_transport_terminal(state).await {
         return StreamProgress::Yield(chunk);
     }
@@ -26,7 +29,7 @@ pub(super) async fn next_stream_progress(state: &mut ResponseStreamState) -> Str
         Ok(parsed) => parsed,
         Err(progress) => return progress,
     };
-    process_upstream_event(state, parsed).await
+    process_upstream_event(state, parsed, ledger).await
 }
 
 pub(super) async fn parse_upstream_event(
@@ -104,6 +107,7 @@ fn classify_response_event(parsed: &Value) -> crate::ws_pump::ResponseEvent {
 pub(super) async fn process_upstream_event(
     state: &mut ResponseStreamState,
     parsed: Value,
+    ledger: &mut InternalToolLedger,
 ) -> StreamProgress {
     if !recovery::lifecycle_only(&parsed) {
         state.replay_prohibited = true;
@@ -111,7 +115,9 @@ pub(super) async fn process_upstream_event(
     let trace_metadata = UpstreamEventTraceMetadata::from_event(&parsed);
     trace_upstream_event(&trace_metadata);
     state.observable_output.last_upstream_event_type = Some(trace_metadata.event_type.clone());
-    if let Some(progress) = handle_internal_tool_event(state, &parsed, &trace_metadata).await {
+    if let Some(progress) =
+        handle_internal_tool_event(state, &parsed, &trace_metadata, ledger).await
+    {
         return progress;
     }
     let event_type = parsed

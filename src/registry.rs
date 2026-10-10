@@ -12,6 +12,7 @@ pub enum RegistryAcquireError {
     RetainedSessionConflict,
     RetainedSessionCapacityExceeded,
     UpstreamInboundBufferOverflow,
+    UpstreamWebSocketPolicyViolation,
 }
 
 pub struct RetainedSessionRegistry {
@@ -53,10 +54,16 @@ struct RegistryEntry {
     window_generation: u64,
     upstream: Option<Arc<LiveUpstreamWebSocket>>,
     in_use: bool,
-    recoverable: bool,
+    prohibition: Option<RegistryProhibition>,
     liveness_timed_out: bool,
     last_used: Instant,
     markers: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum RegistryProhibition {
+    InboundOverflow,
+    PolicyViolation,
 }
 
 impl RetainedSessionRegistry {
@@ -92,7 +99,7 @@ impl RetainedSessionRegistry {
                 window_generation: 0,
                 upstream: None,
                 in_use: true,
-                recoverable: true,
+                prohibition: None,
                 liveness_timed_out: false,
                 last_used: Instant::now(),
                 markers: Vec::new(),
@@ -176,26 +183,38 @@ impl RegistryEntry {
         if self.in_use {
             return Err(RegistryAcquireError::RetainedSessionConflict);
         }
-        if !self.recoverable {
-            return Err(RegistryAcquireError::UpstreamInboundBufferOverflow);
+        if let Some(prohibition) = self.prohibition {
+            return Err(match prohibition {
+                RegistryProhibition::InboundOverflow => {
+                    RegistryAcquireError::UpstreamInboundBufferOverflow
+                }
+                RegistryProhibition::PolicyViolation => {
+                    RegistryAcquireError::UpstreamWebSocketPolicyViolation
+                }
+            });
         }
         if self.liveness_timed_out {
             return Err(RegistryAcquireError::PreviousResponseNotFound);
         }
         if let Some(upstream) = self.upstream.as_ref() {
-            match upstream.terminal_state() {
+            let terminal = upstream.terminal_state();
+            if terminal.is_policy_violation() {
+                self.prohibition = Some(RegistryProhibition::PolicyViolation);
+                self.upstream = None;
+                return Err(RegistryAcquireError::UpstreamWebSocketPolicyViolation);
+            }
+            match terminal {
                 UpstreamTerminalState::InboundBufferOverflow(_) => {
                     self.upstream = None;
-                    self.recoverable = false;
+                    self.prohibition = Some(RegistryProhibition::InboundOverflow);
                     return Err(RegistryAcquireError::UpstreamInboundBufferOverflow);
                 }
-                UpstreamTerminalState::Closed(_) => {
+                UpstreamTerminalState::Closed(_)
+                | UpstreamTerminalState::TransportClosed { .. } => {
                     self.upstream = None;
-                    self.recoverable = true;
                 }
                 UpstreamTerminalState::LivenessTimeout(_) => {
                     self.upstream = None;
-                    self.recoverable = true;
                     self.liveness_timed_out = true;
                     return Err(RegistryAcquireError::PreviousResponseNotFound);
                 }
@@ -278,13 +297,33 @@ impl RetainedSessionLease {
         self.remove_markerless_entry();
     }
 
+    pub fn finalize_policy_violation_turn(&mut self) {
+        if self.removed || self.released {
+            return;
+        }
+        if let Ok(mut state) = self.registry.lock()
+            && let Some(entry) = state.entries.get_mut(&self.entry_id)
+        {
+            entry.prohibition = Some(RegistryProhibition::PolicyViolation);
+            entry.upstream = None;
+            entry.last_used = Instant::now();
+            let markerless = entry.markers.is_empty();
+            self.upstream = None;
+            self.armed = false;
+            if markerless {
+                remove_entry(&mut state, self.entry_id);
+                self.removed = true;
+                self.released = true;
+            }
+        }
+    }
+
     pub fn detach_upstream_recoverably(&mut self) {
         self.upstream = None;
         if let Ok(mut state) = self.registry.lock()
             && let Some(entry) = state.entries.get_mut(&self.entry_id)
         {
             entry.upstream = None;
-            entry.recoverable = true;
             self.session = entry.session.clone();
             entry.last_used = Instant::now();
         }
@@ -335,7 +374,7 @@ impl RetainedSessionLease {
         let mut state = self.registry.lock().expect("registry mutex poisoned");
         if let Some(entry) = state.entries.get_mut(&self.entry_id) {
             entry.upstream = upstream;
-            entry.recoverable = true;
+            entry.prohibition = None;
             entry.liveness_timed_out = false;
             entry.last_used = Instant::now();
         }

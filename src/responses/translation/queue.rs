@@ -9,6 +9,9 @@ pub(super) fn discard_unaccepted_queued_output(state: &mut ResponseStreamState) 
 pub(super) fn final_completion_acceptance_error(
     terminal_state: crate::ws_pump::UpstreamTerminalState,
 ) -> Option<ThreadlineError> {
+    if terminal_state.is_policy_violation() {
+        return Some(ThreadlineError::UpstreamWebSocketPolicyViolation);
+    }
     match terminal_state {
         crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
             Some(ThreadlineError::UpstreamInboundBufferOverflow)
@@ -17,7 +20,8 @@ pub(super) fn final_completion_acceptance_error(
             Some(ThreadlineError::UpstreamLivenessTimeout)
         }
         crate::ws_pump::UpstreamTerminalState::Open
-        | crate::ws_pump::UpstreamTerminalState::Closed(_) => None,
+        | crate::ws_pump::UpstreamTerminalState::Closed(_)
+        | crate::ws_pump::UpstreamTerminalState::TransportClosed { .. } => None,
     }
 }
 
@@ -30,13 +34,6 @@ pub(super) async fn reject_unaccepted_transport_terminal(
             .as_ref()
             .and_then(|upstream| final_completion_acceptance_error(upstream.terminal_state()))
     {
-        let stale_continuation = matches!(error, ThreadlineError::UpstreamLivenessTimeout)
-            && invalidate_stale_continuation_before_first_upstream_event(state);
-        let error = if stale_continuation {
-            ThreadlineError::PreviousResponseNotFound
-        } else {
-            error
-        };
         let failed_payload = terminal_failed_payload_from_error(None, None, &error);
         trace_downstream_sse_event(&downstream_sse_trace_metadata(
             &failed_payload,
@@ -45,12 +42,12 @@ pub(super) async fn reject_unaccepted_transport_terminal(
         ));
         discard_unaccepted_queued_output(state);
         state.upstream = None;
-        if !stale_continuation {
-            if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
-                state.lease.finalize_liveness_timeout_turn();
-            } else {
-                state.lease.mark_upstream_terminal().await;
-            }
+        if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
+            state.lease.finalize_liveness_timeout_turn();
+        } else if matches!(error, ThreadlineError::UpstreamWebSocketPolicyViolation) {
+            state.lease.finalize_policy_violation_turn();
+        } else {
+            state.lease.mark_upstream_terminal().await;
         }
         state.lease.release();
         state.final_done_pending = true;
@@ -186,6 +183,8 @@ pub(super) async fn reject_final_completion(
     state.upstream = None;
     if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
         state.lease.finalize_liveness_timeout_turn();
+    } else if matches!(error, ThreadlineError::UpstreamWebSocketPolicyViolation) {
+        state.lease.finalize_policy_violation_turn();
     } else {
         state.lease.mark_upstream_terminal().await;
     }

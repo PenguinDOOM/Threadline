@@ -103,6 +103,12 @@ impl ResponseStreamLease {
         }
     }
 
+    fn finalize_policy_violation_turn(&mut self) {
+        if let Self::Retained(lease) = self {
+            lease.finalize_policy_violation_turn();
+        }
+    }
+
     async fn mark_upstream_terminal(&mut self) {
         if let Self::Retained(lease) = self {
             lease.mark_upstream_terminal().await;
@@ -379,15 +385,18 @@ pub(super) use recovery::queue_transport_error;
 pub(super) fn response_stream(
     state: ResponseStreamState,
 ) -> impl futures_util::Stream<Item = Result<Bytes, Infallible>> {
-    stream::unfold(state, |mut state| async move {
-        loop {
-            match next_stream_progress(&mut state).await {
-                StreamProgress::Continue => continue,
-                StreamProgress::Yield(chunk) => return Some((Ok(chunk), state)),
-                StreamProgress::Finished => return None,
+    stream::unfold(
+        (state, InternalToolLedger::default()),
+        |(mut state, mut ledger)| async move {
+            loop {
+                match next_stream_progress(&mut state, &mut ledger).await {
+                    StreamProgress::Continue => continue,
+                    StreamProgress::Yield(chunk) => return Some((Ok(chunk), (state, ledger))),
+                    StreamProgress::Finished => return None,
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 enum StreamProgress {

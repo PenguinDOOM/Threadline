@@ -3,8 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
     ResponsesRouteState, continuation_terminal_error, normalize_persistent_reasoning_context,
-    responses_handler, rewrite_stale_continuation_first_send_error,
-    thread_id_from_prompt_cache_key,
+    responses_handler, thread_id_from_prompt_cache_key,
 };
 use crate::auth::{AuthSource, LoadedUpstreamAuth, RefreshBoundary};
 use crate::codex_ws::UpstreamSessionDescriptor;
@@ -56,14 +55,14 @@ impl UpstreamConnector for CountingConnector {
     }
 }
 
-async fn assert_previous_response_not_found(response: axum::response::Response) {
-    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+async fn assert_liveness_timeout(response: axum::response::Response) {
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("stale continuation error body");
     let payload: serde_json::Value =
         serde_json::from_slice(&body).expect("stale continuation error json");
-    assert_eq!(payload["error"]["code"], "previous_response_not_found");
+    assert_eq!(payload["error"]["code"], "upstream_liveness_timeout");
 }
 
 async fn assert_markers_removed(registry: &RetainedSessionRegistry, markers: &[&str]) {
@@ -226,28 +225,6 @@ fn persistent_reasoning_normalization_is_noop_when_disabled_for_main_or_utility_
     }
 }
 
-#[test]
-fn stale_continuation_first_send_rewrites_closed_upstream_to_previous_response_not_found() {
-    let rewritten =
-        rewrite_stale_continuation_first_send_error(ThreadlineError::UpstreamWebSocketClosed);
-
-    assert!(matches!(
-        rewritten,
-        ThreadlineError::PreviousResponseNotFound
-    ));
-}
-
-#[test]
-fn stale_continuation_first_send_rewrites_liveness_timeout_to_previous_response_not_found() {
-    let rewritten =
-        rewrite_stale_continuation_first_send_error(ThreadlineError::UpstreamLivenessTimeout);
-
-    assert!(matches!(
-        rewritten,
-        ThreadlineError::PreviousResponseNotFound
-    ));
-}
-
 #[tokio::test]
 async fn retained_continuation_first_send_liveness_timeout_invalidates_all_aliases_without_reconnect()
  {
@@ -280,7 +257,7 @@ async fn retained_continuation_first_send_liveness_timeout_invalidates_all_alias
         Ok(_) => panic!("first-send liveness timeout must not begin an SSE response"),
         Err(error) => error.into_response(),
     };
-    assert_previous_response_not_found(response).await;
+    assert_liveness_timeout(response).await;
     assert_eq!(send_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(connector_calls.load(Ordering::SeqCst), 0);
     assert!(matches!(
@@ -318,28 +295,6 @@ async fn retained_continuation_first_send_timeout_with_hosted_tools_is_not_repla
         UpstreamTerminalState::LivenessTimeout(_)
     ));
     assert_markers_removed(&registry, &["response-accepted", "response-alias"]).await;
-}
-
-#[test]
-fn stale_continuation_first_send_preserves_inbound_overflow_error() {
-    let preserved =
-        rewrite_stale_continuation_first_send_error(ThreadlineError::UpstreamInboundBufferOverflow);
-
-    assert!(matches!(
-        preserved,
-        ThreadlineError::UpstreamInboundBufferOverflow
-    ));
-}
-
-#[test]
-fn stale_continuation_first_send_preserves_non_transport_errors() {
-    let preserved =
-        rewrite_stale_continuation_first_send_error(ThreadlineError::InvalidResponsesRequest);
-
-    assert!(matches!(
-        preserved,
-        ThreadlineError::InvalidResponsesRequest
-    ));
 }
 
 #[test]

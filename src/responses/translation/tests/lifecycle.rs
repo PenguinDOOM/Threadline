@@ -1,5 +1,69 @@
 use super::*;
 
+struct DispatchCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+impl crate::responses::InternalToolExecutor for DispatchCounter {
+    fn execute(
+        &self,
+        call: crate::tools::InternalToolCall,
+    ) -> BoxFuture<'static, Result<crate::tools::PendingInternalToolOutput, ThreadlineError>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { call.execute() })
+    }
+}
+
+#[tokio::test]
+async fn internal_tool_ledger_capacity_rejects_before_dispatch_without_eviction() {
+    use crate::responses::translation::internal_tools::*;
+    for byte_limit in [false, true] {
+        let (upstream, _pending_send) =
+            LiveUpstreamWebSocket::test_followup_send_pending_for_liveness_timeout();
+        let upstream = Arc::new(upstream);
+        let registry = Arc::new(RetainedSessionRegistry::new(1));
+        let lease = armed_followup_lease(&registry, Arc::clone(&upstream)).await;
+        let mut state = followup_stream_state(upstream, lease);
+        let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state.services = ThreadlineServices::with_internal_tool_executor(
+            Arc::new(UnusedAuthProvider),
+            Arc::new(UnusedConnector),
+            Arc::new(DispatchCounter(Arc::clone(&dispatches))),
+        );
+        let mut ledger = InternalToolLedger::default();
+        let first = if byte_limit {
+            "a".repeat(1024 * 1024)
+        } else {
+            "reserved-0".to_string()
+        };
+        ledger.reserve(&first).expect("exact first reservation");
+        if !byte_limit {
+            for index in 1..4096 {
+                ledger
+                    .reserve(&format!("reserved-{index}"))
+                    .expect("within count limit");
+            }
+        }
+        let event = json!({"type":"response.output_item.done","item":{"type":"function_call","name":"threadline_echo","call_id":"rejected-call","arguments":"{}"}});
+        let call = crate::tools::InternalToolCall::from_event(&event)
+            .unwrap()
+            .unwrap();
+        let metadata = UpstreamEventTraceMetadata::from_event(&event);
+        let progress =
+            execute_internal_tool_event(&mut state, &event, call, &metadata, &mut ledger).await;
+        let crate::responses::translation::StreamProgress::Yield(chunk) = progress else {
+            panic!("capacity must fail");
+        };
+        let mut body = String::from_utf8(chunk.to_vec()).unwrap();
+        for chunk in response_stream(state).collect::<Vec<_>>().await {
+            body.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(body.matches("event: response.failed").count(), 1);
+        assert_eq!(body.matches("data: [DONE]").count(), 1);
+        assert!(body.contains("internal_tool_failed"));
+        assert!(ledger.reserve(&first).is_err());
+    }
+}
+
 #[test]
 fn final_completion_acceptance_snapshot_rejects_overflow_but_allows_closed() {
     let overflow = UpstreamTerminalState::InboundBufferOverflow(InboundBufferOverflow {

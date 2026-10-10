@@ -258,3 +258,114 @@ async fn wait_for_idle_liveness_timeout(websocket: &LiveUpstreamWebSocket) {
         UpstreamTerminalState::LivenessTimeout(_)
     ));
 }
+
+async fn policy_closed_lease(
+    markers: bool,
+    armed: bool,
+) -> (
+    RetainedSessionRegistry,
+    threadline::registry::RetainedSessionLease,
+    Arc<LiveUpstreamWebSocket>,
+) {
+    let server = ScriptedWebSocketServer::start().await;
+    let (stream, _) = connect_async(server.url()).await.expect("connect");
+    let upstream = Arc::new(LiveUpstreamWebSocket::from_stream(stream));
+    let registry = RetainedSessionRegistry::new(1);
+    let mut lease = registry.acquire_new().await.expect("lease");
+    lease.replace_upstream(Some(Arc::clone(&upstream))).await;
+    if markers {
+        lease.record_completed_marker("accepted-marker").await;
+        lease.record_completed_marker("accepted-alias").await;
+    }
+    if armed {
+        lease.arm_active_turn();
+    }
+    server.send_close(1008, "private policy detail").await;
+    timeout(Duration::from_secs(1), async {
+        while !upstream.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("policy close observed");
+    assert_eq!(
+        upstream.terminal_state().close_cause(),
+        Some(threadline::ws_pump::UpstreamCloseCause::PolicyViolation)
+    );
+    (registry, lease, upstream)
+}
+
+async fn assert_policy_alias_refusals(registry: &RetainedSessionRegistry) {
+    for marker in ["accepted-marker", "accepted-alias", "accepted-marker"] {
+        assert_eq!(
+            registry
+                .acquire_previous(marker)
+                .await
+                .expect_err("dedicated refusal"),
+            RegistryAcquireError::UpstreamWebSocketPolicyViolation
+        );
+    }
+    assert_eq!(
+        registry
+            .acquire_previous("intermediate-marker")
+            .await
+            .expect_err("no new marker"),
+        RegistryAcquireError::PreviousResponseNotFound
+    );
+}
+
+#[tokio::test]
+async fn idle_policy_close_lazy_detach_preserves_repeated_dedicated_refusals() {
+    let (registry, mut lease, upstream) = policy_closed_lease(true, false).await;
+    let weak = Arc::downgrade(&upstream);
+    lease.release();
+    assert_policy_alias_refusals(&registry).await;
+    drop(upstream);
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn observed_active_policy_finalization_retains_alias_refusals_without_new_marker() {
+    let (registry, mut lease, upstream) = policy_closed_lease(true, true).await;
+    assert_eq!(
+        registry
+            .acquire_previous("accepted-marker")
+            .await
+            .expect_err("still leased"),
+        RegistryAcquireError::RetainedSessionConflict
+    );
+    let weak = Arc::downgrade(&upstream);
+    lease.finalize_policy_violation_turn();
+    lease.release();
+    drop(lease);
+    assert_policy_alias_refusals(&registry).await;
+    drop(upstream);
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn unobserved_active_policy_close_drop_removes_all_aliases() {
+    let (registry, lease, upstream) = policy_closed_lease(true, true).await;
+    drop(lease);
+    for marker in ["accepted-marker", "accepted-alias"] {
+        assert_eq!(
+            registry
+                .acquire_previous(marker)
+                .await
+                .expect_err("abandonment"),
+            RegistryAcquireError::PreviousResponseNotFound
+        );
+    }
+    drop(upstream);
+    registry.acquire_new().await.expect("capacity reclaimed");
+}
+
+#[tokio::test]
+async fn observed_markerless_policy_finalization_reclaims_capacity() {
+    let (registry, mut lease, _upstream) = policy_closed_lease(false, true).await;
+    lease.finalize_policy_violation_turn();
+    registry
+        .acquire_new()
+        .await
+        .expect("markerless policy entry removed");
+}

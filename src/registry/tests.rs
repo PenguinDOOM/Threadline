@@ -140,7 +140,7 @@ async fn detached_nonrecoverable_entry_repeats_inbound_overflow_for_its_marker()
             .get_mut(&entry_id)
             .expect("entry should exist");
         entry.upstream = None;
-        entry.recoverable = false;
+        entry.prohibition = Some(super::RegistryProhibition::InboundOverflow);
     }
 
     for _ in 0..2 {
@@ -189,7 +189,7 @@ fn assert_timed_out_metadata(
     assert_eq!(&entry.session, session);
     assert_eq!(entry.window_generation, 7);
     assert!(entry.upstream.is_none());
-    assert!(entry.recoverable);
+    assert!(entry.prohibition.is_none());
     assert!(entry.liveness_timed_out);
     assert_eq!(entry.in_use, in_use);
 }

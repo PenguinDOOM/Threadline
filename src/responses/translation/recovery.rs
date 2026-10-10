@@ -7,20 +7,6 @@ use crate::ws_pump::{UpstreamTerminalState, UpstreamWebSocketError};
 const PRELUDE_MAX_EVENTS: usize = 8;
 const PRELUDE_MAX_BYTES: usize = 64 * 1024;
 
-pub(super) fn replay_allowed(state: &ResponseStreamState, failure: RecoveryFailure) -> bool {
-    state.replay_stale_marker_on_pre_first_event_close
-        && state.recovery_local_tools_only
-        && !state.headers_committed
-        && !state.replay_prohibited
-        && match failure {
-            RecoveryFailure::ConnectionLimit
-            | RecoveryFailure::MarkerMissing
-            | RecoveryFailure::TransportLost => true,
-            RecoveryFailure::LivenessTimeout => !state.upstream_event_seen,
-            RecoveryFailure::Other => false,
-        }
-}
-
 pub(in crate::responses) async fn preflight(
     state: &mut ResponseStreamState,
 ) -> Result<(), ThreadlineError> {
@@ -99,12 +85,10 @@ fn preflight_event_error(
     if !failure_without_progress(event) {
         state.replay_prohibited = true;
     }
-    if replay_allowed(state, failure) {
-        Some(ThreadlineError::PreviousResponseNotFound)
-    } else if failure == RecoveryFailure::ConnectionLimit {
+    if failure == RecoveryFailure::ConnectionLimit {
         Some(ThreadlineError::UpstreamWebSocketConnectionLimit)
     } else {
-        None
+        Some(ThreadlineError::UpstreamErrorEvent)
     }
 }
 
@@ -112,20 +96,12 @@ fn finish_preflight_failure(
     state: &mut ResponseStreamState,
     error: ThreadlineError,
 ) -> Result<(), ThreadlineError> {
-    let failure = match error {
-        ThreadlineError::UpstreamWebSocketClosed => RecoveryFailure::TransportLost,
-        ThreadlineError::UpstreamLivenessTimeout => RecoveryFailure::LivenessTimeout,
-        _ => RecoveryFailure::Other,
-    };
-    let error = if replay_allowed(state, failure) {
-        ThreadlineError::PreviousResponseNotFound
-    } else {
-        error
-    };
     state.pending_upstream_events.clear();
     state.upstream = None;
     if matches!(error, ThreadlineError::UpstreamLivenessTimeout) && state.upstream_event_seen {
         state.lease.finalize_liveness_timeout_turn();
+    } else if matches!(error, ThreadlineError::UpstreamWebSocketPolicyViolation) {
+        state.lease.finalize_policy_violation_turn();
     }
     state.lease.release();
     Err(error)
@@ -134,9 +110,14 @@ fn finish_preflight_failure(
 pub(in crate::responses) fn queue_transport_error(
     terminal: UpstreamTerminalState,
 ) -> Option<ThreadlineError> {
+    if terminal.is_policy_violation() {
+        return Some(ThreadlineError::UpstreamWebSocketPolicyViolation);
+    }
     match terminal {
         UpstreamTerminalState::Open => None,
-        UpstreamTerminalState::Closed(_) => Some(ThreadlineError::UpstreamWebSocketClosed),
+        UpstreamTerminalState::Closed(_) | UpstreamTerminalState::TransportClosed { .. } => {
+            Some(ThreadlineError::UpstreamWebSocketClosed)
+        }
         UpstreamTerminalState::InboundBufferOverflow(_) => {
             Some(ThreadlineError::UpstreamInboundBufferOverflow)
         }
@@ -148,8 +129,6 @@ pub(in crate::responses) fn queue_transport_error(
 pub(crate) enum RecoveryFailure {
     ConnectionLimit,
     MarkerMissing,
-    TransportLost,
-    LivenessTimeout,
     Other,
 }
 

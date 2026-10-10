@@ -50,6 +50,10 @@ impl PendingInternalToolOutput {
 }
 
 impl InternalToolCall {
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
     pub fn from_event(event: &Value) -> Result<Option<Self>, ThreadlineError> {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return Ok(None);

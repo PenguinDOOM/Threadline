@@ -624,12 +624,15 @@ pub(super) fn commit_terminal(
     let diagnostic = diagnostics.started_at.map(|started_at| {
         let ages = diagnostics.snapshot(started_at, Instant::now());
         let diagnostic = match &*state {
-            UpstreamTerminalState::Closed(metadata) => SafeTerminalDiagnostic::Closed {
-                source: source.expect("ordinary close has an observation source"),
-                code: metadata.code,
-                reason: safe_close_reason(metadata.reason.as_deref()),
-                error,
-            },
+            UpstreamTerminalState::Closed(metadata)
+            | UpstreamTerminalState::TransportClosed { metadata, .. } => {
+                SafeTerminalDiagnostic::Closed {
+                    source: source.expect("ordinary close has an observation source"),
+                    code: metadata.code,
+                    reason: safe_close_reason(metadata.reason.as_deref()),
+                    error,
+                }
+            }
             UpstreamTerminalState::LivenessTimeout(metadata) => {
                 SafeTerminalDiagnostic::LivenessTimeout(metadata.clone())
             }
@@ -655,13 +658,15 @@ pub(super) fn record_close(
     source: UpstreamCloseSource,
     diagnostics: &CloseDiagnostics,
 ) {
-    commit_terminal(
-        target,
-        UpstreamTerminalState::Closed(metadata),
-        diagnostics,
-        Some(source),
-        None,
-    );
+    let terminal = if matches!(source, UpstreamCloseSource::StreamEof) {
+        UpstreamTerminalState::TransportClosed {
+            cause: UpstreamCloseCause::Eof,
+            metadata,
+        }
+    } else {
+        UpstreamTerminalState::Closed(metadata)
+    };
+    commit_terminal(target, terminal, diagnostics, Some(source), None);
 }
 
 pub(super) fn record_error(
@@ -673,11 +678,18 @@ pub(super) fn record_error(
     let safe_error = diagnostics.started_at.map(|_| safe_transport_error(error));
     commit_terminal(
         target,
-        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
-            code: None,
-            reason: None,
-            error: Some(error.to_string()),
-        }),
+        UpstreamTerminalState::TransportClosed {
+            cause: match error {
+                TungsteniteError::Protocol(_) => UpstreamCloseCause::ProtocolError,
+                TungsteniteError::Io(_) => UpstreamCloseCause::Io,
+                _ => UpstreamCloseCause::Other,
+            },
+            metadata: UpstreamCloseMetadata {
+                code: None,
+                reason: None,
+                error: Some(error.to_string()),
+            },
+        },
         diagnostics,
         Some(source),
         safe_error,

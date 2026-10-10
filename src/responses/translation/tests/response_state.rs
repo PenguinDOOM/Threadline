@@ -247,10 +247,7 @@ async fn close_diagnostics_prelude_classifies_fifo_once_and_keeps_discard_unknow
         let result = recovery::preflight(&mut state).await;
         assert_diagnostic_state(&upstream, ResponseState::Unknown);
         if failure {
-            assert!(matches!(
-                result,
-                Err(ThreadlineError::PreviousResponseNotFound)
-            ));
+            assert!(matches!(result, Err(ThreadlineError::UpstreamErrorEvent)));
             assert!(state.pending_upstream_events.is_empty());
             assert!(state.upstream.is_none());
         } else {
@@ -330,7 +327,12 @@ async fn close_diagnostics_internal_tool_await_and_followup_track_each_response(
         .await
         .unwrap();
     let created = parse_received_event(&mut state).await;
-    progression::process_upstream_event(&mut state, created).await;
+    progression::process_upstream_event(
+        &mut state,
+        created,
+        &mut super::super::InternalToolLedger::default(),
+    )
+    .await;
     assert_diagnostic_state(&upstream, ResponseState::InProgress);
     assert_diagnostic_tool_await(
         &upstream,
@@ -372,7 +374,12 @@ async fn complete_diagnostic_tool_followup(
     let writing = started.notified();
     tokio::pin!(writing);
     writing.as_mut().enable();
-    progression::process_upstream_event(state, completed).await;
+    progression::process_upstream_event(
+        state,
+        completed,
+        &mut super::super::InternalToolLedger::default(),
+    )
+    .await;
     writing.await;
     assert_diagnostic_state(&upstream, ResponseState::CreatePending);
     open.store(true, Ordering::SeqCst);
@@ -386,7 +393,12 @@ async fn complete_diagnostic_tool_followup(
     assert_diagnostic_state(&upstream, ResponseState::CreateSent);
     send_server_event(server, json!({"type":"response.completed","response":{"id":"resp_final","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}})).await;
     let final_event = parse_received_event(state).await;
-    progression::process_upstream_event(state, final_event).await;
+    progression::process_upstream_event(
+        state,
+        final_event,
+        &mut super::super::InternalToolLedger::default(),
+    )
+    .await;
     assert_diagnostic_state(&upstream, ResponseState::Completed);
     state.lease.release();
     let mut next_lease = registry.acquire_previous("resp_final").await.unwrap();
@@ -420,7 +432,8 @@ async fn assert_diagnostic_tool_await(
 ) {
     send_server_event(server, json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_test","name":"threadline_echo","arguments":json!({"value":"done"}).to_string()}})).await;
     let tool = parse_received_event(state).await;
-    let execution = progression::process_upstream_event(state, tool);
+    let mut ledger = super::super::InternalToolLedger::default();
+    let execution = progression::process_upstream_event(state, tool, &mut ledger);
     tokio::pin!(execution);
     assert!(futures_util::poll!(&mut execution).is_pending());
     started.notified().await;

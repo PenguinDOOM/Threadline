@@ -10,6 +10,9 @@ pub(super) async fn receive_upstream_text(
         Some(upstream) => upstream.recv_text().await,
         None => Ok(None),
     };
+    if let Some(chunk) = reject_unaccepted_transport_terminal(state).await {
+        return Err(StreamProgress::Yield(chunk));
+    }
     let next = match upstream_result {
         Ok(Some(text)) => text,
         Err(crate::ws_pump::UpstreamWebSocketError::InboundBufferOverflow) => {
@@ -49,12 +52,7 @@ pub(super) async fn receive_overflow_terminal(
 pub(super) async fn receive_timeout_terminal(
     state: &mut ResponseStreamState,
 ) -> Result<Option<String>, StreamProgress> {
-    let stale_continuation = invalidate_stale_continuation_before_first_upstream_event(state);
-    let error = if stale_continuation {
-        ThreadlineError::PreviousResponseNotFound
-    } else {
-        ThreadlineError::UpstreamLivenessTimeout
-    };
+    let error = ThreadlineError::UpstreamLivenessTimeout;
     let failed_payload = terminal_failed_payload_from_error(None, None, &error);
     trace_downstream_sse_event(&downstream_sse_trace_metadata(
         &failed_payload,
@@ -63,15 +61,12 @@ pub(super) async fn receive_timeout_terminal(
     ));
     discard_unaccepted_queued_output(state);
     state.upstream = None;
-    if !stale_continuation {
-        if state.followup_send_started {
-            state.lease.mark_upstream_terminal().await;
-            state.lease.release();
-        } else {
-            state.lease.finalize_liveness_timeout_turn();
-            state.lease.release();
-        }
+    if state.followup_send_started {
+        state.lease.mark_upstream_terminal().await;
+    } else {
+        state.lease.finalize_liveness_timeout_turn();
     }
+    state.lease.release();
     state.final_done_pending = true;
     Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
         &failed_payload,
@@ -95,17 +90,6 @@ pub(super) async fn receive_closed_transport(
     Err(StreamProgress::Yield(sse_terminal_response_failed_chunk(
         &failed_payload,
     )))
-}
-
-pub(super) fn invalidate_stale_continuation_before_first_upstream_event(
-    state: &mut ResponseStreamState,
-) -> bool {
-    if recovery::replay_allowed(state, recovery::RecoveryFailure::LivenessTimeout) {
-        state.lease.release();
-        return true;
-    }
-
-    false
 }
 
 pub(super) fn terminal_failed_payload(

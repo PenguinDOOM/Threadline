@@ -173,7 +173,7 @@ pub(crate) async fn send_response_create(
     upstream
         .send_response_create_text(text)
         .await
-        .map_err(map_upstream_websocket_error)
+        .map_err(|error| map_upstream_websocket_error(error, upstream.terminal_state()))
 }
 
 pub(crate) fn build_followup_tool_outputs_payload(
@@ -205,15 +205,21 @@ pub(crate) async fn send_followup_tool_outputs(
     upstream
         .send_response_create_text(text)
         .await
-        .map_err(map_upstream_websocket_error)
+        .map_err(|error| map_upstream_websocket_error(error, upstream.terminal_state()))
 }
 
-fn map_upstream_websocket_error(error: UpstreamWebSocketError) -> ThreadlineError {
+fn map_upstream_websocket_error(
+    error: UpstreamWebSocketError,
+    terminal_state: crate::ws_pump::UpstreamTerminalState,
+) -> ThreadlineError {
     match error {
         UpstreamWebSocketError::InboundBufferOverflow => {
             ThreadlineError::UpstreamInboundBufferOverflow
         }
         UpstreamWebSocketError::LivenessTimeout => ThreadlineError::UpstreamLivenessTimeout,
+        UpstreamWebSocketError::OutboundQueueClosed if terminal_state.is_policy_violation() => {
+            ThreadlineError::UpstreamWebSocketPolicyViolation
+        }
         UpstreamWebSocketError::OutboundQueueClosed => ThreadlineError::UpstreamWebSocketClosed,
     }
 }

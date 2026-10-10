@@ -1,9 +1,40 @@
 use super::*;
 
+const INTERNAL_TOOL_MAX_CALL_IDS: usize = 4096;
+const INTERNAL_TOOL_MAX_CALL_ID_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct InternalToolLedger {
+    call_ids: HashSet<String>,
+    bytes: usize,
+}
+
+impl InternalToolLedger {
+    pub(super) fn reserve(&mut self, call_id: &str) -> Result<(), ThreadlineError> {
+        if self.call_ids.contains(call_id)
+            || self.call_ids.len() >= INTERNAL_TOOL_MAX_CALL_IDS
+            || call_id.len() > INTERNAL_TOOL_MAX_CALL_ID_BYTES - self.bytes
+        {
+            return Err(ThreadlineError::InternalToolFailed);
+        }
+        self.call_ids.insert(call_id.to_owned());
+        self.bytes += call_id.len();
+        Ok(())
+    }
+}
+
+fn start_work_error(state: &ResponseStreamState) -> Option<ThreadlineError> {
+    match state.upstream.as_ref() {
+        Some(upstream) => queue_transport_error(upstream.terminal_state()),
+        None => Some(ThreadlineError::UpstreamWebSocketClosed),
+    }
+}
+
 pub(super) async fn handle_internal_tool_event(
     state: &mut ResponseStreamState,
     parsed: &Value,
     trace_metadata: &UpstreamEventTraceMetadata,
+    ledger: &mut InternalToolLedger,
 ) -> Option<StreamProgress> {
     if !state.execute_internal_tools {
         return None;
@@ -37,7 +68,9 @@ pub(super) async fn handle_internal_tool_event(
     };
 
     if let Some(call) = internal_tool_call {
-        return Some(execute_internal_tool_event(state, parsed, call, trace_metadata).await);
+        return Some(
+            execute_internal_tool_event(state, parsed, call, trace_metadata, ledger).await,
+        );
     }
 
     None
@@ -93,14 +126,25 @@ pub(super) async fn execute_internal_tool_event(
     parsed: &Value,
     call: InternalToolCall,
     trace_metadata: &UpstreamEventTraceMetadata,
+    ledger: &mut InternalToolLedger,
 ) -> StreamProgress {
     state.replay_prohibited = true;
+    if let Some(error) = start_work_error(state) {
+        return reject_internal_tool_transport(
+            state,
+            parsed,
+            response_id_from_event(parsed),
+            error,
+        )
+        .await;
+    }
+    if let Err(error) = ledger.reserve(call.call_id()) {
+        return reject_internal_tool_output(state, parsed, response_id_from_event(parsed), error)
+            .await;
+    }
+    let call_id = call.call_id().to_owned();
     let execution_result = state.services.execute_internal_tool(call).await;
-    if let Some(error) = state
-        .upstream
-        .as_ref()
-        .and_then(|upstream| final_completion_acceptance_error(upstream.terminal_state()))
-    {
+    if let Some(error) = start_work_error(state) {
         return reject_internal_tool_transport(
             state,
             parsed,
@@ -112,11 +156,7 @@ pub(super) async fn execute_internal_tool_event(
 
     match execution_result {
         Ok(output) => {
-            if state
-                .pending_internal_outputs
-                .iter()
-                .any(|pending| pending.call_id() == output.call_id())
-            {
+            if output.call_id() != call_id {
                 return reject_internal_tool_output(
                     state,
                     parsed,
@@ -147,11 +187,7 @@ pub(super) async fn handle_intermediate_completion(
             .await;
     };
 
-    if let Some(error) = state
-        .upstream
-        .as_ref()
-        .and_then(|upstream| final_completion_acceptance_error(upstream.terminal_state()))
-    {
+    if let Some(error) = start_work_error(state) {
         return reject_internal_tool_transport(state, parsed, Some(response_id), error).await;
     }
 
@@ -195,6 +231,8 @@ pub(super) async fn reject_internal_tool_transport(
     state.upstream = None;
     if matches!(error, ThreadlineError::UpstreamLivenessTimeout) {
         state.lease.finalize_liveness_timeout_turn();
+    } else if matches!(error, ThreadlineError::UpstreamWebSocketPolicyViolation) {
+        state.lease.finalize_policy_violation_turn();
     } else {
         state.lease.mark_upstream_terminal().await;
     }
@@ -251,6 +289,9 @@ pub(super) async fn send_internal_tool_followup(
     response_id: &str,
     followup_input: Value,
 ) -> Option<StreamProgress> {
+    if let Some(error) = start_work_error(state) {
+        return Some(reject_internal_tool_transport(state, parsed, Some(response_id), error).await);
+    }
     let Some(upstream) = state.upstream.as_ref() else {
         let failed_payload = terminal_failed_payload_from_error(
             parsed.get("response"),
@@ -269,6 +310,12 @@ pub(super) async fn send_internal_tool_followup(
             .await;
     state.followup_send_started = false;
     if let Err(error) = followup_result {
+        let error = queue_transport_error(upstream.terminal_state()).unwrap_or(error);
+        if matches!(error, ThreadlineError::UpstreamWebSocketPolicyViolation) {
+            return Some(
+                reject_internal_tool_transport(state, parsed, Some(response_id), error).await,
+            );
+        }
         return Some(reject_internal_tool_output(state, parsed, Some(response_id), error).await);
     }
 

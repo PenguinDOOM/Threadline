@@ -349,7 +349,14 @@ fn close_diagnostics_eof_and_fallback_keep_the_first_observed_source() {
         );
         assert_eq!(
             *state.lock().unwrap(),
-            UpstreamTerminalState::Closed(empty_close_metadata())
+            if source == "stream_eof" {
+                UpstreamTerminalState::TransportClosed {
+                    cause: UpstreamCloseCause::Eof,
+                    metadata: empty_close_metadata(),
+                }
+            } else {
+                UpstreamTerminalState::Closed(empty_close_metadata())
+            }
         );
         let capture = diagnostics.capture();
         assert_eq!(capture.calls, 1);
@@ -485,6 +492,11 @@ fn assert_read_error_diagnostic_case(
     expected_raw_os_error: &str,
 ) {
     let original = error.to_string();
+    let cause = match &error {
+        TungsteniteError::Protocol(_) => UpstreamCloseCause::ProtocolError,
+        TungsteniteError::Io(_) => UpstreamCloseCause::Io,
+        _ => UpstreamCloseCause::Other,
+    };
     let mut diagnostics = CloseDiagnostics::new(true);
     let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
     assert!(!handle_test_inbound(
@@ -500,11 +512,14 @@ fn assert_read_error_diagnostic_case(
     );
     assert_eq!(
         *state.lock().unwrap(),
-        UpstreamTerminalState::Closed(UpstreamCloseMetadata {
-            code: None,
-            reason: None,
-            error: Some(original),
-        })
+        UpstreamTerminalState::TransportClosed {
+            cause,
+            metadata: UpstreamCloseMetadata {
+                code: None,
+                reason: None,
+                error: Some(original),
+            }
+        }
     );
     let capture = diagnostics.capture();
     assert_eq!(capture.calls, 1);

@@ -327,7 +327,8 @@ impl LiveUpstreamWebSocket {
 
     pub async fn close_metadata(&self) -> Option<UpstreamCloseMetadata> {
         match self.terminal_state() {
-            UpstreamTerminalState::Closed(metadata) => Some(metadata),
+            UpstreamTerminalState::Closed(metadata)
+            | UpstreamTerminalState::TransportClosed { metadata, .. } => Some(metadata),
             UpstreamTerminalState::LivenessTimeout(_) => Some(liveness_timeout_close_metadata()),
             UpstreamTerminalState::Open | UpstreamTerminalState::InboundBufferOverflow(_) => None,
         }
@@ -341,14 +342,20 @@ impl LiveUpstreamWebSocket {
     }
 
     pub(super) fn terminal_error(&self) -> Result<(), UpstreamWebSocketError> {
-        match self.terminal_state() {
+        let terminal_state = self.terminal_state();
+        match terminal_state {
             UpstreamTerminalState::InboundBufferOverflow(_) => {
                 Err(UpstreamWebSocketError::InboundBufferOverflow)
             }
             UpstreamTerminalState::LivenessTimeout(_) => {
                 Err(UpstreamWebSocketError::LivenessTimeout)
             }
-            UpstreamTerminalState::Open | UpstreamTerminalState::Closed(_) => Ok(()),
+            state if state.is_policy_violation() => {
+                Err(UpstreamWebSocketError::OutboundQueueClosed)
+            }
+            UpstreamTerminalState::Open
+            | UpstreamTerminalState::Closed(_)
+            | UpstreamTerminalState::TransportClosed { .. } => Ok(()),
         }
     }
 }

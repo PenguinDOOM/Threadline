@@ -214,6 +214,43 @@ impl UpstreamConnector for OverflowBeforeFirstSendConnector {
 }
 
 #[derive(Clone)]
+struct PolicyCloseBeforeSendConnector {
+    server: Arc<ScriptedWebSocketServer>,
+}
+
+impl UpstreamConnector for PolicyCloseBeforeSendConnector {
+    fn connect(
+        &self,
+        _auth: LoadedUpstreamAuth,
+        session: Option<UpstreamSessionDescriptor>,
+    ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
+        let server = Arc::clone(&self.server);
+        Box::pin(async move {
+            let session = session.unwrap_or_else(new_session_descriptor);
+            let (stream, _) = connect_async(server.url())
+                .await
+                .map_err(|_| ThreadlineError::UpstreamWebSocketConnectFailed)?;
+            let websocket = Arc::new(LiveUpstreamWebSocket::from_stream_with_limits(
+                stream,
+                UpstreamInboundLimits::DEFAULT,
+            ));
+
+            server.send_close(1008, "private policy detail").await;
+            timeout(Duration::from_secs(1), server.wait_for_client_disconnect())
+                .await
+                .expect("policy close should terminate the pump before connector return");
+            assert!(websocket.terminal_state().is_policy_violation());
+
+            Ok(ConnectedUpstream {
+                websocket,
+                session,
+                turn_state: None,
+            })
+        })
+    }
+}
+
+#[derive(Clone)]
 struct FailingConnector;
 
 impl UpstreamConnector for FailingConnector {
@@ -5003,7 +5040,7 @@ async fn upstream_error_event_partial_previous_response_messages_remain_upstream
 }
 
 #[tokio::test]
-async fn classified_upstream_previous_response_not_found_releases_prior_marker_without_reconnect() {
+async fn post_send_previous_response_not_found_returns_fixed_http502_without_reconnect() {
     let first_server = Arc::new(ScriptedWebSocketServer::start().await);
     let reconnect_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![
@@ -5053,12 +5090,16 @@ async fn classified_upstream_previous_response_not_found_releases_prior_marker_w
         )
         .await;
     let failed = failed.await.expect("marker-missing headers");
-    assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
     let body = to_bytes(failed.into_body(), usize::MAX)
         .await
         .expect("failed body");
     let error: Value = serde_json::from_slice(&body).expect("marker-missing JSON");
-    assert_eq!(error["error"]["code"], "previous_response_not_found");
+    assert_eq!(error["error"]["code"], "upstream_error_event");
+    assert_eq!(
+        error["error"]["message"],
+        "The upstream websocket emitted an error event."
+    );
     timeout(
         Duration::from_secs(1),
         first_server.wait_for_client_disconnect(),
@@ -8272,6 +8313,167 @@ async fn queued_final_completion_survives_normal_close_before_body_polling() {
     );
 }
 
+async fn close_policy_and_wait(server: &ScriptedWebSocketServer, upstream: &LiveUpstreamWebSocket) {
+    server.send_close(1008, "private policy detail").await;
+    timeout(Duration::from_secs(1), async {
+        while !upstream.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("policy terminal observed");
+    assert!(upstream.terminal_state().is_policy_violation());
+}
+
+async fn assert_policy_http_error(response: Response<Body>) {
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("error body");
+    let error: Value = serde_json::from_slice(&bytes).expect("JSON");
+    assert_eq!(
+        error,
+        json!({"error":{
+            "code":"upstream_websocket_policy_violation",
+            "message":"The upstream websocket closed due to a policy violation.",
+            "type":"server_error"
+        }})
+    );
+}
+
+#[tokio::test]
+async fn active_preflight_policy_close_returns_http502_and_retains_dedicated_refusal() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+    let seed = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"seed"})).await;
+    let _ = server.recv_client_message().await.expect("seed create");
+    server
+        .send_text(&assistant_text_completed_event("policy-seed", "seed").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+    let response = tokio::spawn(post_responses(
+        app.clone(),
+        json!({"model":"gpt-6-sol","input":"continue","previous_response_id":"policy-seed"}),
+    ));
+    let _ = server
+        .recv_client_message()
+        .await
+        .expect("one continuation create");
+    let upstream = connector.recorded_websockets().await[0]
+        .upgrade()
+        .expect("pump");
+    close_policy_and_wait(&server, &upstream).await;
+    assert_policy_http_error(response.await.expect("preflight task")).await;
+    for _ in 0..2 {
+        assert_policy_http_error(
+            post_responses(
+                app.clone(),
+                json!({"model":"gpt-6-sol","input":"retry","previous_response_id":"policy-seed"}),
+            )
+            .await,
+        )
+        .await;
+    }
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn queued_final_policy_close_is_rejected_before_acceptance() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+    let response = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"final"})).await;
+    let _ = server.recv_client_message().await.expect("create");
+    let upstream = connector.recorded_websockets().await[0]
+        .upgrade()
+        .expect("pump");
+    server
+        .send_text(&assistant_text_completed_event("policy-final", "not accepted").to_string())
+        .await;
+    close_policy_and_wait(&server, &upstream).await;
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("UTF8");
+    let frames = split_sse_frames(&text);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(sse_event_and_data(frames[0]).0, "response.failed");
+    let failed: Value = serde_json::from_str(sse_event_and_data(frames[0]).1).expect("failure");
+    assert_eq!(
+        failed["response"]["error"]["code"],
+        "upstream_websocket_policy_violation"
+    );
+    assert_done_frame(frames[1]);
+    assert!(!text.contains("private policy detail"));
+    assert!(!text.contains("not accepted"));
+    let retry = post_responses(
+        app,
+        json!({"model":"gpt-6-sol","input":"retry","previous_response_id":"policy-final"}),
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_final_survives_policy_close_then_marker_reuse_is_refused() {
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![PlannedConnection {
+        server: Arc::clone(&server),
+        turn_state: None,
+    }]);
+    let app = build_test_router(ThreadlineConfig::default(), Arc::new(connector.clone()));
+    let response = post_responses(app.clone(), json!({"model":"gpt-6-sol","input":"final"})).await;
+    let _ = server.recv_client_message().await.expect("create");
+    let upstream = connector.recorded_websockets().await[0]
+        .upgrade()
+        .expect("pump");
+    server
+        .send_text(&assistant_text_completed_event("policy-final", "accepted answer").to_string())
+        .await;
+    let mut body = response.into_body().into_data_stream();
+    let delta = next_body_chunk(&mut body).await;
+    assert!(
+        String::from_utf8(delta.to_vec())
+            .unwrap()
+            .contains("event: response.output_text.delta")
+    );
+    close_policy_and_wait(&server, &upstream).await;
+    let completed = next_body_chunk(&mut body).await;
+    assert!(
+        String::from_utf8(completed.to_vec())
+            .unwrap()
+            .contains("event: response.completed")
+    );
+    assert_eq!(
+        String::from_utf8(next_body_chunk(&mut body).await.to_vec()).unwrap(),
+        "data: [DONE]\n\n"
+    );
+    assert!(body.next().await.is_none());
+    for _ in 0..2 {
+        assert_policy_http_error(
+            post_responses(
+                app.clone(),
+                json!({"model":"gpt-6-sol","input":"retry","previous_response_id":"policy-final"}),
+            )
+            .await,
+        )
+        .await;
+    }
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(server.take_pending_client_messages().await.is_empty());
+}
+
 #[tokio::test]
 async fn active_overflow_invalidates_all_completed_aliases_and_releases_registry_capacity() {
     let retained_server = Arc::new(ScriptedWebSocketServer::start().await);
@@ -8963,6 +9165,35 @@ async fn auxiliary_summary_missed_pong_and_matching_pongs_preserve_main_marker()
     let requested_sessions = connector.recorded_requested_sessions().await;
     assert!(requested_sessions[0].is_some());
     assert_eq!(requested_sessions[1..], [None, None]);
+}
+
+#[tokio::test]
+async fn transient_routes_map_policy_close_before_first_send_to_dedicated_http_error() {
+    for (profile, request) in [
+        (
+            RouteProfile::Utility,
+            json!({
+                "model":"threadline-utility-gpt-6-luna",
+                "input":"utility"
+            }),
+        ),
+        (RouteProfile::Main, auxiliary_summary_request(None)),
+    ] {
+        let server = Arc::new(ScriptedWebSocketServer::start().await);
+        let connector = PolicyCloseBeforeSendConnector {
+            server: Arc::clone(&server),
+        };
+        let app = build_test_router(
+            ThreadlineConfig {
+                profile,
+                ..ThreadlineConfig::default()
+            },
+            Arc::new(connector),
+        );
+
+        assert_policy_http_error(post_responses(app, request).await).await;
+        assert!(server.take_pending_client_messages().await.is_empty());
+    }
 }
 
 #[tokio::test]

@@ -1,5 +1,89 @@
 use super::*;
 
+#[tokio::test]
+async fn policy_close_rejects_outbound_send_before_enqueue() {
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+    let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+    let pump = LiveUpstreamWebSocket {
+        outbound_tx,
+        inbound_rx: Mutex::new(inbound_rx),
+        terminal_state: Arc::new(StdMutex::new(UpstreamTerminalState::Closed(
+            UpstreamCloseMetadata {
+                code: Some(1008),
+                reason: Some("private policy detail".to_string()),
+                error: None,
+            },
+        ))),
+        task: tokio::spawn(std::future::pending()),
+        after_text_send: None,
+        pending_text_send: None,
+        diagnostics: CloseDiagnostics::new(false),
+    };
+
+    assert_eq!(
+        pump.send_response_create_text("{}".to_string()).await,
+        Err(UpstreamWebSocketError::OutboundQueueClosed)
+    );
+    assert!(outbound_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn policy_close_classifies_send_blocked_during_enqueue() {
+    let (outbound_tx, outbound_rx) = mpsc::channel(1);
+    outbound_tx
+        .try_send(OutboundCommand::Text("queued".to_string()))
+        .expect("fill outbound queue");
+    let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+    let terminal_state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    let pump = LiveUpstreamWebSocket {
+        outbound_tx,
+        inbound_rx: Mutex::new(inbound_rx),
+        terminal_state: Arc::clone(&terminal_state),
+        task: tokio::spawn(std::future::pending()),
+        after_text_send: None,
+        pending_text_send: None,
+        diagnostics: CloseDiagnostics::new(false),
+    };
+    let send = pump.send_response_create_text("{}".to_string());
+    tokio::pin!(send);
+    assert!(futures_util::poll!(&mut send).is_pending());
+
+    *terminal_state.lock().unwrap() = UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+        code: Some(1008),
+        reason: Some("private policy detail".to_string()),
+        error: None,
+    });
+    drop(outbound_rx);
+
+    assert_eq!(send.await, Err(UpstreamWebSocketError::OutboundQueueClosed));
+}
+
+#[test]
+fn peer_close_codes_preserve_distinct_typed_causes_and_first_terminal() {
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    for (code, expected) in [
+        (1000, UpstreamCloseCause::Normal),
+        (1012, UpstreamCloseCause::ServiceRestart),
+        (1008, UpstreamCloseCause::PolicyViolation),
+    ] {
+        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        let mut diagnostics = CloseDiagnostics::new(true);
+        assert!(!handle_test_inbound(
+            Some(Ok(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(code),
+                reason: "private reason".into(),
+            })))),
+            &state,
+            &mut diagnostics
+        ));
+        let first = state.lock().unwrap().clone();
+        assert_eq!(first.close_cause(), Some(expected));
+        assert!(!handle_test_inbound(None, &state, &mut diagnostics));
+        assert_eq!(*state.lock().unwrap(), first);
+        assert_eq!(diagnostics.capture().calls, 1);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn close_diagnostics_control_flush_does_not_replace_successful_send_times() {
     let (client, _server) = raw_pair(1024).await;
@@ -406,7 +490,7 @@ fn assert_write_failure_terminal(
 ) {
     let first = state.lock().unwrap().clone();
     assert!(
-        matches!(&first, UpstreamTerminalState::Closed(UpstreamCloseMetadata { code: None, reason: None, error: Some(error) }) if error.contains("write-secret"))
+        matches!(&first, UpstreamTerminalState::TransportClosed { cause: UpstreamCloseCause::Io, metadata: UpstreamCloseMetadata { code: None, reason: None, error: Some(error) } } if error.contains("write-secret"))
     );
     record_close(
         state,

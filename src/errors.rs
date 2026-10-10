@@ -58,6 +58,9 @@ pub enum ThreadlineError {
     )]
     UpstreamWebSocketClosed,
 
+    #[error("The upstream websocket closed due to a policy violation.")]
+    UpstreamWebSocketPolicyViolation,
+
     #[error("The upstream websocket inbound buffer overflowed.")]
     UpstreamInboundBufferOverflow,
 
@@ -130,6 +133,7 @@ impl ThreadlineError {
             Self::UpstreamWebSocketConnectTimeout => StatusCode::BAD_GATEWAY,
             Self::UpstreamWebSocketHandshakeRejected { status } => *status,
             Self::UpstreamWebSocketClosed => StatusCode::BAD_GATEWAY,
+            Self::UpstreamWebSocketPolicyViolation => StatusCode::BAD_GATEWAY,
             Self::UpstreamInboundBufferOverflow => StatusCode::BAD_GATEWAY,
             Self::UpstreamLivenessTimeout => StatusCode::BAD_GATEWAY,
             Self::UpstreamWebSocketConnectionLimit => StatusCode::BAD_GATEWAY,
@@ -168,6 +172,11 @@ impl ThreadlineError {
                 error_type: Cow::Borrowed("bad_gateway_error"),
             },
             Self::UpstreamWebSocketClosed => UPSTREAM_WEB_SOCKET_CLOSED,
+            Self::UpstreamWebSocketPolicyViolation => borrowed_public_error(
+                "upstream_websocket_policy_violation",
+                "The upstream websocket closed due to a policy violation.",
+                "server_error",
+            ),
             Self::UpstreamInboundBufferOverflow => UPSTREAM_INBOUND_BUFFER_OVERFLOW,
             Self::UpstreamLivenessTimeout => UPSTREAM_LIVENESS_TIMEOUT,
             Self::UpstreamWebSocketConnectionLimit => UPSTREAM_WEB_SOCKET_CONNECTION_LIMIT,

@@ -4,7 +4,7 @@ pub(super) async fn start_continuation_upstream(
     lease: &mut RetainedSessionLease,
     upstream_request: &mut serde_json::Map<String, Value>,
     previous_response_id: &str,
-    recovery_local_tools_only: bool,
+    _recovery_local_tools_only: bool,
 ) -> Result<Arc<LiveUpstreamWebSocket>, ThreadlineError> {
     let Some(upstream) = lease.upstream() else {
         trace_stale_continuation(lease, previous_response_id, "missing_or_closed_upstream");
@@ -25,37 +25,29 @@ pub(super) async fn start_continuation_upstream(
 
     lease.arm_active_turn();
     if let Err(error) = send_response_create(&upstream, upstream_request).await {
-        let error = if recovery_local_tools_only {
-            rewrite_stale_continuation_first_send_error(error)
-        } else {
-            error
-        };
-        if matches!(error, ThreadlineError::PreviousResponseNotFound) {
-            trace_stale_continuation(lease, previous_response_id, "first_send_closed");
-            lease.release();
-            return Err(ThreadlineError::PreviousResponseNotFound);
-        }
-
-        return Err(error);
+        return Err(finish_initial_send_failure(lease, &upstream, error));
     }
 
     tokio::task::yield_now().await;
     if let Some(error) = super::translation::queue_transport_error(upstream.terminal_state()) {
-        let error = if recovery_local_tools_only {
-            rewrite_stale_continuation_first_send_error(error)
-        } else {
-            error
-        };
-        trace_stale_continuation(
-            lease,
-            previous_response_id,
-            "first_send_closed_after_enqueue",
-        );
-        lease.release();
-        return Err(error);
+        return Err(finish_initial_send_failure(lease, &upstream, error));
     }
 
     Ok(upstream)
+}
+
+fn finish_initial_send_failure(
+    lease: &mut RetainedSessionLease,
+    upstream: &LiveUpstreamWebSocket,
+    error: ThreadlineError,
+) -> ThreadlineError {
+    let error =
+        super::translation::queue_transport_error(upstream.terminal_state()).unwrap_or(error);
+    if matches!(error, ThreadlineError::UpstreamWebSocketPolicyViolation) {
+        lease.finalize_policy_violation_turn();
+    }
+    lease.release();
+    error
 }
 
 pub(super) async fn start_new_upstream(
@@ -66,7 +58,9 @@ pub(super) async fn start_new_upstream(
     let auth = services.auth_provider().load()?;
     let upstream = ensure_upstream(services, lease, auth).await?;
     lease.arm_active_turn();
-    send_response_create(&upstream, upstream_request).await?;
+    if let Err(error) = send_response_create(&upstream, upstream_request).await {
+        return Err(finish_initial_send_failure(lease, &upstream, error));
+    }
 
     Ok(upstream)
 }
@@ -93,6 +87,11 @@ pub(super) fn check_continuation_transport(
     stale_reason: &str,
 ) -> Result<(), ThreadlineError> {
     if let Some(error) = continuation_terminal_error(upstream.terminal_state()) {
+        if matches!(error, ThreadlineError::UpstreamWebSocketPolicyViolation) {
+            lease.finalize_policy_violation_turn();
+            lease.release();
+            return Err(error);
+        }
         if matches!(error, ThreadlineError::UpstreamInboundBufferOverflow) {
             return Err(error);
         }
@@ -103,23 +102,16 @@ pub(super) fn check_continuation_transport(
     Ok(())
 }
 
-pub(super) fn rewrite_stale_continuation_first_send_error(
-    error: ThreadlineError,
-) -> ThreadlineError {
-    match error {
-        ThreadlineError::UpstreamWebSocketClosed | ThreadlineError::UpstreamLivenessTimeout => {
-            ThreadlineError::PreviousResponseNotFound
-        }
-        other => other,
-    }
-}
-
 pub(super) fn continuation_terminal_error(
     terminal_state: crate::ws_pump::UpstreamTerminalState,
 ) -> Option<ThreadlineError> {
+    if terminal_state.is_policy_violation() {
+        return Some(ThreadlineError::UpstreamWebSocketPolicyViolation);
+    }
     match terminal_state {
         crate::ws_pump::UpstreamTerminalState::Open => None,
-        crate::ws_pump::UpstreamTerminalState::Closed(_) => {
+        crate::ws_pump::UpstreamTerminalState::Closed(_)
+        | crate::ws_pump::UpstreamTerminalState::TransportClosed { .. } => {
             Some(ThreadlineError::PreviousResponseNotFound)
         }
         crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
@@ -154,7 +146,11 @@ pub(super) async fn ensure_upstream(
     auth: LoadedUpstreamAuth,
 ) -> Result<Arc<LiveUpstreamWebSocket>, ThreadlineError> {
     if let Some(upstream) = lease.upstream() {
-        match upstream.terminal_state() {
+        let terminal = upstream.terminal_state();
+        if terminal.is_policy_violation() {
+            return Err(ThreadlineError::UpstreamWebSocketPolicyViolation);
+        }
+        match terminal {
             crate::ws_pump::UpstreamTerminalState::Open => return Ok(upstream),
             crate::ws_pump::UpstreamTerminalState::InboundBufferOverflow(_) => {
                 return Err(ThreadlineError::UpstreamInboundBufferOverflow);
@@ -162,7 +158,8 @@ pub(super) async fn ensure_upstream(
             crate::ws_pump::UpstreamTerminalState::LivenessTimeout(_) => {
                 return Err(ThreadlineError::UpstreamLivenessTimeout);
             }
-            crate::ws_pump::UpstreamTerminalState::Closed(_) => {
+            crate::ws_pump::UpstreamTerminalState::Closed(_)
+            | crate::ws_pump::UpstreamTerminalState::TransportClosed { .. } => {
                 lease.detach_upstream_recoverably();
             }
         }
@@ -192,6 +189,9 @@ pub(super) fn map_registry_error(error: RegistryAcquireError) -> ThreadlineError
         }
         RegistryAcquireError::UpstreamInboundBufferOverflow => {
             ThreadlineError::UpstreamInboundBufferOverflow
+        }
+        RegistryAcquireError::UpstreamWebSocketPolicyViolation => {
+            ThreadlineError::UpstreamWebSocketPolicyViolation
         }
     }
 }

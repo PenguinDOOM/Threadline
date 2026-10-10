@@ -78,14 +78,14 @@ async fn client_emulated_full_resend_uses_new_session_and_only_registers_success
             .await
             .expect("limit headers")
             .expect("task");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let error: Value = serde_json::from_slice(
             &to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("error body"),
         )
         .expect("error JSON");
-        assert_eq!(error["error"]["code"], "previous_response_not_found");
+        assert_eq!(error["error"]["code"], "websocket_connection_limit_reached");
         assert_eq!(connector.recorded_sessions().await.len(), 1);
         assert!(connector.recorded_websockets().await[0].upgrade().is_none());
         assert_old_aliases_missing(app.clone()).await;
@@ -214,7 +214,7 @@ async fn transient_limit_leaves_main_marker_usable_then_visible_close_is_termina
 }
 
 #[tokio::test]
-async fn continuation_close_recovery_requires_only_known_local_functions() {
+async fn continuation_close_after_send_never_replays_regardless_of_tools() {
     for (tools, recovery, abort_transport) in [
         (
             json!([{"type":"function","name":"external","parameters":{}}]),
@@ -250,7 +250,7 @@ async fn continuation_close_recovery_requires_only_known_local_functions() {
         assert_eq!(
             response.status(),
             if recovery {
-                StatusCode::BAD_REQUEST
+                StatusCode::BAD_GATEWAY
             } else {
                 StatusCode::OK
             }
@@ -260,7 +260,7 @@ async fn continuation_close_recovery_requires_only_known_local_functions() {
             .expect("body");
         if recovery {
             let error: Value = serde_json::from_slice(&bytes).expect("JSON");
-            assert_eq!(error["error"]["code"], "previous_response_not_found");
+            assert_eq!(error["error"]["code"], "upstream_websocket_closed");
         } else {
             let text = String::from_utf8(bytes.to_vec()).expect("UTF8");
             assert!(text.contains("upstream_websocket_closed"));
@@ -414,7 +414,7 @@ async fn reconnect_fallback_is_not_attempted_for_non_continuation_requests() {
 }
 
 #[tokio::test]
-async fn lifecycle_only_close_returns_http_not_found_without_reconnect() {
+async fn lifecycle_only_close_returns_http502_without_reconnect() {
     let seed_server = Arc::new(ScriptedWebSocketServer::start().await);
     let connector = RecordingConnector::new(vec![planned_connection(
         &seed_server,
@@ -446,12 +446,12 @@ async fn lifecycle_only_close_returns_http_not_found_without_reconnect() {
         .await
         .expect("headers")
         .expect("response task");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
     let error: Value = serde_json::from_slice(&bytes).expect("JSON error");
-    assert_eq!(error["error"]["code"], "previous_response_not_found");
+    assert_eq!(error["error"]["code"], "upstream_websocket_closed");
 
     let sessions = connector.recorded_sessions().await;
     assert_eq!(sessions.len(), 1);
