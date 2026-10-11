@@ -30,3 +30,16 @@ target
 *.log
 .env
 .env.*
+
+# Local development files
+completes/
+guardrails/
+plans/
+requests/
+
+# Codacy
+.codacy/
+
+
+#Ignore insiders AI rules
+.github/instructions/codacy.instructions.md
