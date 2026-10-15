@@ -1,5 +1,56 @@
 use super::*;
 
+pub(crate) fn synthetic_created() -> String {
+    serde_json::json!({"type":"response.created", "response":{"id":"resp_synthetic"}}).to_string()
+}
+
+pub(crate) fn synthetic_delta(ordinal: usize) -> String {
+    assert!((1..=400).contains(&ordinal));
+    let mut event = serde_json::json!({"type":"response.output_text.delta", "item_id":"synthetic_item",
+        "output_index":0, "content_index":0, "sequence_number":ordinal,
+        "delta":format!("{ordinal:06}"), "padding":""});
+    let padding = 199 - event.to_string().len();
+    event["padding"] = serde_json::Value::String("x".repeat(padding));
+    let text = event.to_string();
+    assert_eq!(text.len(), 199);
+    text
+}
+
+pub(crate) fn synthetic_completed() -> String {
+    synthetic_completed_through(400)
+}
+
+pub(super) fn synthetic_completed_through(last: usize) -> String {
+    let text: String = (1..=last).map(|ordinal| format!("{ordinal:06}")).collect();
+    serde_json::json!({"type":"response.completed", "response":{"id":"resp_synthetic", "output":[
+        {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]}]}})
+    .to_string()
+}
+
+pub(crate) fn finite_warning_capture() -> (
+    tracing::Dispatch,
+    tracing::subscriber::DefaultGuard,
+    impl Fn() -> usize,
+) {
+    let keepalive = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let capture = OverflowLogCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+    (keepalive, guard, move || {
+        capture
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|fields| {
+                fields
+                    .get("message")
+                    .is_some_and(|message| message.contains("ws_pump_inbound_overflow"))
+            })
+            .count()
+    })
+}
+
 pub(super) fn test_diagnostic_pump_state(
     enabled: bool,
 ) -> (OwnedPumpState, mpsc::Receiver<InboundEnvelope>) {
@@ -43,26 +94,6 @@ pub(super) fn empty_close_metadata() -> UpstreamCloseMetadata {
         reason: None,
         error: None,
     }
-}
-
-pub(super) fn terminal_observation_cases() -> [UpstreamTerminalState; 3] {
-    [
-        UpstreamTerminalState::Closed(empty_close_metadata()),
-        UpstreamTerminalState::LivenessTimeout(UpstreamLivenessTimeout {
-            cause: UpstreamLivenessTimeoutCause::WriteDeadline,
-            timeout: Duration::from_secs(1),
-            elapsed: Duration::from_secs(1),
-            outbound_kind: Some(UpstreamOutboundKind::Text),
-        }),
-        UpstreamTerminalState::InboundBufferOverflow(InboundBufferOverflow {
-            cause: InboundBufferOverflowCause::MessageCount,
-            queued_messages: 1,
-            queued_bytes: 1,
-            incoming_bytes: 1,
-            max_messages: 1,
-            max_bytes: 1,
-        }),
-    ]
 }
 
 pub(super) fn assert_terminal_observation_freezes(

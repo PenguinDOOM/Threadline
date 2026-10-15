@@ -17,6 +17,12 @@ mod diagnostics;
 pub(crate) use diagnostics::ResponseState;
 use diagnostics::*;
 pub(crate) use diagnostics::{ConsumerPhase, ResponseEvent};
+#[cfg(test)]
+pub(crate) use tests::fixtures::{
+    finite_warning_capture, synthetic_completed, synthetic_created, synthetic_delta,
+};
+#[cfg(test)]
+pub(crate) use tests::{FiniteTrace, finite_drive, finite_read_barrier, finite_send};
 
 use std::sync::{Arc, Mutex as StdMutex};
 

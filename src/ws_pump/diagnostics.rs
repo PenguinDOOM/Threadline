@@ -79,6 +79,8 @@ pub(super) struct ResponseObservation {
     queued_bytes: usize,
     queue_messages_high_water: usize,
     queue_bytes_high_water: usize,
+    #[cfg(test)]
+    trace: Option<FiniteTrace>,
 }
 
 #[derive(Clone)]
@@ -87,6 +89,23 @@ pub(super) struct ResponseDiagnostics {
 }
 
 impl ResponseObservation {
+    #[cfg(test)]
+    fn trace_event(&self, kind: &'static str, bytes: Option<usize>) {
+        if let Some(trace) = &self.trace {
+            trace.event(
+                kind,
+                None,
+                bytes,
+                Some((
+                    self.queued_messages,
+                    self.unclassified,
+                    self.queue_messages_high_water,
+                )),
+                None,
+            );
+        }
+    }
+
     fn snapshot(&self) -> ResponseState {
         if self.ambiguous || self.unclassified != 0 {
             ResponseState::Unknown
@@ -190,6 +209,8 @@ impl CloseDiagnostics {
                         queued_bytes: 0,
                         queue_messages_high_water: 0,
                         queue_bytes_high_water: 0,
+                        #[cfg(test)]
+                        trace: None,
                     }))
                 }),
             },
@@ -210,6 +231,55 @@ impl CloseDiagnostics {
 }
 
 impl ResponseDiagnostics {
+    #[cfg(test)]
+    pub(super) fn test_trace(&self) -> Option<FiniteTrace> {
+        self.record
+            .as_ref()
+            .and_then(|record| record.lock().unwrap().trace.clone())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_trace_payload(&self, payload: &str) {
+        if let Some(trace) = self.test_trace() {
+            let event: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let ordinal = match event["type"].as_str().unwrap() {
+                "response.created" => 0,
+                "response.completed" => 401,
+                "response.output_text.delta" => event["sequence_number"].as_u64().unwrap() as usize,
+                _ => panic!("unexpected finite synthetic event"),
+            };
+            trace.event(
+                "rx",
+                Some(ordinal),
+                Some(payload.len()),
+                Some(self.test_queue_sample()),
+                None,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_set_trace(&self, trace: FiniteTrace) {
+        self.record.as_ref().unwrap().lock().unwrap().trace = Some(trace);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_queue_sample(&self) -> (usize, usize, usize) {
+        let record = self.record.as_ref().unwrap().lock().unwrap();
+        (
+            record.queued_messages,
+            record.unclassified,
+            record.queue_messages_high_water,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_trace_event(&self, kind: &'static str, bytes: Option<usize>) {
+        if let Some(record) = &self.record {
+            record.lock().unwrap().trace_event(kind, bytes);
+        }
+    }
+
     pub(super) fn record_consumer_phase(
         &self,
         terminal: &Arc<StdMutex<UpstreamTerminalState>>,
@@ -252,6 +322,8 @@ impl ResponseDiagnostics {
             .max(response.queued_messages);
         response.queue_bytes_high_water =
             response.queue_bytes_high_water.max(response.queued_bytes);
+        #[cfg(test)]
+        response.trace_event("enqueue", Some(bytes));
         Ok(())
     }
 
@@ -264,6 +336,8 @@ impl ResponseDiagnostics {
             response.queued_messages = response.queued_messages.saturating_sub(1);
             response.queued_bytes = response.queued_bytes.saturating_sub(bytes);
             response.last_dequeue_at = Some(Instant::now());
+            #[cfg(test)]
+            response.trace_event("dequeue", Some(bytes));
         });
     }
 
@@ -349,6 +423,8 @@ impl ResponseDiagnostics {
                 ResponseEvent::Progress => response.state,
                 ResponseEvent::Unknown => ResponseState::Unknown,
             };
+            #[cfg(test)]
+            response.trace_event("classify", None);
         });
     }
 

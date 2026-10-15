@@ -1,5 +1,41 @@
 use super::*;
 
+fn owned_pump_state(
+    inbound_tx: mpsc::Sender<InboundEnvelope>,
+    byte_budget: Arc<Semaphore>,
+    limits: UpstreamInboundLimits,
+    terminal_state: Arc<StdMutex<UpstreamTerminalState>>,
+    watchdog_policy: UpstreamWatchdogPolicy,
+    diagnostics: CloseDiagnostics,
+) -> OwnedPumpState {
+    OwnedPumpState {
+        inbound_tx,
+        byte_budget,
+        limits,
+        terminal_state,
+        watchdog_policy,
+        diagnostics,
+    }
+}
+
+fn spawn_pump<S>(
+    stream: WebSocketStream<S>,
+    outbound_rx: mpsc::Receiver<OutboundCommand>,
+    state: OwnedPumpState,
+    ping_interval: Duration,
+    #[cfg(test)] trace: Option<FiniteTrace>,
+) -> JoinHandle<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let pump = run_pump(stream, outbound_rx, state, ping_interval);
+    #[cfg(not(test))]
+    let task = tokio::spawn(pump);
+    #[cfg(test)]
+    let task = tokio::spawn(super::tests::observe_pump_future(pump, trace));
+    task
+}
+
 impl LiveUpstreamWebSocket {
     pub fn from_stream<S>(stream: WebSocketStream<S>) -> Self
     where
@@ -113,19 +149,21 @@ impl LiveUpstreamWebSocket {
         #[cfg(test)]
         let test_diagnostics = diagnostics.clone();
 
-        let task = tokio::spawn(run_pump(
+        let task = spawn_pump(
             stream,
             outbound_rx,
-            OwnedPumpState {
+            owned_pump_state(
                 inbound_tx,
                 byte_budget,
                 limits,
-                terminal_state: Arc::clone(&terminal_state),
+                Arc::clone(&terminal_state),
                 watchdog_policy,
                 diagnostics,
-            },
+            ),
             ping_interval,
-        ));
+            #[cfg(test)]
+            test_diagnostics.response.test_trace(),
+        );
 
         Self {
             outbound_tx,
@@ -336,6 +374,11 @@ impl LiveUpstreamWebSocket {
         self.terminal_error()?;
         let envelope = self.inbound_rx.lock().await.recv().await;
         if let Some(envelope) = &envelope {
+            #[cfg(test)]
+            if !matches!(self.terminal_state(), UpstreamTerminalState::Open) {
+                self.response_diagnostics()
+                    .test_trace_event("terminal_dequeue", Some(envelope.payload.len()));
+            }
             self.response_diagnostics()
                 .record_dequeue(&self.terminal_state, envelope.payload.len());
         }

@@ -91,6 +91,12 @@ pub(super) fn record_inbound_overflow(
     ) {
         return;
     }
+    #[cfg(test)]
+    diagnostics
+        .response
+        .test_trace_event("reject", Some(overflow.incoming_bytes));
+    #[cfg(test)]
+    diagnostics.response.test_trace_event("terminal", None);
     tracing::warn!(
         overflow_cause = ?overflow.cause,
         queued_messages = overflow.queued_messages,

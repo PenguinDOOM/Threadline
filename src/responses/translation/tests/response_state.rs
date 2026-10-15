@@ -2,13 +2,30 @@ use super::lifecycle::{armed_followup_lease, followup_stream_state};
 use super::*;
 
 use crate::responses::translation::{progression, receive, recovery};
+use crate::ws_pump::{
+    FiniteTrace, finite_drive, finite_read_barrier, finite_send, finite_warning_capture,
+    synthetic_completed, synthetic_created, synthetic_delta,
+};
 use crate::ws_pump::{ResponseState, UpstreamInboundLimits, UpstreamWatchdogPolicy};
 use futures_util::SinkExt;
 use tokio::io::{DuplexStream, duplex};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
+#[path = "response_state_overflow.rs"]
+mod overflow;
+
 async fn diagnostic_stream_pair() -> (
+    Arc<LiveUpstreamWebSocket>,
+    ResponseStreamState,
+    WebSocketStream<DuplexStream>,
+) {
+    diagnostic_stream_pair_with_trace(None).await
+}
+
+async fn diagnostic_stream_pair_with_trace(
+    trace: Option<FiniteTrace>,
+) -> (
     Arc<LiveUpstreamWebSocket>,
     ResponseStreamState,
     WebSocketStream<DuplexStream>,
@@ -16,12 +33,15 @@ async fn diagnostic_stream_pair() -> (
     let (client_io, server_io) = duplex(8192);
     let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
     let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
-    let upstream = Arc::new(LiveUpstreamWebSocket::from_stream_with_close_diagnostics(
-        client,
-        UpstreamWatchdogPolicy::DEFAULT,
-        UpstreamInboundLimits::DEFAULT,
-        true,
-    ));
+    let upstream = Arc::new(match trace {
+        Some(trace) => LiveUpstreamWebSocket::test_traced_stream(client, trace),
+        None => LiveUpstreamWebSocket::from_stream_with_close_diagnostics(
+            client,
+            UpstreamWatchdogPolicy::DEFAULT,
+            UpstreamInboundLimits::DEFAULT,
+            true,
+        ),
+    });
     let registry = Arc::new(RetainedSessionRegistry::new(1));
     let lease = armed_followup_lease(&registry, Arc::clone(&upstream)).await;
     let state = followup_stream_state(Arc::clone(&upstream), lease);
@@ -49,6 +69,15 @@ async fn diagnostic_read_barrier(server: &mut WebSocketStream<DuplexStream>) {
         server.next().await.unwrap().unwrap(),
         Message::Pong(vec![7])
     );
+}
+
+fn finite_sse_value(bytes: &[u8]) -> serde_json::Value {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let data = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    serde_json::from_str(data).unwrap()
 }
 
 #[tokio::test(start_paused = true)]

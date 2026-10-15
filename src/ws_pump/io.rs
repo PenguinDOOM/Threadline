@@ -159,6 +159,8 @@ fn handle_inbound_frame(
                 .diagnostics
                 .response
                 .record_unclassified(pump_state.terminal_state);
+            #[cfg(test)]
+            pump_state.diagnostics.response.test_trace_payload(&text);
             enqueue_inbound_payload(text.to_string(), pump_state)
         }
         Message::Binary(bytes) => {
