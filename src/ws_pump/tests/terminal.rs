@@ -1,0 +1,510 @@
+use super::*;
+
+#[tokio::test]
+async fn policy_close_rejects_outbound_send_before_enqueue() {
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+    let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+    let pump = LiveUpstreamWebSocket {
+        outbound_tx,
+        inbound_rx: Mutex::new(inbound_rx),
+        terminal_state: Arc::new(StdMutex::new(UpstreamTerminalState::Closed(
+            UpstreamCloseMetadata {
+                code: Some(1008),
+                reason: Some("private policy detail".to_string()),
+                error: None,
+            },
+        ))),
+        task: tokio::spawn(std::future::pending()),
+        after_text_send: None,
+        pending_text_send: None,
+        diagnostics: CloseDiagnostics::new(false),
+    };
+
+    assert_eq!(
+        pump.send_response_create_text("{}".to_string()).await,
+        Err(UpstreamWebSocketError::OutboundQueueClosed)
+    );
+    assert!(outbound_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn policy_close_classifies_send_blocked_during_enqueue() {
+    let (outbound_tx, outbound_rx) = mpsc::channel(1);
+    outbound_tx
+        .try_send(OutboundCommand::Text("queued".to_string()))
+        .expect("fill outbound queue");
+    let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+    let terminal_state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    let pump = LiveUpstreamWebSocket {
+        outbound_tx,
+        inbound_rx: Mutex::new(inbound_rx),
+        terminal_state: Arc::clone(&terminal_state),
+        task: tokio::spawn(std::future::pending()),
+        after_text_send: None,
+        pending_text_send: None,
+        diagnostics: CloseDiagnostics::new(false),
+    };
+    let send = pump.send_response_create_text("{}".to_string());
+    tokio::pin!(send);
+    assert!(futures_util::poll!(&mut send).is_pending());
+
+    *terminal_state.lock().unwrap() = UpstreamTerminalState::Closed(UpstreamCloseMetadata {
+        code: Some(1008),
+        reason: Some("private policy detail".to_string()),
+        error: None,
+    });
+    drop(outbound_rx);
+
+    assert_eq!(send.await, Err(UpstreamWebSocketError::OutboundQueueClosed));
+}
+
+#[test]
+fn peer_close_codes_preserve_distinct_typed_causes_and_first_terminal() {
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    for (code, expected) in [
+        (1000, UpstreamCloseCause::Normal),
+        (1012, UpstreamCloseCause::ServiceRestart),
+        (1008, UpstreamCloseCause::PolicyViolation),
+    ] {
+        let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+        let mut diagnostics = CloseDiagnostics::new(true);
+        assert!(!handle_test_inbound(
+            Some(Ok(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(code),
+                reason: "private reason".into(),
+            })))),
+            &state,
+            &mut diagnostics
+        ));
+        let first = state.lock().unwrap().clone();
+        assert_eq!(first.close_cause(), Some(expected));
+        assert!(!handle_test_inbound(None, &state, &mut diagnostics));
+        assert_eq!(*state.lock().unwrap(), first);
+        assert_eq!(diagnostics.capture().calls, 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_control_flush_does_not_replace_successful_send_times() {
+    let (client, _server) = raw_pair(1024).await;
+    let (mut writer, mut reader) = client.split();
+    let (mut owned, _inbound_rx) = test_diagnostic_pump_state(true);
+    let mut pump_state = owned.borrowed();
+    for (message, kind) in [
+        (
+            Message::Text("text".to_string()),
+            UpstreamOutboundKind::Text,
+        ),
+        (Message::Ping(vec![1]), UpstreamOutboundKind::Ping),
+    ] {
+        advance(Duration::from_millis(100)).await;
+        assert!(
+            drive_test_write_operation(&mut writer, &mut reader, &mut pump_state, message, kind)
+                .await
+        );
+        let completed_at = pump_state.diagnostics.last_tx_at;
+        let ping_at = pump_state.diagnostics.last_ping_at;
+        advance(Duration::from_millis(50)).await;
+        assert!(
+            drive_test_write_operation(
+                &mut writer,
+                &mut reader,
+                &mut pump_state,
+                Message::Pong(Vec::new()),
+                UpstreamOutboundKind::ControlFlush
+            )
+            .await
+        );
+        assert_eq!(pump_state.diagnostics.last_tx_at, completed_at);
+        assert_eq!(pump_state.diagnostics.last_ping_at, ping_at);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_pending_and_timed_out_writes_preserve_prior_activity() {
+    for kind in [UpstreamOutboundKind::Text, UpstreamOutboundKind::Ping] {
+        let (client, _server, _, _, _) = write_gate_pair(1024, None).await;
+        let (mut writer, mut reader) = client.split();
+        let (mut owned, _inbound_rx) = test_diagnostic_pump_state(true);
+        let previous_at = Instant::now();
+        owned.diagnostics.last_tx_at = Some(previous_at);
+        owned.diagnostics.last_ping_at = Some(previous_at);
+        owned.watchdog_policy =
+            UpstreamWatchdogPolicy::new(Duration::from_secs(5), Duration::from_secs(2)).unwrap();
+        let mut pump_state = owned.borrowed();
+        advance(Duration::from_millis(100)).await;
+        {
+            let write = drive_test_write_operation(
+                &mut writer,
+                &mut reader,
+                &mut pump_state,
+                if kind == UpstreamOutboundKind::Text {
+                    Message::Text("pending-secret".to_string())
+                } else {
+                    Message::Ping(b"pending-secret".to_vec())
+                },
+                kind,
+            );
+            pin_mut!(write);
+            assert!(futures_util::poll!(&mut write).is_pending());
+            advance(Duration::from_millis(100)).await;
+            assert!(futures_util::poll!(&mut write).is_pending());
+            advance(Duration::from_millis(1900)).await;
+            assert!(!write.await);
+        }
+        assert_eq!(owned.diagnostics.last_tx_at, Some(previous_at));
+        assert_eq!(owned.diagnostics.last_ping_at, Some(previous_at));
+        assert_eq!(owned.diagnostics.last_rx, None);
+        let output = String::from_utf8(owned.diagnostics.capture().bytes.clone()).unwrap();
+        assert!(output.contains("connection_age_ms=2100 last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=2100 last_ping_age_ms=2100 last_pong_age_ms=-"));
+        assert!(output.contains("cause=write_deadline timeout_ms=2000 elapsed_ms=2000"));
+        assert!(!output.contains("secret"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_timeout_and_overflow_remain_sticky_and_warn_once() {
+    let _no_subscriber_dispatch =
+        tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let events = OverflowLogCapture::default();
+    let subscriber = tracing_subscriber::registry().with(events.clone());
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    for overflow_first in [false, true] {
+        assert_sticky_terminal_diagnostics(overflow_first).await;
+    }
+    assert_timeout_and_overflow_events(&events);
+}
+
+async fn assert_sticky_terminal_diagnostics(overflow_first: bool) {
+    let diagnostics = CloseDiagnostics::new(true);
+    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    let limits = UpstreamInboundLimits::new(1, 4).unwrap();
+    let (sender, _receiver) = mpsc::channel(1);
+    let budget = Arc::new(Semaphore::new(4));
+    let overflow = || {
+        assert!(record_transport_overflow(
+            &state,
+            &sender,
+            &budget,
+            limits,
+            &TungsteniteError::Capacity(CapacityError::MessageTooLong {
+                size: 126,
+                max_size: 125
+            }),
+            &diagnostics
+        ));
+    };
+    let liveness_timeout = || {
+        record_liveness_timeout(
+            &state,
+            UpstreamLivenessTimeoutCause::WriteDeadline,
+            Duration::from_secs(7),
+            Duration::from_secs(8),
+            Some(UpstreamOutboundKind::Text),
+            &diagnostics,
+        );
+    };
+    advance(Duration::from_millis(1500)).await;
+    if overflow_first {
+        overflow();
+    } else {
+        liveness_timeout();
+    }
+    let first = state.lock().unwrap().clone();
+    assert_eq!(
+        matches!(first, UpstreamTerminalState::InboundBufferOverflow(_)),
+        overflow_first
+    );
+    advance(Duration::from_secs(2)).await;
+    overflow();
+    liveness_timeout();
+    assert_fallback_preserves_terminal(&state, first, &diagnostics, overflow_first);
+}
+
+fn assert_fallback_preserves_terminal(
+    state: &Arc<StdMutex<UpstreamTerminalState>>,
+    first: UpstreamTerminalState,
+    diagnostics: &CloseDiagnostics,
+    overflow_first: bool,
+) {
+    record_close(
+        state,
+        empty_close_metadata(),
+        UpstreamCloseSource::PumpExitFallback,
+        diagnostics,
+    );
+    assert_eq!(*state.lock().unwrap(), first);
+    assert_sticky_terminal_output(diagnostics, overflow_first);
+}
+
+fn assert_sticky_terminal_output(diagnostics: &CloseDiagnostics, overflow_first: bool) {
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    let output = String::from_utf8(capture.bytes.clone()).unwrap();
+    assert!(output.contains("connection_age_ms=1500 last_rx_age_ms=- last_rx_kind=- last_tx_age_ms=- last_ping_age_ms=- last_pong_age_ms=-"));
+    assert!(!output.contains("source="));
+    if overflow_first {
+        assert!(output.contains("terminal=inbound_buffer_overflow"));
+        assert!(output.contains("cause=transport_size queued_messages=0 queued_bytes=0 incoming_bytes=126 max_messages=1 max_bytes=4"));
+    } else {
+        assert!(output.contains("terminal=liveness_timeout"));
+        assert!(
+            output.contains(
+                "cause=write_deadline timeout_ms=7000 elapsed_ms=8000 outbound_kind=text"
+            )
+        );
+    }
+}
+
+fn assert_timeout_and_overflow_events(events: &OverflowLogCapture) {
+    let events = events.0.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].get("cause"), Some(&"WriteDeadline".to_string()));
+    assert_eq!(events[0].get("timeout_ms"), Some(&"7000".to_string()));
+    assert_eq!(events[0].get("elapsed_ms"), Some(&"8000".to_string()));
+    assert_eq!(
+        events[0].get("outbound_kind"),
+        Some(&"Some(Text)".to_string())
+    );
+    assert_eq!(
+        events[1].get("overflow_cause"),
+        Some(&"TransportSize".to_string())
+    );
+    assert_eq!(events[1].get("incoming_bytes"), Some(&"126".to_string()));
+    assert_eq!(events[1].get("recoverable"), Some(&"false".to_string()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_first_commit_freezes_lifetime_and_unlocks_before_writing() {
+    let mut diagnostics = CloseDiagnostics::new(true);
+    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    diagnostics.capture().terminal_state = Some(Arc::clone(&state));
+    advance(Duration::from_millis(200)).await;
+    diagnostics.record_write(UpstreamOutboundKind::Ping);
+    advance(Duration::from_millis(50)).await;
+    let received_at = diagnostics.record_rx_kind(RxKind::Pong);
+    diagnostics.record_pong(received_at);
+    advance(Duration::from_millis(984)).await;
+    let metadata = UpstreamCloseMetadata {
+        code: Some(1001),
+        reason: Some("going away".to_string()),
+        error: None,
+    };
+    assert!(commit_terminal(
+        &state,
+        UpstreamTerminalState::Closed(metadata.clone()),
+        &diagnostics,
+        Some(UpstreamCloseSource::PeerCloseFrame),
+        None
+    ));
+    let first_bytes = diagnostics.capture().bytes.clone();
+    advance(Duration::from_secs(10)).await;
+    diagnostics.record_write(UpstreamOutboundKind::Ping);
+    let received_at = diagnostics.record_rx_kind(RxKind::Pong);
+    diagnostics.record_pong(received_at);
+    for inbound in [None, Some(Err(TungsteniteError::ConnectionClosed))] {
+        assert!(!handle_test_inbound(inbound, &state, &mut diagnostics));
+    }
+    assert!(!commit_terminal(
+        &state,
+        UpstreamTerminalState::Closed(outbound_channel_closed_metadata()),
+        &diagnostics,
+        Some(UpstreamCloseSource::PumpExitFallback),
+        None
+    ));
+    assert_eq!(
+        *state.lock().unwrap(),
+        UpstreamTerminalState::Closed(metadata)
+    );
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    assert_eq!(capture.bytes, first_bytes);
+    assert_eq!(
+        String::from_utf8(capture.bytes.clone()).unwrap(),
+        "[threadline] websocket closed source=peer_close_frame code=1001 reason=going away error=- protocol_kind=- connection_age_ms=1234 last_rx_age_ms=984 last_rx_kind=pong last_tx_age_ms=1034 last_ping_age_ms=1034 last_pong_age_ms=984 response_state=not_started last_classified_response_state=not_started unclassified_data_count=0 response_ambiguous=false consumer_phase=not_started last_consumer_poll_age_ms=- last_dequeue_age_ms=- internal_tool_age_ms=- queue_messages_high_water=0 queue_bytes_high_water=0 last_data_age_ms=- io_kind=- raw_os_error=-\n"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_diagnostics_disabled_never_calls_writer_and_preserves_metadata() {
+    let (mut owned, _inbound_rx) = test_diagnostic_pump_state(false);
+    assert_disabled_activity(&mut owned.borrowed()).await;
+    let diagnostics = &owned.diagnostics;
+    let state = &owned.terminal_state;
+    assert_eq!(diagnostics.last_rx, None);
+    assert_eq!(diagnostics.last_tx_at, None);
+    assert_eq!(diagnostics.last_ping_at, None);
+    assert_eq!(diagnostics.last_pong_at, None);
+    let metadata = UpstreamCloseMetadata {
+        code: Some(1001),
+        reason: Some("private-reason".to_string()),
+        error: Some("private-error".to_string()),
+    };
+    assert!(commit_terminal(
+        state,
+        UpstreamTerminalState::Closed(metadata.clone()),
+        diagnostics,
+        Some(UpstreamCloseSource::ReadError),
+        None
+    ));
+    assert_eq!(
+        *state.lock().unwrap(),
+        UpstreamTerminalState::Closed(metadata)
+    );
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 0);
+    assert!(capture.bytes.is_empty());
+}
+
+async fn assert_disabled_activity(pump_state: &mut PumpState<'_>) {
+    let (client, _server) = raw_pair(1024).await;
+    let (mut writer, mut reader) = client.split();
+    for (message, kind) in [
+        (
+            Message::Text("text-secret".to_string()),
+            UpstreamOutboundKind::Text,
+        ),
+        (
+            Message::Ping(b"nonce-secret".to_vec()),
+            UpstreamOutboundKind::Ping,
+        ),
+    ] {
+        assert!(
+            drive_test_write_operation(&mut writer, &mut reader, pump_state, message, kind).await
+        );
+    }
+    let mut challenge = Some(PendingPongChallenge {
+        nonce: b"nonce-secret".to_vec(),
+        sent_at: Some(Instant::now()),
+        acknowledged_early: false,
+    });
+    assert!(handle_inbound_message(
+        Some(Ok(Message::Pong(b"nonce-secret".to_vec()))),
+        pump_state,
+        &mut challenge,
+        &mut false
+    ));
+    assert!(challenge.is_none());
+    assert!(handle_inbound_message(
+        Some(Ok(Message::Text("rx-secret".to_string()))),
+        pump_state,
+        &mut None,
+        &mut false
+    ));
+}
+
+#[test]
+fn close_diagnostics_failing_writer_does_not_retry_log_or_change_terminal() {
+    let diagnostics = CloseDiagnostics::new(true);
+    diagnostics.capture().fail = true;
+    let state = Arc::new(StdMutex::new(UpstreamTerminalState::Open));
+    let capture = OverflowLogCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let metadata = UpstreamCloseMetadata {
+        code: None,
+        reason: None,
+        error: None,
+    };
+    tracing::subscriber::with_default(subscriber, || {
+        assert!(commit_terminal(
+            &state,
+            UpstreamTerminalState::Closed(metadata.clone()),
+            &diagnostics,
+            Some(UpstreamCloseSource::PumpExitFallback),
+            None
+        ));
+        assert!(!commit_terminal(
+            &state,
+            UpstreamTerminalState::Closed(metadata.clone()),
+            &diagnostics,
+            Some(UpstreamCloseSource::StreamEof),
+            None
+        ));
+    });
+    assert_eq!(
+        *state.lock().unwrap(),
+        UpstreamTerminalState::Closed(metadata)
+    );
+    assert!(capture.0.lock().unwrap().is_empty());
+    let writer = diagnostics.capture();
+    assert_eq!(writer.calls, 1);
+    assert!(writer.bytes.is_empty());
+}
+
+#[tokio::test]
+async fn close_diagnostics_write_failure_uses_send_and_flush_paths_with_pending_reader() {
+    for outbound_kind in [
+        UpstreamOutboundKind::Text,
+        UpstreamOutboundKind::Ping,
+        UpstreamOutboundKind::ControlFlush,
+    ] {
+        assert_write_failure_diagnostics(outbound_kind).await;
+    }
+}
+
+async fn assert_write_failure_diagnostics(outbound_kind: UpstreamOutboundKind) {
+    let (client, _server, _, _, _) = flush_gate_pair(1024, true).await;
+    let (mut writer, mut reader) = client.split();
+    {
+        let read = reader.next();
+        pin_mut!(read);
+        assert!(
+            futures_util::poll!(read).is_pending(),
+            "read must be pending before the write error"
+        );
+    }
+    let (mut owned, _inbound_rx) = test_diagnostic_pump_state(true);
+    let previous_at = owned.diagnostics.started_at;
+    owned.diagnostics.last_tx_at = previous_at;
+    owned.diagnostics.last_ping_at = previous_at;
+    let mut pump_state = owned.borrowed();
+    let mut next_ping_due = Instant::now() + UPSTREAM_PING_INTERVAL;
+    assert!(
+        !timeout(
+            Duration::from_secs(2),
+            drive_write_operation(
+                &mut writer,
+                &mut reader,
+                &mut pump_state,
+                Message::Text("frame-secret".to_string()),
+                outbound_kind,
+                PumpLivenessState {
+                    pending_challenge: &mut None,
+                    control_flush_needed: &mut false,
+                    next_ping_due: &mut next_ping_due,
+                    ping_interval: UPSTREAM_PING_INTERVAL,
+                },
+            )
+        )
+        .await
+        .expect("write fails without waiting for a deadline")
+    );
+    assert_eq!(owned.diagnostics.last_tx_at, previous_at);
+    assert_eq!(owned.diagnostics.last_ping_at, previous_at);
+    assert_write_failure_terminal(&owned.terminal_state, &owned.diagnostics);
+}
+
+fn assert_write_failure_terminal(
+    state: &Arc<StdMutex<UpstreamTerminalState>>,
+    diagnostics: &CloseDiagnostics,
+) {
+    let first = state.lock().unwrap().clone();
+    assert!(
+        matches!(&first, UpstreamTerminalState::TransportClosed { cause: UpstreamCloseCause::Io, metadata: UpstreamCloseMetadata { code: None, reason: None, error: Some(error) } } if error.contains("write-secret"))
+    );
+    record_close(
+        state,
+        empty_close_metadata(),
+        UpstreamCloseSource::PumpExitFallback,
+        diagnostics,
+    );
+    assert_eq!(*state.lock().unwrap(), first);
+    let capture = diagnostics.capture();
+    assert_eq!(capture.calls, 1);
+    let output = String::from_utf8(capture.bytes.clone()).unwrap();
+    assert!(output.contains("source=write_error code=- reason=- error=io"));
+    assert!(output.contains("io_kind=broken_pipe raw_os_error=-"));
+    assert!(!output.contains("secret"));
+    assert!(!output.contains(['\r', '\x1b']));
+    assert_eq!(output.lines().count(), 1);
+}
