@@ -123,6 +123,10 @@ The pump owns continuous socket IO. Other code communicates with the pump throug
 
 The pump must support reading upstream frames, writing outbound upstream messages, replying to server Ping frames with Pong, forwarding Text/Binary frames into an inbound queue, accepting outbound Text/Ping/Close commands, recording close/error metadata, and running while a session is retained.
 
+After a Text or Binary frame is handled successfully, the pump consumes one unit of Tokio's shared cooperative task budget. This gives the runtime a scheduling opportunity during sustained inbound data processing; it does not guarantee that a particular consumer or other task runs next, nor does it impose a strict maximum number of frames per poll. The cooperative point is after the existing frame handling and state updates. Control frames and unsuccessful data handling do not consume an additional unit.
+
+This scheduling point does not wait for inbound capacity or change overflow handling. If a data frame cannot be enqueued within the configured limits, the pump still records the existing terminal overflow immediately; a consumer that has stopped polling can still allow the queue to fill and overflow. The per-connection defaults remain 256 messages and 16 MiB. While a write is in progress, the pump retains the existing write operation and its fixed deadline across cooperative scheduling; it does not restart or extend that deadline.
+
 ## Upstream connection establishment
 
 Upstream connection establishment is bounded by `--upstream-connect-timeout-secs` or `THREADLINE_UPSTREAM_CONNECT_TIMEOUT_SECS`. The default is `30` seconds, and startup accepts only integer values in the range `1..=3600`. CLI values take precedence over environment values. Zero, negative, non-integer, and out-of-range values are rejected during startup; the setting is not disableable and values are not clamped.

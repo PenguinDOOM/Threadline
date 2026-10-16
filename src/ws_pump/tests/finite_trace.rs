@@ -1,5 +1,5 @@
 use super::super::*;
-use super::fixtures::{synthetic_completed, synthetic_created, synthetic_delta};
+use super::fixtures::{synthetic_completed_through, synthetic_created, synthetic_delta};
 
 use futures_util::task::AtomicWaker;
 use std::pin::Pin;
@@ -298,14 +298,26 @@ pub(super) async fn finite_ready_pair(
     Arc<AtomicBool>,
     Arc<AtomicWaker>,
 ) {
+    let (io, open, reader) = finite_ready_io(trace, 400);
+    (
+        WebSocketStream::from_raw_socket(io, Role::Client, None).await,
+        open,
+        reader,
+    )
+}
+
+pub(super) fn finite_ready_io(
+    trace: &FiniteTrace,
+    deltas: usize,
+) -> (ReadyInputIo, Arc<AtomicBool>, Arc<AtomicWaker>) {
     use tokio_tungstenite::tungstenite::protocol::frame::{
         Frame,
         coding::{Data, OpCode},
     };
     let mut encoded = Vec::new();
     for text in std::iter::once(synthetic_created())
-        .chain((1..=400).map(synthetic_delta))
-        .chain(std::iter::once(synthetic_completed()))
+        .chain((1..=deltas).map(synthetic_delta))
+        .chain(std::iter::once(synthetic_completed_through(deltas)))
     {
         Frame::message(text.into_bytes(), OpCode::Data(Data::Text), true)
             .format(&mut encoded)
@@ -322,11 +334,7 @@ pub(super) async fn finite_ready_pair(
         reader: reader.clone(),
         writes: Vec::new(),
     };
-    (
-        WebSocketStream::from_raw_socket(io, Role::Client, None).await,
-        open,
-        reader,
-    )
+    (io, open, reader)
 }
 
 pub(crate) async fn finite_drive<F: std::future::Future>(future: F) -> F::Output {

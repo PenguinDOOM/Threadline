@@ -39,7 +39,7 @@ where
                     control_flush_needed: liveness_state.control_flush_needed,
                     next_ping_due: liveness_state.next_ping_due,
                     ping_interval: liveness_state.ping_interval,
-                }) {
+                }).await {
                     return false;
                 }
             }

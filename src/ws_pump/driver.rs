@@ -237,7 +237,7 @@ where
         WaitingEvent::Timer => true,
         WaitingEvent::Inbound(inbound) => {
             schedule.prefer_inbound = false;
-            handle_inbound_and_schedule(inbound, pump_state, schedule.liveness())
+            handle_inbound_and_schedule(inbound, pump_state, schedule.liveness()).await
         }
         WaitingEvent::Outbound(Some(command)) => {
             schedule.prefer_inbound = true;
@@ -274,11 +274,12 @@ where
     }
 }
 
-pub(super) fn handle_inbound_and_schedule(
+pub(super) async fn handle_inbound_and_schedule(
     inbound: Option<Result<Message, TungsteniteError>>,
     pump_state: &mut PumpState<'_>,
     liveness_state: PumpLivenessState<'_>,
 ) -> bool {
+    let is_data = matches!(inbound, Some(Ok(Message::Text(_) | Message::Binary(_))));
     let challenge_was_pending = liveness_state.pending_challenge.is_some();
     if !handle_inbound_message(
         inbound,
@@ -290,6 +291,9 @@ pub(super) fn handle_inbound_and_schedule(
     }
     if challenge_was_pending && liveness_state.pending_challenge.is_none() {
         *liveness_state.next_ping_due = Instant::now() + liveness_state.ping_interval;
+    }
+    if is_data {
+        tokio::task::coop::consume_budget().await;
     }
     true
 }

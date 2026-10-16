@@ -2,6 +2,7 @@ mod diagnostics;
 mod finite_trace;
 pub(crate) mod fixtures;
 mod inbound;
+mod inbound_cooperative;
 mod inbound_ready;
 mod ownership;
 mod peer;
