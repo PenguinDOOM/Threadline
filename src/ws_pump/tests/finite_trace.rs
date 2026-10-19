@@ -856,7 +856,7 @@ impl FiniteTrace {
         let mut removed = (0u64, 0u64);
         for record in &trace.records {
             let encoded = serde_json::to_string(record).unwrap();
-            assert!(encoded.len() + 1 <= 506);
+            assert!(encoded.len() < 506);
             assert!(!encoded.contains("secret"));
             if record[4] == Some(11) {
                 observed[record[21].unwrap() as usize - 1] += 1;
