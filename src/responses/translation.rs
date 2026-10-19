@@ -394,14 +394,27 @@ pub(super) fn response_stream(
     state: ResponseStreamState,
 ) -> impl futures_util::Stream<Item = Result<Bytes, Infallible>> {
     state.observe_consumer_phase(ConsumerPhase::AwaitingDownstreamPoll);
+    #[cfg(test)]
+    let measurement = state
+        .upstream
+        .as_ref()
+        .and_then(|upstream| upstream.test_trace());
     stream::unfold(
         (state, InternalToolLedger::default()),
-        |(mut state, mut ledger)| {
+        move |(mut state, mut ledger)| {
+            #[cfg(test)]
+            let measurement = measurement.clone();
             let upstream = state.upstream.as_ref().map(Arc::downgrade);
             let progress = async move {
                 state.observe_consumer_phase(ConsumerPhase::ProcessingEvent);
                 loop {
-                    match next_stream_progress(&mut state, &mut ledger).await {
+                    let progress = next_stream_progress(&mut state, &mut ledger);
+                    #[cfg(test)]
+                    let progress = diagnostics::observe_measurement(
+                        crate::ws_pump::TraceOperation::Progress,
+                        progress,
+                    );
+                    match progress.await {
                         StreamProgress::Continue => continue,
                         StreamProgress::Yield(chunk) => {
                             state.observe_consumer_phase(ConsumerPhase::AwaitingDownstreamPoll);
@@ -412,14 +425,42 @@ pub(super) fn response_stream(
                 }
             };
             async move {
+                #[cfg(test)]
+                if let Some(measurement) = &measurement {
+                    measurement.event("next_poll", None, None, None, None);
+                }
                 tokio::pin!(progress);
-                futures_util::future::poll_fn(|context| {
+                let progress = futures_util::future::poll_fn(|context| {
                     if let Some(upstream) = upstream.as_ref().and_then(std::sync::Weak::upgrade) {
                         upstream.observe_consumer_poll();
                     }
                     std::future::Future::poll(progress.as_mut(), context)
-                })
-                .await
+                });
+                #[cfg(test)]
+                let progress = async {
+                    match &measurement {
+                        Some(measurement) => {
+                            measurement
+                                .observe_operation(crate::ws_pump::TraceOperation::Body, progress)
+                                .await
+                        }
+                        None => progress.await,
+                    }
+                };
+                let result = progress.await;
+                #[cfg(test)]
+                if let Some(measurement) = &measurement {
+                    measurement.event(
+                        if result.is_some() { "yield" } else { "eof" },
+                        None,
+                        result
+                            .as_ref()
+                            .map(|(chunk, _)| chunk.as_ref().unwrap().len()),
+                        None,
+                        None,
+                    );
+                }
+                result
             }
         },
     )

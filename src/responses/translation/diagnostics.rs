@@ -1,5 +1,16 @@
 use super::*;
 
+#[cfg(test)]
+pub(super) async fn observe_measurement<F: std::future::Future>(
+    operation: crate::ws_pump::TraceOperation,
+    future: F,
+) -> F::Output {
+    match crate::ws_pump::FiniteTrace::current() {
+        Some(trace) => trace.observe_operation(operation, future).await,
+        None => future.await,
+    }
+}
+
 pub(super) fn downstream_sse_trace_metadata(
     event: &Value,
     action: DownstreamTraceAction,

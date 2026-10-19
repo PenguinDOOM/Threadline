@@ -79,29 +79,76 @@ pub(super) struct ResponseObservation {
     queued_bytes: usize,
     queue_messages_high_water: usize,
     queue_bytes_high_water: usize,
-    #[cfg(test)]
-    trace: Option<FiniteTrace>,
+    traffic: TrafficObservation,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IntervalObservation {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+    saturated: bool,
+}
+
+impl IntervalObservation {
+    fn record(&mut self, previous: Option<Instant>, now: Instant) {
+        let Some(previous) = previous else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(previous).as_nanos();
+        let elapsed = u64::try_from(elapsed).unwrap_or_else(|_| {
+            self.saturated = true;
+            u64::MAX
+        });
+        saturating_accumulate(&mut self.count, 1, &mut self.saturated);
+        saturating_accumulate(&mut self.total_ns, elapsed, &mut self.saturated);
+        self.max_ns = self.max_ns.max(elapsed);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TrafficObservation {
+    enqueued_messages: u64,
+    enqueued_bytes: u64,
+    dequeued_messages: u64,
+    dequeued_bytes: u64,
+    saturated: bool,
+    consumer_poll_gap: IntervalObservation,
+    dequeue_gap: IntervalObservation,
+}
+
+fn saturating_accumulate(value: &mut u64, increment: u64, saturated: &mut bool) {
+    match value.checked_add(increment) {
+        Some(sum) => *value = sum,
+        None => {
+            *value = u64::MAX;
+            *saturated = true;
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(super) struct ResponseDiagnostics {
     pub(super) record: Option<Arc<StdMutex<ResponseObservation>>>,
+    #[cfg(test)]
+    trace: Option<Arc<std::sync::OnceLock<FiniteTrace>>>,
 }
 
 impl ResponseObservation {
     #[cfg(test)]
-    fn trace_event(&self, kind: &'static str, bytes: Option<usize>) {
-        if let Some(trace) = &self.trace {
-            trace.event(
+    fn trace_event(&self, trace: Option<FiniteTrace>, kind: &'static str, bytes: usize) {
+        if let Some(trace) = trace {
+            trace.queue_sample(
                 kind,
-                None,
                 bytes,
-                Some((
+                Some([
                     self.queued_messages,
-                    self.unclassified,
+                    self.queued_bytes,
                     self.queue_messages_high_water,
-                )),
-                None,
+                    self.queue_bytes_high_water,
+                    self.unclassified,
+                ]),
+                true,
             );
         }
     }
@@ -181,7 +228,10 @@ impl CloseDiagnostics {
         last_ping_at: None,
         last_pong_at: None,
         last_data_at: None,
-        response: ResponseDiagnostics { record: None },
+        response: ResponseDiagnostics {
+            record: None,
+            trace: None,
+        },
         #[cfg(test)]
         capture: None,
     };
@@ -209,10 +259,11 @@ impl CloseDiagnostics {
                         queued_bytes: 0,
                         queue_messages_high_water: 0,
                         queue_bytes_high_water: 0,
-                        #[cfg(test)]
-                        trace: None,
+                        traffic: TrafficObservation::default(),
                     }))
                 }),
+                #[cfg(test)]
+                trace: Some(Arc::new(std::sync::OnceLock::new())),
             },
             #[cfg(test)]
             capture: Some(Arc::new(StdMutex::new(TestDiagnosticWriter::default()))),
@@ -233,24 +284,15 @@ impl CloseDiagnostics {
 impl ResponseDiagnostics {
     #[cfg(test)]
     pub(super) fn test_trace(&self) -> Option<FiniteTrace> {
-        self.record
-            .as_ref()
-            .and_then(|record| record.lock().unwrap().trace.clone())
+        self.trace.as_ref().and_then(|trace| trace.get().cloned())
     }
 
     #[cfg(test)]
     pub(super) fn test_trace_payload(&self, payload: &str) {
         if let Some(trace) = self.test_trace() {
-            let event: serde_json::Value = serde_json::from_str(payload).unwrap();
-            let ordinal = match event["type"].as_str().unwrap() {
-                "response.created" => 0,
-                "response.completed" => 401,
-                "response.output_text.delta" => event["sequence_number"].as_u64().unwrap() as usize,
-                _ => panic!("unexpected finite synthetic event"),
-            };
             trace.event(
                 "rx",
-                Some(ordinal),
+                None,
                 Some(payload.len()),
                 Some(self.test_queue_sample()),
                 None,
@@ -260,12 +302,17 @@ impl ResponseDiagnostics {
 
     #[cfg(test)]
     pub(super) fn test_set_trace(&self, trace: FiniteTrace) {
-        self.record.as_ref().unwrap().lock().unwrap().trace = Some(trace);
+        if trace.enabled() {
+            assert!(self.trace.as_ref().unwrap().set(trace).is_ok());
+        }
     }
 
     #[cfg(test)]
     pub(super) fn test_queue_sample(&self) -> (usize, usize, usize) {
-        let record = self.record.as_ref().unwrap().lock().unwrap();
+        let Some(record) = &self.record else {
+            return (0, 0, 0);
+        };
+        let record = record.lock().unwrap();
         (
             record.queued_messages,
             record.unclassified,
@@ -275,8 +322,14 @@ impl ResponseDiagnostics {
 
     #[cfg(test)]
     pub(super) fn test_trace_event(&self, kind: &'static str, bytes: Option<usize>) {
-        if let Some(record) = &self.record {
-            record.lock().unwrap().trace_event(kind, bytes);
+        if let Some(trace) = self.test_trace() {
+            trace.event(
+                kind,
+                None,
+                bytes,
+                self.record.as_ref().map(|_| self.test_queue_sample()),
+                None,
+            );
         }
     }
 
@@ -296,7 +349,12 @@ impl ResponseDiagnostics {
 
     pub(super) fn record_consumer_poll(&self, terminal: &Arc<StdMutex<UpstreamTerminalState>>) {
         self.observe(terminal, |response| {
-            response.last_consumer_poll_at = Some(Instant::now());
+            let now = Instant::now();
+            response
+                .traffic
+                .consumer_poll_gap
+                .record(response.last_consumer_poll_at, now);
+            response.last_consumer_poll_at = Some(now);
         });
     }
 
@@ -307,7 +365,12 @@ impl ResponseDiagnostics {
         enqueue: impl FnOnce() -> Result<(), mpsc::error::TrySendError<InboundEnvelope>>,
     ) -> Result<(), mpsc::error::TrySendError<InboundEnvelope>> {
         let Some(record) = &self.record else {
-            return enqueue();
+            let result = enqueue();
+            #[cfg(test)]
+            if result.is_ok() {
+                self.test_trace_event("enqueue", Some(bytes));
+            }
+            return result;
         };
         let terminal = terminal.lock().expect("terminal state lock");
         if !matches!(*terminal, UpstreamTerminalState::Open) {
@@ -315,6 +378,13 @@ impl ResponseDiagnostics {
         }
         let mut response = record.lock().expect("response observation lock");
         enqueue()?;
+        let traffic = &mut response.traffic;
+        saturating_accumulate(&mut traffic.enqueued_messages, 1, &mut traffic.saturated);
+        saturating_accumulate(
+            &mut traffic.enqueued_bytes,
+            bytes as u64,
+            &mut traffic.saturated,
+        );
         response.queued_messages += 1;
         response.queued_bytes += bytes;
         response.queue_messages_high_water = response
@@ -323,7 +393,7 @@ impl ResponseDiagnostics {
         response.queue_bytes_high_water =
             response.queue_bytes_high_water.max(response.queued_bytes);
         #[cfg(test)]
-        response.trace_event("enqueue", Some(bytes));
+        response.trace_event(self.test_trace(), "enqueue", bytes);
         Ok(())
     }
 
@@ -332,13 +402,47 @@ impl ResponseDiagnostics {
         terminal: &Arc<StdMutex<UpstreamTerminalState>>,
         bytes: usize,
     ) {
+        #[cfg(test)]
+        let mut updated = false;
         self.observe(terminal, |response| {
             response.queued_messages = response.queued_messages.saturating_sub(1);
             response.queued_bytes = response.queued_bytes.saturating_sub(bytes);
-            response.last_dequeue_at = Some(Instant::now());
+            let now = Instant::now();
+            response
+                .traffic
+                .dequeue_gap
+                .record(response.last_dequeue_at, now);
+            response.last_dequeue_at = Some(now);
+            saturating_accumulate(
+                &mut response.traffic.dequeued_messages,
+                1,
+                &mut response.traffic.saturated,
+            );
+            saturating_accumulate(
+                &mut response.traffic.dequeued_bytes,
+                bytes as u64,
+                &mut response.traffic.saturated,
+            );
             #[cfg(test)]
-            response.trace_event("dequeue", Some(bytes));
+            {
+                response.trace_event(self.test_trace(), "dequeue", bytes);
+                updated = true;
+            }
         });
+        #[cfg(test)]
+        if !updated && let Some(trace) = self.test_trace() {
+            let sample = self.record.as_ref().map(|record| {
+                let record = record.lock().unwrap();
+                [
+                    record.queued_messages,
+                    record.queued_bytes,
+                    record.queue_messages_high_water,
+                    record.queue_bytes_high_water,
+                    record.unclassified,
+                ]
+            });
+            trace.queue_sample("dequeue", bytes, sample, false);
+        }
     }
 
     fn observe(
@@ -423,8 +527,6 @@ impl ResponseDiagnostics {
                 ResponseEvent::Progress => response.state,
                 ResponseEvent::Unknown => ResponseState::Unknown,
             };
-            #[cfg(test)]
-            response.trace_event("classify", None);
         });
     }
 
@@ -445,6 +547,20 @@ impl ResponseDiagnostics {
         count: usize,
     ) {
         self.observe(terminal, |response| response.unclassified = count);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_seed_traffic_saturation(&self) {
+        let mut response = self.record.as_ref().unwrap().lock().unwrap();
+        let traffic = &mut response.traffic;
+        traffic.enqueued_messages = u64::MAX;
+        traffic.enqueued_bytes = u64::MAX;
+        traffic.dequeued_messages = u64::MAX;
+        traffic.dequeued_bytes = u64::MAX;
+        traffic.consumer_poll_gap.count = u64::MAX;
+        traffic.consumer_poll_gap.total_ns = u64::MAX;
+        traffic.dequeue_gap.count = u64::MAX;
+        traffic.dequeue_gap.total_ns = u64::MAX;
     }
 }
 
@@ -501,6 +617,7 @@ impl CloseDiagnostics {
             queue_messages_high_water: response.queue_messages_high_water,
             queue_bytes_high_water: response.queue_bytes_high_water,
             last_data_age_ms: self.last_data_at.map(age),
+            traffic: response.traffic,
         }
     }
 
@@ -540,6 +657,7 @@ pub(super) struct TerminalActivitySnapshot {
     queue_messages_high_water: usize,
     queue_bytes_high_water: usize,
     last_data_age_ms: Option<u128>,
+    traffic: TrafficObservation,
 }
 
 impl std::fmt::Display for TerminalActivitySnapshot {
@@ -580,6 +698,25 @@ impl std::fmt::Display for TerminalActivitySnapshot {
             self.queue_messages_high_water, self.queue_bytes_high_water
         )?;
         write_optional_field(formatter, "last_data_age_ms", self.last_data_age_ms)?;
+        write!(
+            formatter,
+            " enqueued_messages={} enqueued_bytes={} dequeued_messages={} dequeued_bytes={} traffic_saturated={}",
+            self.traffic.enqueued_messages,
+            self.traffic.enqueued_bytes,
+            self.traffic.dequeued_messages,
+            self.traffic.dequeued_bytes,
+            self.traffic.saturated
+        )?;
+        for (name, gap) in [
+            ("consumer_poll_gap", self.traffic.consumer_poll_gap),
+            ("dequeue_gap", self.traffic.dequeue_gap),
+        ] {
+            write!(
+                formatter,
+                " {name}_count={} {name}_total_ns={} {name}_max_ns={} {name}_saturated={}",
+                gap.count, gap.total_ns, gap.max_ns, gap.saturated
+            )?;
+        }
         Ok(())
     }
 }

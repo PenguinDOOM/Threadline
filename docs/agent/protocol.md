@@ -215,6 +215,16 @@ The activity ages are elapsed milliseconds at the frozen terminal observation ti
 
 `queue_messages_high_water` and `queue_bytes_high_water` are the maximum simultaneously queued data-message count and converted payload bytes observed between accepted enqueue and consumer dequeue. They are not cumulative traffic counters. The byte value follows the inbound queue accounting described above, including Binary lossy conversion.
 
+The terminal diagnostic also reports fixed-size cumulative queue activity. `enqueued_messages` and `enqueued_bytes` count only successfully enqueued data messages and their converted payload bytes; a rejected enqueue is not counted. `dequeued_messages` and `dequeued_bytes` count messages physically removed from the inbound queue and their converted payload bytes. These counters are observations, not wire-level traffic totals. Their units are messages and bytes, respectively.
+
+Two interval families describe observations within the connection: `consumer_poll_gap_count`, `consumer_poll_gap_total_ns`, and `consumer_poll_gap_max_ns` measure poll-to-poll intervals; `dequeue_gap_count`, `dequeue_gap_total_ns`, and `dequeue_gap_max_ns` measure dequeue-to-dequeue intervals. Counts are intervals, and total and maximum values are nanoseconds. The first poll or dequeue establishes that series' baseline and contributes no interval. There is no poll-to-dequeue interval in these product aggregates.
+
+`traffic_saturated` indicates that adding to a cumulative message or byte counter overflowed and saturated the value at `u64::MAX`. Each interval family has its own `{family}_saturated` indicator for interval-count or total-nanosecond overflow. Saturation is sticky for the connection's observation. Do not derive rates from a saturated counter or interval total, or from a zero-length time window; the diagnostic emits aggregate values, not rates. Rates, when calculated separately from valid unsaturated observations, are derived values rather than diagnostic fields.
+
+All added aggregate work is opt-in with `--ws-close-diagnostics`. When disabled, no activity record is allocated and these counters and intervals add no per-message clock, formatting, or parsing work. Existing inbound limits remain 256 messages and 16 MiB by default; diagnostics neither change nor raise those bounds.
+
+The aggregate snapshot is frozen when terminal state is first recorded. A message physically removed after that point may still be reflected in separate test telemetry, but cannot update or re-emit the frozen terminal diagnostic. Physical drain after terminal is therefore distinct from the terminal snapshot and does not change its counts or high-water values.
+
 These fields are emitted only by the opt-in terminal diagnostic and are not substitutes for control state. They do not establish root cause, user intent, or successful upstream execution. The existing per-connection inbound limits remain 256 messages and 16 MiB by default; these diagnostics do not change those limits or bound RSS/global memory. No diagnostic rotation, active-session migration, queue optimization, or always-on timer is implied. They do not claim to fix production overflow or guarantee 60 minutes of uninterrupted operation.
 
 ## Idle sessions

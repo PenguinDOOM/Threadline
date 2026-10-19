@@ -375,15 +375,27 @@ impl LiveUpstreamWebSocket {
         let envelope = self.inbound_rx.lock().await.recv().await;
         if let Some(envelope) = &envelope {
             #[cfg(test)]
-            if !matches!(self.terminal_state(), UpstreamTerminalState::Open) {
-                self.response_diagnostics()
-                    .test_trace_event("terminal_dequeue", Some(envelope.payload.len()));
+            if let Some(trace) = self.test_trace() {
+                let observed_at = (std::time::Instant::now(), Instant::now());
+                trace.physical_dequeue(envelope.payload.len(), observed_at);
             }
             self.response_diagnostics()
                 .record_dequeue(&self.terminal_state, envelope.payload.len());
         }
         self.terminal_error()?;
         Ok(envelope.map(|envelope| envelope.payload.into_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_trace(&self) -> Option<FiniteTrace> {
+        self.response_diagnostics().test_trace()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_stop_and_join(&mut self) {
+        self.task.abort();
+        let result = (&mut self.task).await;
+        assert!(result.is_ok() || result.unwrap_err().is_cancelled());
     }
 
     pub fn is_closed(&self) -> bool {

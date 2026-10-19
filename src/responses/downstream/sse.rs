@@ -1,11 +1,18 @@
 use super::*;
 
 pub(in crate::responses) fn sse_payload_chunk(event: &str, payload: &str) -> Bytes {
+    #[cfg(test)]
+    let _span = crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Encode);
     Bytes::from(format!("event: {event}\ndata: {payload}\n\n"))
 }
 
 pub(in crate::responses) fn sse_json_chunk(event: &str, payload: &Value) -> Bytes {
-    let payload = serde_json::to_string(payload).expect("serialize downstream sse payload");
+    let payload = {
+        #[cfg(test)]
+        let _span =
+            crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Serialize);
+        serde_json::to_string(payload).expect("serialize downstream sse payload")
+    };
     sse_payload_chunk(event, &payload)
 }
 

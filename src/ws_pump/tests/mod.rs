@@ -13,8 +13,8 @@ mod terminal_observation;
 mod write_progress;
 use finite_trace::finite_ready_pair;
 pub(crate) use finite_trace::{
-    FiniteTrace, finite_drive, finite_read_barrier, finite_receive, finite_send,
-    observe_pump_future,
+    FiniteTrace, TraceOperation, finite_drive, finite_read_barrier, finite_receive, finite_send,
+    measurement_encoded_bytes, observe_pump_future,
 };
 use fixtures::*;
 use peer::*;

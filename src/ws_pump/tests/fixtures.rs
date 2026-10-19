@@ -27,6 +27,104 @@ pub(super) fn synthetic_completed_through(last: usize) -> String {
     .to_string()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SyntheticSeriesKind {
+    Text,
+    Arguments,
+}
+
+pub(crate) struct SyntheticSeries {
+    pub(crate) events: Vec<String>,
+    pub(crate) semantic_text: String,
+    pub(crate) delta_start: usize,
+    pub(crate) metadata: serde_json::Value,
+}
+
+pub(crate) fn measurement_series(
+    kind: SyntheticSeriesKind,
+    deltas: usize,
+    delta_bytes: usize,
+) -> SyntheticSeries {
+    use serde_json::{Value, json};
+    assert!([16, 1536].contains(&deltas) && [199, 4096].contains(&delta_bytes));
+    let text: String = (1..=deltas)
+        .map(|ordinal| format!("{ordinal:06}"))
+        .collect();
+    let arguments = format!("{{\"s\":\"{text}\"}}");
+    let is_text = matches!(kind, SyntheticSeriesKind::Text);
+    let mut item = if is_text {
+        json!({"id":"m0","type":"message","status":"in_progress","role":"assistant","content":[]})
+    } else {
+        json!({"id":"f0","type":"function_call","status":"in_progress","call_id":"c0","name":"external_probe","arguments":""})
+    };
+    let mut values = vec![
+        json!({"type":"response.created","response":{"id":"r0","status":"in_progress","output":[]}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":item}),
+    ];
+    if is_text {
+        values.push(json!({"type":"response.content_part.added","item_id":"m0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}));
+    }
+    let delta_start = values.len();
+    for ordinal in 1..=deltas {
+        let fragment = format!("{ordinal:06}");
+        values.push(if is_text {
+            json!({"type":"response.output_text.delta","item_id":"m0","output_index":0,"content_index":0,"delta":fragment,"padding":""})
+        } else {
+            let fragment = if ordinal == 1 { format!("{{\"s\":\"{fragment}") }
+                else if ordinal == deltas { format!("{fragment}\"}}") } else {fragment};
+            json!({"type":"response.function_call_arguments.delta","item_id":"f0","output_index":0,"delta":fragment,"padding":""})
+        });
+    }
+    item["status"] = json!("completed");
+    if is_text {
+        let part = json!({"type":"output_text","text":text,"annotations":[]});
+        item["content"] = json!([part]);
+        values.push(json!({"type":"response.output_text.done","item_id":"m0","output_index":0,"content_index":0,"text":text}));
+        values.push(json!({"type":"response.content_part.done","item_id":"m0","output_index":0,"content_index":0,"part":part}));
+    } else {
+        item["arguments"] = json!(arguments);
+        values.push(json!({"type":"response.function_call_arguments.done","item_id":"f0","output_index":0,"arguments":arguments}));
+    }
+    values.push(json!({"type":"response.output_item.done","output_index":0,"item":item}));
+    values.push(json!({"type":"response.completed","response":{"id":"r0","status":"completed","output":[item]}}));
+    let mut events = Vec::with_capacity(values.len());
+    let mut payload_bytes = 0usize;
+    let mut wire_bytes = 0usize;
+    for (sequence, mut value) in values.into_iter().enumerate() {
+        value["sequence_number"] = json!(sequence);
+        value["response_id"] = json!("r0");
+        if value.get("padding").is_some() {
+            let base = serde_json::to_string(&value).unwrap().len();
+            value["padding"] = Value::String("x".repeat(delta_bytes.checked_sub(base).unwrap()));
+        }
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(encoded.len() <= 16 * 1024);
+        payload_bytes = payload_bytes.checked_add(encoded.len()).unwrap();
+        wire_bytes = wire_bytes
+            .checked_add(encoded.len() + if encoded.len() <= 125 { 2 } else { 4 })
+            .unwrap();
+        assert!(wire_bytes <= 8 * 1024 * 1024);
+        events.push(encoded);
+    }
+    let metadata = json!({"generator_version":1,"series":if is_text {"text"} else {"arguments"},
+        "deltas":deltas,"frames":events.len(),"delta_start":delta_start,"delta_payload_bytes":delta_bytes,
+        "frame_payload_bytes":events.iter().map(String::len).collect::<Vec<_>>(),"payload_bytes":payload_bytes,"wire_bytes":wire_bytes,
+        "sequence":"q starts at zero, consecutive; response_id r0; semantic fragment is six-digit zero-padded ordinal 1..=D",
+        "identity":"text m0/message/assistant; arguments f0/function_call/c0/external_probe; r0 is synthetic",
+        "text_order":"created,item.added,part.added,D deltas,text.done,part.done,item.done,completed",
+        "arguments_order":"created,item.added,D deltas,arguments.done,item.done,completed",
+        "content":"text is concatenated semantic fragments; arguments is JSON object with s equal to text; first/last fragments carry JSON delimiters",
+        "encoding":"ASCII compact JSON; delta padding x fills complete payload to target; unmasked unfragmented Text frames; empty initial content/arguments; completed output repeats same item and text/arguments; annotations empty",
+        "limits":{"encoded_bytes":8388608,"payload_bytes":16384},
+        "limitation":"4096-byte deltas use padding, not larger semantic arguments; no wire-arrival time is observed"});
+    SyntheticSeries {
+        events,
+        semantic_text: text,
+        delta_start,
+        metadata,
+    }
+}
+
 pub(crate) fn finite_warning_capture() -> (
     tracing::Dispatch,
     tracing::subscriber::DefaultGuard,

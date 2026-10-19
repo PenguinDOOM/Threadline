@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) fn discard_unaccepted_queued_output(state: &mut ResponseStreamState) {
+    #[cfg(test)]
+    let _span = crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Clear);
     state.pending_upstream_events.clear();
     state.queued_synthetic_output_text_deltas.clear();
     state.queued_forwarded_event = None;
@@ -34,7 +36,13 @@ pub(super) async fn reject_unaccepted_transport_terminal(
             .as_ref()
             .and_then(|upstream| final_completion_acceptance_error(upstream.terminal_state()))
     {
-        let failed_payload = terminal_failed_payload_from_error(None, None, &error);
+        let failed_payload = {
+            #[cfg(test)]
+            let _span = crate::ws_pump::FiniteTrace::current_span(
+                crate::ws_pump::TraceOperation::TerminalPayload,
+            );
+            terminal_failed_payload_from_error(None, None, &error)
+        };
         trace_downstream_sse_event(&downstream_sse_trace_metadata(
             &failed_payload,
             DownstreamTraceAction::Terminal,
@@ -49,8 +57,13 @@ pub(super) async fn reject_unaccepted_transport_terminal(
         } else {
             state.lease.mark_upstream_terminal().await;
         }
+        #[cfg(test)]
+        let finish_span =
+            crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Finish);
         state.lease.release();
         state.final_done_pending = true;
+        #[cfg(test)]
+        drop(finish_span);
         return Some(sse_terminal_response_failed_chunk(&failed_payload));
     }
     None
@@ -58,6 +71,10 @@ pub(super) async fn reject_unaccepted_transport_terminal(
 
 pub(super) fn drain_queued_synthetic_delta(state: &mut ResponseStreamState) -> Option<Bytes> {
     if let Some(synthetic_delta) = state.queued_synthetic_output_text_deltas.pop_front() {
+        #[cfg(test)]
+        let metadata_span = crate::ws_pump::FiniteTrace::current_span(
+            crate::ws_pump::TraceOperation::QueuedMetadata,
+        );
         let event_type = synthetic_delta
             .payload
             .get("type")
@@ -82,6 +99,8 @@ pub(super) fn drain_queued_synthetic_delta(state: &mut ResponseStreamState) -> O
             Some(&trace_diagnostics),
         ));
         debug!(event_type, "translation_event_forwarded");
+        #[cfg(test)]
+        drop(metadata_span);
         return Some(sse_json_chunk(&event_type, &synthetic_delta.payload));
     }
     None
@@ -89,6 +108,10 @@ pub(super) fn drain_queued_synthetic_delta(state: &mut ResponseStreamState) -> O
 
 pub(super) fn drain_queued_forwarded_event(state: &mut ResponseStreamState) -> Option<Bytes> {
     if let Some(forwarded_event) = state.queued_forwarded_event.take() {
+        #[cfg(test)]
+        let metadata_span = crate::ws_pump::FiniteTrace::current_span(
+            crate::ws_pump::TraceOperation::QueuedMetadata,
+        );
         let event_type = forwarded_event
             .payload
             .get("type")
@@ -101,6 +124,8 @@ pub(super) fn drain_queued_forwarded_event(state: &mut ResponseStreamState) -> O
             Some(&DownstreamTraceDiagnostics::default()),
         ));
         debug!(event_type, "translation_event_forwarded");
+        #[cfg(test)]
+        drop(metadata_span);
         return Some(sse_json_chunk(&event_type, &forwarded_event.payload));
     }
     None
@@ -108,6 +133,10 @@ pub(super) fn drain_queued_forwarded_event(state: &mut ResponseStreamState) -> O
 
 pub(super) fn drain_queued_completed_event(state: &mut ResponseStreamState) -> Option<Bytes> {
     if let Some(completed) = state.queued_final_completed.take() {
+        #[cfg(test)]
+        let metadata_span = crate::ws_pump::FiniteTrace::current_span(
+            crate::ws_pump::TraceOperation::QueuedMetadata,
+        );
         let response_id = response_id_from_event(&completed.payload);
         let trace_diagnostics = DownstreamTraceDiagnostics {
             response_id: response_id.map(ToString::to_string),
@@ -135,6 +164,8 @@ pub(super) fn drain_queued_completed_event(state: &mut ResponseStreamState) -> O
         state.lease.release();
         state.final_done_pending = true;
         debug!(response_id, "final_done_queued");
+        #[cfg(test)]
+        drop(metadata_span);
         return Some(sse_json_chunk("response.completed", &completed.payload));
     }
     None
@@ -199,6 +230,8 @@ pub(super) fn accept_final_completion(
     sanitized_completed: Value,
     diagnostics: CompletedSanitizationDiagnostics,
 ) -> Result<(), ThreadlineError> {
+    #[cfg(test)]
+    let _span = crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Accept);
     if let Some(error) = state
         .upstream
         .as_ref()

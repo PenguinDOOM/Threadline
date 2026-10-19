@@ -129,6 +129,8 @@ pub(super) fn handle_inbound_message(
 }
 
 fn enqueue_inbound_payload(payload: String, pump_state: &PumpState<'_>) -> bool {
+    #[cfg(test)]
+    pump_state.diagnostics.response.test_trace_payload(&payload);
     try_enqueue_inbound(
         pump_state.inbound_tx,
         pump_state.byte_budget,
@@ -159,8 +161,6 @@ fn handle_inbound_frame(
                 .diagnostics
                 .response
                 .record_unclassified(pump_state.terminal_state);
-            #[cfg(test)]
-            pump_state.diagnostics.response.test_trace_payload(&text);
             enqueue_inbound_payload(text.to_string(), pump_state)
         }
         Message::Binary(bytes) => {

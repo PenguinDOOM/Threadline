@@ -20,16 +20,27 @@ pub(super) async fn next_stream_progress(
         debug!("downstream_sse_stream_finished");
         return StreamProgress::Finished;
     }
-    let next = match receive_upstream_text(state).await {
+    let receive = receive_upstream_text(state);
+    #[cfg(test)]
+    let receive =
+        diagnostics::observe_measurement(crate::ws_pump::TraceOperation::Receive, receive);
+    let next = match receive.await {
         Ok(Some(next)) => next,
         Ok(None) => return StreamProgress::Continue,
         Err(progress) => return progress,
     };
-    let parsed = match parse_upstream_event(state, &next).await {
+    let parse = parse_upstream_event(state, &next);
+    #[cfg(test)]
+    let parse = diagnostics::observe_measurement(crate::ws_pump::TraceOperation::Parse, parse);
+    let parsed = match parse.await {
         Ok(parsed) => parsed,
         Err(progress) => return progress,
     };
-    process_upstream_event(state, parsed, ledger).await
+    let process = process_upstream_event(state, parsed, ledger);
+    #[cfg(test)]
+    let process =
+        diagnostics::observe_measurement(crate::ws_pump::TraceOperation::Process, process);
+    process.await
 }
 
 pub(super) async fn parse_upstream_event(
@@ -61,7 +72,13 @@ pub(super) async fn parse_upstream_event(
         )));
     }
 
-    let parsed = match serde_json::from_str::<Value>(next) {
+    let parsed = {
+        #[cfg(test)]
+        let _span =
+            crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Parse);
+        serde_json::from_str::<Value>(next)
+    };
+    let parsed = match parsed {
         Ok(parsed) => parsed,
         Err(_) => {
             observe_response_event(state, crate::ws_pump::ResponseEvent::Unknown);
@@ -74,6 +91,14 @@ pub(super) async fn parse_upstream_event(
         }
     };
 
+    #[cfg(test)]
+    if let Some(trace) = state
+        .upstream
+        .as_ref()
+        .and_then(|upstream| upstream.test_trace())
+    {
+        trace.classification(&parsed);
+    }
     observe_response_event(state, classify_response_event(&parsed));
     Ok(parsed)
 }
@@ -110,17 +135,25 @@ pub(super) async fn process_upstream_event(
     parsed: Value,
     ledger: &mut InternalToolLedger,
 ) -> StreamProgress {
+    #[cfg(test)]
+    let routing =
+        crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::RouteBeforeTool);
     if !recovery::lifecycle_only(&parsed) {
         state.replay_prohibited = true;
     }
     let trace_metadata = UpstreamEventTraceMetadata::from_event(&parsed);
     trace_upstream_event(&trace_metadata);
     state.observable_output.last_upstream_event_type = Some(trace_metadata.event_type.clone());
+    #[cfg(test)]
+    drop(routing);
     if let Some(progress) =
         handle_internal_tool_event(state, &parsed, &trace_metadata, ledger).await
     {
         return progress;
     }
+    #[cfg(test)]
+    let routing =
+        crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::RouteAfterTool);
     let event_type = parsed
         .get("type")
         .and_then(Value::as_str)
@@ -130,6 +163,8 @@ pub(super) async fn process_upstream_event(
     if suppress_internal_tool_event(state, &parsed, &event_type, &trace_metadata) {
         return StreamProgress::Continue;
     }
+    #[cfg(test)]
+    drop(routing);
     match event_type.as_str() {
         "response.completed" => handle_completed_event(state, &parsed, &event_type).await,
         "response.failed" => handle_failed_event(state, &parsed, &event_type).await,
@@ -150,22 +185,37 @@ pub(super) async fn handle_completed_event(
         return handle_intermediate_completion(state, parsed, response_id.as_deref()).await;
     }
 
-    if !has_accumulated_visible_assistant_text(&state.visible_assistant_text) {
-        queue_visible_text_deltas(
-            state,
-            synthesized_completed_output_text_delta(parsed),
-            "response.completed",
-            response_id.as_deref(),
+    {
+        #[cfg(test)]
+        let _span = crate::ws_pump::FiniteTrace::current_span(
+            crate::ws_pump::TraceOperation::CompletedSynthesis,
         );
+        if !has_accumulated_visible_assistant_text(&state.visible_assistant_text) {
+            queue_visible_text_deltas(
+                state,
+                synthesized_completed_output_text_delta(parsed),
+                "response.completed",
+                response_id.as_deref(),
+            );
+        }
     }
 
-    let (sanitized_completed, diagnostics) =
-        sanitized_completed_event_with_diagnostics(parsed, &state.visible_assistant_text);
-    record_completed_observable_output(
-        &mut state.observable_output,
-        &sanitized_completed,
-        &diagnostics,
-    );
+    let (sanitized_completed, diagnostics) = {
+        #[cfg(test)]
+        let _span =
+            crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Sanitize);
+        sanitized_completed_event_with_diagnostics(parsed, &state.visible_assistant_text)
+    };
+    {
+        #[cfg(test)]
+        let _span =
+            crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Observable);
+        record_completed_observable_output(
+            &mut state.observable_output,
+            &sanitized_completed,
+            &diagnostics,
+        );
+    }
 
     if state.apply_no_observable_output_failure && !has_downstream_observable_output(state) {
         return reject_no_observable_output(
@@ -256,21 +306,26 @@ pub(super) fn handle_visible_event(
     parsed: Value,
     event_type: &str,
 ) -> StreamProgress {
-    let trace_diagnostics = if event_type == "response.output_text.delta" {
-        record_visible_delta_event(state, &parsed)
-    } else {
-        if queue_visible_done_event(state, &parsed, event_type) {
-            state.queued_forwarded_event = Some(QueuedForwardedEvent { payload: parsed });
-            return StreamProgress::Continue;
-        }
-        DownstreamTraceDiagnostics::default()
-    };
-    record_forwarded_observable_output(&mut state.observable_output, event_type, &parsed);
-    trace_downstream_sse_event(&downstream_sse_trace_metadata(
-        &parsed,
-        DownstreamTraceAction::Forwarded,
-        Some(&trace_diagnostics),
-    ));
-    debug!(event_type, "translation_event_forwarded");
+    {
+        #[cfg(test)]
+        let _span =
+            crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Visible);
+        let trace_diagnostics = if event_type == "response.output_text.delta" {
+            record_visible_delta_event(state, &parsed)
+        } else {
+            if queue_visible_done_event(state, &parsed, event_type) {
+                state.queued_forwarded_event = Some(QueuedForwardedEvent { payload: parsed });
+                return StreamProgress::Continue;
+            }
+            DownstreamTraceDiagnostics::default()
+        };
+        record_forwarded_observable_output(&mut state.observable_output, event_type, &parsed);
+        trace_downstream_sse_event(&downstream_sse_trace_metadata(
+            &parsed,
+            DownstreamTraceAction::Forwarded,
+            Some(&trace_diagnostics),
+        ));
+        debug!(event_type, "translation_event_forwarded");
+    }
     StreamProgress::Yield(sse_json_chunk(event_type, &parsed))
 }

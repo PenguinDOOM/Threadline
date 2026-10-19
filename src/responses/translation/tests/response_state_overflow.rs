@@ -254,7 +254,7 @@ async fn finish_failed_sse(
 }
 
 async fn run_pending_receive_snapshot(warning_count: impl Fn() -> usize) {
-    let trace = FiniteTrace::new("sse_pending_seventeen_ms");
+    let trace = FiniteTrace::configured("sse_pending_seventeen_ms", 1, 0, 402, false, true, true);
     let (upstream, state, mut server) =
         diagnostic_stream_pair_with_trace(Some(trace.clone())).await;
     let mut body: ResponseBody = Box::pin(response_stream(state));

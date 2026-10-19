@@ -4,6 +4,14 @@ pub(super) async fn receive_upstream_text(
     state: &mut ResponseStreamState,
 ) -> Result<Option<String>, StreamProgress> {
     if let Some(text) = state.pending_upstream_events.pop_front() {
+        #[cfg(test)]
+        if let Some(trace) = state
+            .upstream
+            .as_ref()
+            .and_then(|upstream| upstream.test_trace())
+        {
+            trace.event("pending_input", None, Some(text.len()), None, None);
+        }
         return Ok(Some(text));
     }
     state.observe_consumer_phase(if state.pending_internal_outputs.is_empty() {
