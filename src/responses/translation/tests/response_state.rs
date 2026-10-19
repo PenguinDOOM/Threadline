@@ -23,6 +23,18 @@ async fn measurement_stream_pair(
     ResponseStreamState,
     WebSocketStream<DuplexStream>,
 ) {
+    measurement_stream_pair_with_limits(trace, aggregate, UpstreamInboundLimits::DEFAULT).await
+}
+
+async fn measurement_stream_pair_with_limits(
+    trace: &FiniteTrace,
+    aggregate: bool,
+    limits: UpstreamInboundLimits,
+) -> (
+    Arc<LiveUpstreamWebSocket>,
+    ResponseStreamState,
+    WebSocketStream<DuplexStream>,
+) {
     let (client_io, server_io) = duplex(8192);
     let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
     let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
@@ -30,7 +42,7 @@ async fn measurement_stream_pair(
         client,
         aggregate,
         trace.clone(),
-        UpstreamInboundLimits::DEFAULT,
+        limits,
     ));
     let registry = Arc::new(RetainedSessionRegistry::new(1));
     let lease = armed_followup_lease(&registry, Arc::clone(&upstream)).await;
@@ -38,13 +50,14 @@ async fn measurement_stream_pair(
     (upstream, state, server)
 }
 
-async fn stop_measurement_pump(upstream: Arc<LiveUpstreamWebSocket>, trace: &FiniteTrace) {
+async fn stop_measurement_pump(upstream: Arc<LiveUpstreamWebSocket>, trace: &FiniteTrace) -> usize {
     let mut upstream = Arc::try_unwrap(upstream)
         .ok()
         .expect("stream and registry released upstream ownership");
     upstream.test_stop_and_join().await;
-    upstream.test_drain_after_terminal(trace).await;
+    let drained = upstream.test_drain_after_terminal(trace).await;
     trace.event("resource_released", None, None, None, None);
+    drained
 }
 
 async fn measurement_attempt<F: std::future::Future>(
@@ -95,8 +108,14 @@ async fn legal_series_measurement(
     trace: Option<FiniteTrace>,
 ) {
     let series = crate::ws_pump::measurement_series(kind, 16, 199);
+    let runtime = tokio::runtime::Handle::current().runtime_flavor();
+    let workers = if runtime == tokio::runtime::RuntimeFlavor::MultiThread {
+        2
+    } else {
+        1
+    };
     let trace = trace.unwrap_or_else(|| {
-        FiniteTrace::configured(name, 1, 0, series.events.len(), false, false, detail)
+        FiniteTrace::configured(name, workers, 0, series.events.len(), false, false, detail)
     });
     trace.set_series(series.delta_start, 16);
     let (upstream, state, mut server) = measurement_stream_pair(&trace, aggregate).await;
@@ -161,7 +180,7 @@ async fn legal_series_measurement(
     let activity = result.as_ref().ok().and_then(|value| value.1.clone());
     trace.write_scenario(
         name,
-        &json!({"generator":series.metadata,"runtime_flavor":"current_thread","workers":1,
+        &json!({"generator":series.metadata,"runtime_flavor":if workers == 2 {"multi_thread"} else {"current_thread"},"workers":workers,
         "aggregate":aggregate,"detail":detail,"limits":{"messages":256,"bytes":16777216},"elapsed_ns":elapsed_ns,
         "valid":result.is_ok() && invalid_reason.is_none(),"invalid_reason":invalid_reason,"trace_record_limit":trace.record_budget(),"completed":result.is_ok(),"overflow":false,"delivered_sequence_inclusive":result.is_ok().then_some([0,series.events.len()-1]),"done_chunks":usize::from(result.is_ok()),
         "aggregate_snapshot":activity,"cleanup":"body and registry references released; pump abort joined; channel empty",
@@ -176,6 +195,25 @@ async fn legal_series_measurement(
         }));
     }
     assert!(result.is_ok(), "invalid measurement: {result:?}");
+}
+
+#[tokio::test]
+async fn response_stream_matrix_small_series_current_thread() {
+    use crate::ws_pump::SyntheticSeriesKind::{Arguments, Text};
+    for (name, kind) in [
+        ("m1_text_current", Text),
+        ("m1_arguments_current", Arguments),
+    ] {
+        legal_series_measurement(name, true, true, kind, None).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_stream_matrix_small_series_two_workers() {
+    use crate::ws_pump::SyntheticSeriesKind::{Arguments, Text};
+    for (name, kind) in [("m1_text_multi", Text), ("m1_arguments_multi", Arguments)] {
+        legal_series_measurement(name, true, true, kind, None).await;
+    }
 }
 
 #[tokio::test]

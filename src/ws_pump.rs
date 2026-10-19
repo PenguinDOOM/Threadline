@@ -19,13 +19,13 @@ use diagnostics::*;
 pub(crate) use diagnostics::{ConsumerPhase, ResponseEvent};
 #[cfg(test)]
 pub(crate) use tests::fixtures::{
-    SyntheticSeriesKind, finite_warning_capture, measurement_series, synthetic_completed,
-    synthetic_created, synthetic_delta,
+    SyntheticSeries, SyntheticSeriesKind, finite_warning_capture, measurement_series,
+    synthetic_completed, synthetic_created, synthetic_delta,
 };
 #[cfg(test)]
 pub(crate) use tests::{
     FiniteTrace, TraceOperation, finite_drive, finite_read_barrier, finite_send,
-    measurement_encoded_bytes,
+    measurement_encoded_bytes, measurement_ready_io,
 };
 
 use std::sync::{Arc, Mutex as StdMutex};

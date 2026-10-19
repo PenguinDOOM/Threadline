@@ -145,7 +145,7 @@ struct FiniteTraceRecords {
     barrier_count: usize,
     delta_start: usize,
     deltas: usize,
-    name: &'static str,
+    name: String,
     workers: usize,
     runtime_flavor: &'static str,
 }
@@ -250,7 +250,7 @@ impl FiniteTrace {
     }
 
     pub(crate) fn configured(
-        name: &'static str,
+        name: &str,
         workers: usize,
         connection: usize,
         input_frames: usize,
@@ -293,7 +293,7 @@ impl FiniteTrace {
                 barrier_count: 0,
                 delta_start: 1,
                 deltas: input_frames.saturating_sub(2),
-                name,
+                name: name.to_owned(),
                 workers,
                 runtime_flavor: match tokio::runtime::Handle::try_current()
                     .map(|handle| handle.runtime_flavor())
@@ -382,6 +382,12 @@ impl FiniteTrace {
 
     pub(crate) fn enabled(&self) -> bool {
         self.0.is_some()
+    }
+
+    pub(crate) fn monotonic_ns(&self) -> Option<u64> {
+        self.0
+            .as_ref()
+            .map(|shared| shared.monotonic.elapsed().as_nanos().try_into().unwrap())
     }
 
     fn record(&self, mut record: FiniteTraceRecord) {
@@ -588,7 +594,7 @@ impl FiniteTrace {
             return;
         };
         if let Some(directory) = std::env::var_os("THREADLINE_TEST_TRACE_DIR") {
-            let name = shared.records.lock().unwrap().name;
+            let name = shared.records.lock().unwrap().name.clone();
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -815,8 +821,8 @@ impl FiniteTrace {
         let Some(shared) = &self.0 else {
             return;
         };
-        let name = shared.records.lock().unwrap().name;
-        self.write_scenario(name, scenario);
+        let name = shared.records.lock().unwrap().name.clone();
+        self.write_scenario(&name, scenario);
     }
 
     pub(crate) fn write_scenario(&self, name: &str, scenario: &serde_json::Value) {
@@ -902,7 +908,7 @@ pub(crate) async fn observe_pump_future<F: std::future::Future<Output = ()>>(
     }
 }
 
-pub(super) struct ReadyInputIo {
+pub(crate) struct ReadyInputIo {
     encoded: Vec<u8>,
     cursor: usize,
     open: Arc<AtomicBool>,
