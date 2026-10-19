@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(test)]
 pub(in crate::responses) fn sse_payload_chunk(event: &str, payload: &str) -> Bytes {
     #[cfg(test)]
     let _span = crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Encode);
@@ -8,28 +7,13 @@ pub(in crate::responses) fn sse_payload_chunk(event: &str, payload: &str) -> Byt
 }
 
 pub(in crate::responses) fn sse_json_chunk(event: &str, payload: &Value) -> Bytes {
-    let mut output = Vec::new();
-    {
-        #[cfg(test)]
-        let _span =
-            crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Encode);
-        output.extend_from_slice(b"event: ");
-        output.extend_from_slice(event.as_bytes());
-        output.extend_from_slice(b"\ndata: ");
-    }
-    {
+    let payload = {
         #[cfg(test)]
         let _span =
             crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Serialize);
-        serde_json::to_writer(&mut output, payload).expect("serialize downstream sse payload");
-    }
-    {
-        #[cfg(test)]
-        let _span =
-            crate::ws_pump::FiniteTrace::current_span(crate::ws_pump::TraceOperation::Encode);
-        output.extend_from_slice(b"\n\n");
-    }
-    Bytes::from(output)
+        serde_json::to_string(payload).expect("serialize downstream sse payload")
+    };
+    sse_payload_chunk(event, &payload)
 }
 
 pub(in crate::responses) fn sse_done_chunk() -> Bytes {
