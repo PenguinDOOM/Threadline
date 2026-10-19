@@ -21,6 +21,22 @@ fn sse_json_chunk_serializes_compact_json() {
 }
 
 #[test]
+fn sse_json_chunk_preserves_escaped_text_and_arguments_bytes() {
+    let chunk = sse_json_chunk(
+        "response.output_text.delta",
+        &json!({
+            "delta": "\"quoted\" \\\\ line\n次",
+            "arguments": "{\"empty\":\"\",\"line\":\"a\\nb\"}"
+        }),
+    );
+
+    assert_eq!(
+        chunk.as_ref(),
+        "event: response.output_text.delta\ndata: {\"arguments\":\"{\\\"empty\\\":\\\"\\\",\\\"line\\\":\\\"a\\\\nb\\\"}\",\"delta\":\"\\\"quoted\\\" \\\\\\\\ line\\n次\"}\n\n".as_bytes()
+    );
+}
+
+#[test]
 fn sse_done_chunk_keeps_bare_done_payload() {
     let chunk = sse_done_chunk();
 
