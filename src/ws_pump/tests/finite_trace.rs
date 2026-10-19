@@ -845,6 +845,28 @@ impl FiniteTrace {
         }
     }
 
+    pub(crate) fn write_payloads(&self, name: &str, payloads: &[impl AsRef<[u8]>]) {
+        use std::io::Write;
+        let directory = self
+            .0
+            .as_ref()
+            .and_then(|shared| shared.records.lock().unwrap().directory.clone())
+            .or_else(|| {
+                std::env::var_os("THREADLINE_TEST_TRACE_DIR").map(std::path::PathBuf::from)
+            });
+        if let Some(directory) = directory {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join(format!("{name}.bytes")))
+                .unwrap();
+            for payload in payloads {
+                file.write_all(payload.as_ref()).unwrap();
+            }
+            file.flush().unwrap();
+        }
+    }
+
     pub(crate) fn assert_measurement_records(&self, classes: Option<[usize; 4]>) {
         let Some(shared) = &self.0 else {
             return;

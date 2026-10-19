@@ -332,6 +332,8 @@ async fn response_stream_matrix_controlled_two_workers() {
 
 struct NaturalCase {
     name: String,
+    mode: (bool, bool),
+    outer_observer: bool,
     workers: usize,
     capacity: usize,
     kind: crate::ws_pump::SyntheticSeriesKind,
@@ -345,12 +347,77 @@ struct NaturalOutput {
     chunks: Vec<Bytes>,
     raw: Vec<String>,
     pause_completed: bool,
+    yield_offsets_ns: Option<Vec<u64>>,
+    end_offset_ns: Option<u64>,
+}
+
+impl NaturalOutput {
+    fn observe_yield(&mut self, anchor: std::time::Instant, bound: usize) {
+        if let Some(offsets) = &mut self.yield_offsets_ns {
+            assert!(offsets.len() < bound);
+            offsets.push(anchor.elapsed().as_nanos() as u64);
+        }
+    }
+
+    fn observations(&self, raw: bool, overflow: bool) -> serde_json::Value {
+        let mut yields = Vec::new();
+        if let Some(offsets) = &self.yield_offsets_ns {
+            let count = if raw {
+                self.raw.len()
+            } else {
+                self.chunks.len()
+            };
+            assert_eq!(offsets.len(), count);
+            for (ordinal, offset) in offsets.iter().enumerate() {
+                let (kind, bytes) = if raw {
+                    let event: serde_json::Value =
+                        serde_json::from_str(&self.raw[ordinal]).unwrap();
+                    (
+                        event["type"].as_str().unwrap().to_owned(),
+                        self.raw[ordinal].len(),
+                    )
+                } else {
+                    let chunk = std::str::from_utf8(&self.chunks[ordinal]).unwrap();
+                    let kind = chunk.lines().next().unwrap();
+                    (
+                        kind.strip_prefix("event: ").unwrap_or("DONE").to_owned(),
+                        chunk.len(),
+                    )
+                };
+                yields
+                    .push(json!({"ordinal":ordinal,"type":kind,"offset_ns":offset,"bytes":bytes}));
+            }
+        }
+        let terminal = yields.iter().find(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("response.completed" | "response.failed")
+            )
+        });
+        let visible = yields.iter().find(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("response.output_text.delta" | "response.function_call_arguments.delta")
+            )
+        });
+        json!({"schema_version":1,"enabled":self.yield_offsets_ns.is_some(),"valid":true,"yields":yields,
+            "first_output_offset_ns":yields.first().map(|item| &item["offset_ns"]),
+            "first_visible_offset_ns":visible.map(|item| &item["offset_ns"]),
+            "first_visible_absence":if visible.is_none() {Some("no visible delta observed; consult observer setting and outcome")} else {None},
+            "terminal_offset_ns":terminal.map(|item| item["offset_ns"].as_u64().unwrap()).or(if raw && overflow {self.end_offset_ns} else {None}),
+            "consumer_end_offset_ns":self.end_offset_ns,"eof_offset_ns":if raw {None} else {self.end_offset_ns},
+            "missing_yield_ordinal_ranges":if self.yield_offsets_ns.is_none() {vec![[0, (self.raw.len()+self.chunks.len()).saturating_sub(1)]]} else {Vec::new()},
+            "missing_reason":if self.yield_offsets_ns.is_none() {Some("outer observer disabled by case metadata")} else {None},
+            "raw_eof_missing_reason":if raw {Some("raw consumer ends at final input or typed overflow; transport EOF is not polled")} else {None}})
+    }
 }
 
 async fn natural_matrix_case(case: NaturalCase) {
     use crate::ws_pump::{TraceOperation, UpstreamTerminalState, measurement_series};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let series = measurement_series(case.kind, 1536, case.size);
+    let (aggregate, detail) = case.mode;
+    assert!(!detail || aggregate);
     let trace = FiniteTrace::configured(
         &case.name,
         case.workers,
@@ -358,7 +425,7 @@ async fn natural_matrix_case(case: NaturalCase) {
         series.events.len(),
         true,
         false,
-        true,
+        detail,
     );
     trace.set_series(series.delta_start, 1536);
     let limits = UpstreamInboundLimits::new(case.capacity, 16 * 1024 * 1024).unwrap();
@@ -367,7 +434,7 @@ async fn natural_matrix_case(case: NaturalCase) {
         let client = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
         let upstream = Arc::new(LiveUpstreamWebSocket::test_measurement_stream(
             client,
-            true,
+            aggregate,
             trace.clone(),
             limits,
         ));
@@ -377,7 +444,7 @@ async fn natural_matrix_case(case: NaturalCase) {
         (upstream, state, None, Some((open, reader)))
     } else {
         let (upstream, state, server) =
-            measurement_stream_pair_with_limits(&trace, true, limits).await;
+            measurement_stream_pair_with_limits(&trace, aggregate, limits).await;
         (upstream, state, Some(server), None)
     };
     let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
@@ -387,12 +454,21 @@ async fn natural_matrix_case(case: NaturalCase) {
     let consumer_pending = pending_observed.clone();
     let raw = case.raw;
     let slow = case.slow;
+    let outer_observer = case.outer_observer;
     let frames = series.events.len();
+    let anchor_unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_string();
+    let anchor = std::time::Instant::now();
     let mut consumer = tokio::spawn(async move {
         let mut output = NaturalOutput {
             chunks: Vec::new(),
             raw: Vec::new(),
             pause_completed: false,
+            yield_offsets_ns: outer_observer.then(|| Vec::with_capacity(frames + 4)),
+            end_offset_ns: None,
         };
         let mut body: ResponseBody = Box::pin(response_stream(state));
         let mut pending_tx = Some(pending_tx);
@@ -415,6 +491,7 @@ async fn natural_matrix_case(case: NaturalCase) {
                 .await;
                 match result {
                     Ok(Some(text)) => {
+                        output.observe_yield(anchor, frames + 4);
                         let last = output.raw.len() == frames - 1;
                         assert!(output.raw.len() < 1543);
                         output.raw.push(text);
@@ -444,6 +521,7 @@ async fn natural_matrix_case(case: NaturalCase) {
                 .await;
                 match result {
                     Some(Ok(chunk)) => {
+                        output.observe_yield(anchor, frames + 4);
                         assert!(output.chunks.len() < 1547);
                         output.chunks.push(chunk);
                         true
@@ -478,6 +556,7 @@ async fn natural_matrix_case(case: NaturalCase) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
+        output.end_offset_ns = outer_observer.then(|| anchor.elapsed().as_nanos() as u64);
         consumer_trace.event("eof", None, None, None, None);
         output
     });
@@ -490,6 +569,7 @@ async fn natural_matrix_case(case: NaturalCase) {
     let mut producer = tokio::spawn(async move {
         pending_rx.await.unwrap();
         let started = std::time::Instant::now();
+        let start_offset = anchor.elapsed().as_nanos() as u64;
         if let Some((open, reader)) = gate {
             supply_trace.event(
                 "input_gate_open",
@@ -501,12 +581,19 @@ async fn natural_matrix_case(case: NaturalCase) {
             open.store(true, Ordering::SeqCst);
             reader.wake();
             supply_count.store(payloads.len(), Ordering::SeqCst);
-            return (None, started.elapsed().as_nanos(), None);
+            return (
+                None,
+                started.elapsed().as_nanos(),
+                None,
+                [start_offset, anchor.elapsed().as_nanos() as u64],
+                None,
+            );
         }
         let mut server = server.unwrap();
         let base = tokio::time::Instant::now();
-        let scheduled_base = supply_trace.monotonic_ns().unwrap();
+        let scheduled_base = supply_trace.monotonic_ns();
         let mut delta_times = None;
+        let mut send_times = None;
         for (sequence, text) in payloads.into_iter().enumerate() {
             if supply_upstream.is_closed() {
                 break;
@@ -523,7 +610,7 @@ async fn natural_matrix_case(case: NaturalCase) {
             supply_trace.planned(
                 sequence,
                 text.len(),
-                Some(scheduled_base + offset.as_nanos() as u64),
+                scheduled_base.map(|base| base + offset.as_nanos() as u64),
             );
             supply_trace.event("send_start", Some(sequence), Some(text.len()), None, None);
             let bytes = text.len();
@@ -535,16 +622,23 @@ async fn natural_matrix_case(case: NaturalCase) {
                 break;
             }
             supply_count.fetch_add(1, Ordering::SeqCst);
+            let now = anchor.elapsed().as_nanos() as u64;
+            let times = send_times.get_or_insert([now, now]);
+            times[1] = now;
             supply_trace.event("send", Some(sequence), Some(bytes), None, None);
             if (delta_start..delta_start + 1536).contains(&sequence) {
-                let now = supply_trace.monotonic_ns().unwrap();
                 let times = delta_times.get_or_insert([now, now]);
                 times[1] = now;
             }
         }
-        (Some(server), started.elapsed().as_nanos(), delta_times)
+        (
+            Some(server),
+            started.elapsed().as_nanos(),
+            delta_times,
+            [start_offset, anchor.elapsed().as_nanos() as u64],
+            send_times,
+        )
     });
-    let started = std::time::Instant::now();
     let mut consumer_joined = false;
     let mut producer_joined = false;
     let result = measurement_attempt(&trace, async {
@@ -565,7 +659,7 @@ async fn natural_matrix_case(case: NaturalCase) {
         (output, producer_output)
     })
     .await;
-    let elapsed_ns = started.elapsed().as_nanos();
+    let elapsed_ns = anchor.elapsed().as_nanos();
     if result.is_err() {
         consumer.abort();
         producer.abort();
@@ -585,16 +679,22 @@ async fn natural_matrix_case(case: NaturalCase) {
     let mut validation = None;
     let mut supply = None;
     let mut pause_completed = false;
-    if let Ok((output, (server, duration, times))) = result {
+    let mut outer = json!({"schema_version":1,"enabled":outer_observer,"valid":false,"missing_yield_ordinal_ranges":[[0,frames+3]],"missing_reason":"consumer result unavailable; bounded trace retained"});
+    if let Ok((output, (server, duration, times, window, send_times))) = result {
         pause_completed = output.pause_completed;
         drop(server);
         supply = Some(
             json!({"elapsed_ns":duration,"delta_send_window_ns":times.map(|times| times[1]-times[0]),
+            "clock":"outer common std::time::Instant anchor; separate from optional C trace anchor","completion_window_offset_ns":window,"actual_send_completion_offsets_ns":send_times,"delta_send_completion_offsets_ns":times,
             "planned_delta_batch":16,"planned_batch_period_ns":5000000,"planned_send_rate_achieved":times.map(|times| supplied.load(Ordering::SeqCst) >= series.delta_start + 1536 && times[1]-times[0] <= 480000000),
             "interpretation":"unachieved natural rate is unidentified; quota control is not a rate proxy"}),
         );
         use futures_util::FutureExt;
         let checked = std::panic::AssertUnwindSafe(async {
+            outer = output.observations(raw, overflow);
+            if !overflow {
+                assert_eq!(supplied.load(Ordering::SeqCst), series.events.len());
+            }
             if raw {
                 for (sequence, text) in output.raw.iter().enumerate() { assert_eq!(text, &series.events[sequence]); }
                 if !overflow { assert_eq!(output.raw.len(), series.events.len()); }
@@ -602,14 +702,24 @@ async fn natural_matrix_case(case: NaturalCase) {
             } else { validate_matrix_output(&output.chunks, &series, case.kind, overflow) }
         }).catch_unwind().await;
         match checked {
-            Ok(value) => validation = Some(value),
+            Ok(value) => {
+                validation = Some(value);
+                trace.write_payloads(&format!("{}.input", case.name), &series.events);
+                if raw {
+                    trace.write_payloads(&format!("{}.raw", case.name), &output.raw);
+                } else {
+                    trace.write_payloads(&format!("{}.sse", case.name), &output.chunks);
+                }
+            }
             Err(_) => trace.invalidate(6),
         }
     }
     let physically_drained = stop_measurement_pump(upstream, &trace).await;
     use futures_util::FutureExt;
     if std::panic::AssertUnwindSafe(async {
-        trace.assert_measurement_records(None);
+        if detail {
+            trace.assert_measurement_records(None);
+        }
     })
     .catch_unwind()
     .await
@@ -620,10 +730,12 @@ async fn natural_matrix_case(case: NaturalCase) {
     let delivered = validation
         .as_ref()
         .and_then(|value| value["delivered_inputs"].as_u64());
-    trace.write_scenario(&case.name, &json!({"matrix":if case.ready {"M5/M7"} else {"M6"},"generator":series.metadata,
-        "runtime_flavor":if case.workers==2 {"multi_thread"} else {"current_thread"},"workers":case.workers,"mode":"C","aggregate":true,"detail":true,
+    trace.write_scenario(&case.name, &json!({"matrix":if case.ready {"M5/M7"} else {"M6/M7_paced"},"generator":series.metadata,
+        "runtime_flavor":if case.workers==2 {"multi_thread"} else {"current_thread"},"workers":case.workers,"mode":if detail {"C"} else if aggregate {"B"} else {"A"},"aggregate":aggregate,"detail":detail,
         "limits":{"messages":case.capacity,"bytes":16777216},"consumer":if raw {"raw_recv"} else {"response_stream"},"transport":if case.ready {"finite_ready_encoded"} else {"duplex_paced"},
         "ready_has_no_send_time":case.ready,"first_actual_pending_before_gate":pending_observed.load(Ordering::SeqCst),"planned_slow_chunks_per_5ms":if slow {Some(8)} else {None},"planned_pause_ns":if slow {50000000} else {0},"actual_pause_completed":pause_completed,
+        "outer_observer":outer_observer,"outer":outer,"clock":{"anchor_unix_ns":anchor_unix_ns,"clock":"std::time::Instant","offset_unit":"ns","origin":"immediately before consumer spawn","trace_clock":"independent C-only anchor; no cross-clock subtraction"},
+        "observation_limits":{"yields":frames+4,"run_timeout_ns":10000000000u64,"supply_timeout_ns":2000000000u64},
         "supply":supply,"supplied_or_encoded_available_inputs":supplied.load(Ordering::SeqCst),"output":validation,"delivered_sequence_inclusive":delivered.filter(|count| *count>0).map(|count|[0,count-1]),
         "undelivered_sequence_inclusive":delivered.filter(|count| (*count as usize)<series.events.len()).map(|count|[count,series.events.len() as u64-1]),
         "diagnostic_queue_before_cleanup":before_cleanup.0,"physical_drain_count":physically_drained,"elapsed_ns":elapsed_ns,"valid":validation.is_some() && trace.invalid_reason().is_none(),"invalid_reason":trace.invalid_reason(),
@@ -632,13 +744,61 @@ async fn natural_matrix_case(case: NaturalCase) {
     trace.flush();
     trace.assert_valid();
     assert!(validation.is_some());
-    trace.assert_measurement_records(None);
+    if detail {
+        trace.assert_measurement_records(None);
+    }
+}
+
+#[tokio::test]
+async fn response_stream_natural_modes_preserve_ready_and_paced_contracts() {
+    for ready in [true, false] {
+        for (mode, aggregate, detail) in
+            [('A', false, false), ('B', true, false), ('C', true, true)]
+        {
+            natural_matrix_case(NaturalCase {
+                name: format!("natural_modes_ready{ready}_{mode}"),
+                mode: (aggregate, detail),
+                outer_observer: true,
+                workers: 1,
+                capacity: 1024,
+                kind: crate::ws_pump::SyntheticSeriesKind::Text,
+                size: 199,
+                raw: false,
+                ready,
+                slow: false,
+            })
+            .await;
+        }
+    }
+    let trace = FiniteTrace::configured("natural_canonical", 1, 0, 0, false, false, false);
+    let cases = vec![
+        json!({"type":"response.output_text.delta","delta":"quote\" slash\\ newline\n tab\t \u{65e5}\u{672c}\u{8a9e}"}),
+        json!({"type":"response.output_text.delta","delta":""}),
+        json!({"type":"response.function_call_arguments.delta","delta":"{\"s\":\"\\n\"}"}),
+        json!({"type":"response.output_text.delta","delta":"synthetic tail"}),
+        json!({"type":"response.completed","response":{"id":"r0","status":"completed","output":[]}}),
+        json!({"type":"response.failed","response":{"status":"failed","error":{"code":"upstream_inbound_buffer_overflow","message":"The upstream websocket inbound buffer overflowed."}}}),
+    ];
+    let mut chunks: Vec<_> = cases
+        .iter()
+        .map(|value| {
+            crate::responses::downstream::sse_json_chunk(value["type"].as_str().unwrap(), value)
+        })
+        .collect();
+    chunks.push(crate::responses::downstream::sse_done_chunk());
+    assert_eq!(chunks.last().unwrap(), "data: [DONE]\n\n");
+    trace.write_payloads("natural_canonical.sse", &chunks);
+    trace.write_scenario("natural_canonical", &json!({"schema_version":1,"cases":cases,"chunk_bytes":chunks.iter().map(Bytes::len).collect::<Vec<_>>(),
+        "boundary":"current sse_json_chunk serializes Value to String, then sse_payload_chunk formats framing; independent C Serialize and Encode spans; DONE uses static bytes",
+        "scope":"exact helper bytes; synthetic/sanitized lifecycle behavior remains covered by existing response stream regressions"}));
 }
 
 async fn ready_matrix(workers: usize) {
     for capacity in [256, 512, 1024] {
         natural_matrix_case(NaturalCase {
             name: format!("m5_{capacity}_w{workers}"),
+            mode: (true, true),
+            outer_observer: true,
             workers,
             capacity,
             kind: crate::ws_pump::SyntheticSeriesKind::Text,
@@ -665,6 +825,8 @@ async fn paced_matrix(workers: usize) {
     for slow in [false, true] {
         natural_matrix_case(NaturalCase {
             name: format!("m6_slow{slow}_w{workers}"),
+            mode: (true, true),
+            outer_observer: true,
             workers,
             capacity: 256,
             kind: crate::ws_pump::SyntheticSeriesKind::Text,
@@ -700,6 +862,8 @@ async fn paced_volume_matrix(workers: usize) {
     for (size, raw) in [(199, false), (4096, false), (4096, true)] {
         natural_matrix_case(NaturalCase {
             name: format!("m7_paced_Arguments_{size}_raw{raw}_w{workers}"),
+            mode: (true, true),
+            outer_observer: true,
             workers,
             capacity: 256,
             kind: Arguments,
@@ -732,6 +896,8 @@ async fn volume_matrix(workers: usize) {
                 }
                 natural_matrix_case(NaturalCase {
                     name: format!("m7_{kind:?}_{size}_raw{raw}_w{workers}"),
+                    mode: (true, true),
+                    outer_observer: true,
                     workers,
                     capacity: 256,
                     kind,
@@ -754,6 +920,51 @@ async fn response_stream_matrix_volume_current_thread() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn response_stream_matrix_volume_two_workers() {
     volume_matrix(2).await;
+}
+
+async fn natural_comparison_matrix(workers: usize) {
+    use crate::ws_pump::SyntheticSeriesKind::{Arguments, Text};
+    for (mode, aggregate, detail) in [('A', false, false), ('B', true, false), ('C', true, true)] {
+        let mut cells = vec![
+            (Text, 199, false, true, 256),
+            (Text, 199, false, true, 512),
+            (Text, 199, false, true, 1024),
+            (Arguments, 199, false, false, 256),
+            (Arguments, 4096, false, false, 256),
+            (Arguments, 4096, true, false, 256),
+        ];
+        if detail {
+            cells.extend([
+                (Text, 4096, false, true, 256),
+                (Arguments, 4096, false, true, 256),
+                (Arguments, 4096, true, true, 256),
+            ]);
+        }
+        for (kind, size, raw, ready, capacity) in cells {
+            natural_matrix_case(NaturalCase {
+                name: format!("comparison_{kind:?}_{size}_raw{raw}_ready{ready}_n{capacity}_w{workers}_{mode}_outertrue"),
+                mode: (aggregate, detail), outer_observer: true, workers, capacity, kind, size, raw, ready, slow: false,
+            }).await;
+        }
+        for (kind, size, ready, capacity) in
+            [(Text, 199, true, 1024), (Arguments, 4096, false, 256)]
+        {
+            natural_matrix_case(NaturalCase {
+                name: format!("comparison_{kind:?}_{size}_rawfalse_ready{ready}_n{capacity}_w{workers}_{mode}_outerfalse"),
+                mode: (aggregate, detail), outer_observer: false, workers, capacity, kind, size, raw: false, ready, slow: false,
+            }).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn response_stream_natural_comparison_current_thread() {
+    natural_comparison_matrix(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_stream_natural_comparison_two_workers() {
+    natural_comparison_matrix(2).await;
 }
 
 async fn observer_matrix(workers: usize) {
