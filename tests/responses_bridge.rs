@@ -352,6 +352,7 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
         thread_id: Uuid::now_v7().to_string(),
         window_id: Uuid::now_v7().to_string(),
         turn_state: None,
+        cache_affinity_id: None,
     }
 }
 

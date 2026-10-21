@@ -52,65 +52,191 @@ fn log_probe_post(post: usize, payload: &Value) {
 
 #[tokio::test]
 async fn client_emulated_full_resend_uses_new_session_and_only_registers_success() {
-    for retry_fails in [false, true] {
-        let old_server = Arc::new(ScriptedWebSocketServer::start().await);
-        let new_server = Arc::new(ScriptedWebSocketServer::start().await);
-        let connector = RecordingConnector::new(vec![
-            planned_connection(&old_server, Some("old-turn-state"), false, None),
-            planned_connection(&new_server, None, false, None),
-        ]);
-        let app = build_test_router(Arc::new(connector.clone()));
-        seed_marker(app.clone(), &old_server, "seed-marker").await;
-        let alias = begin_continuation(app.clone(), &old_server, "seed-marker", None).await;
-        old_server
-            .send_text(
-                &assistant_text_completed_event("alias-marker", "alias completion").to_string(),
+    let cache_key = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
+    for cache_key in [None, Some(cache_key)] {
+        for retry_fails in [false, true] {
+            let old_server = Arc::new(ScriptedWebSocketServer::start().await);
+            let new_server = Arc::new(ScriptedWebSocketServer::start().await);
+            let connector = RecordingConnector::new(vec![
+                planned_connection(&old_server, Some("old-turn-state"), false, None),
+                planned_connection(&new_server, None, false, None),
+            ]);
+            let app = build_test_router(Arc::new(connector.clone()));
+            seed_and_advance_cache_affinity_session(
+                app.clone(),
+                &old_server,
+                &connector,
+                cache_key,
             )
             .await;
-        let _ = to_bytes(alias.await.expect("alias headers").into_body(), usize::MAX)
-            .await
-            .expect("alias body");
-        let continuation = begin_continuation(app.clone(), &old_server, "alias-marker", None).await;
-        old_server
-            .send_text(r#"{"type":"error","error":{"code":"websocket_connection_limit_reached"}}"#)
-            .await;
-        let response = timeout(Duration::from_secs(1), continuation)
-            .await
-            .expect("limit headers")
-            .expect("task");
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let error: Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), usize::MAX)
+            close_retained_session_before_resend(app.clone(), &old_server, &connector).await;
+            let full_input = json!([
+                {"role":"user","content":"seed"}, {"role":"assistant","content":"seed completion"},
+                {"role":"user","content":"continue"}, {"role":"assistant","content":"alias completion"},
+                {"role":"user","content":"continue"}
+            ]);
+            let mut retry_payload = json!({"model":"gpt-6-sol","input":full_input});
+            if let Some(cache_key) = cache_key {
+                retry_payload["prompt_cache_key"] = json!(cache_key);
+            }
+            let retry = post_responses(app.clone(), retry_payload).await;
+            assert_eq!(retry.status(), StatusCode::OK);
+            let create = timeout(Duration::from_secs(1), new_server.recv_client_message())
                 .await
-                .expect("error body"),
-        )
-        .expect("error JSON");
-        assert_eq!(error["error"]["code"], "websocket_connection_limit_reached");
-        assert_eq!(connector.recorded_sessions().await.len(), 1);
-        assert!(connector.recorded_websockets().await[0].upgrade().is_none());
-        assert_old_aliases_missing(app.clone()).await;
-        let full_input = json!([
-            {"role":"user","content":"seed"}, {"role":"assistant","content":"seed completion"},
-            {"role":"user","content":"continue"}, {"role":"assistant","content":"alias completion"},
-            {"role":"user","content":"continue"}
-        ]);
-        let retry =
-            post_responses(app.clone(), json!({"model":"gpt-6-sol","input":full_input})).await;
-        assert_eq!(retry.status(), StatusCode::OK);
-        let create = timeout(Duration::from_secs(1), new_server.recv_client_message())
-            .await
-            .expect("new create deadline")
-            .expect("new create");
-        let create: Value = serde_json::from_str(&create.into_text().expect("text")).expect("JSON");
-        assert_eq!(create["input"], full_input);
-        assert!(create.get("previous_response_id").is_none());
-        let sessions = connector.recorded_sessions().await;
-        assert_eq!(sessions.len(), 2);
-        assert_ne!(sessions[0].session_id, sessions[1].session_id);
-        assert_ne!(sessions[0].window_id, sessions[1].window_id);
-        assert_eq!(sessions[1].turn_state, None);
-        assert_client_retry_result(app, &new_server, &connector, retry, retry_fails).await;
+                .expect("new create deadline")
+                .expect("new create");
+            let create: Value =
+                serde_json::from_str(&create.into_text().expect("text")).expect("JSON");
+            assert_eq!(create["input"], full_input);
+            assert_eq!(
+                create.get("prompt_cache_key").and_then(Value::as_str),
+                cache_key
+            );
+            assert!(create.get("previous_response_id").is_none());
+            let sessions = connector.recorded_sessions().await;
+            assert_eq!(sessions.len(), 2);
+            assert_ne!(sessions[0].session_id, sessions[1].session_id);
+            assert_eq!(sessions[0].cache_affinity_id.as_deref(), cache_key);
+            assert_eq!(sessions[1].cache_affinity_id.as_deref(), cache_key);
+            assert_eq!(sessions[1].turn_state, None);
+            assert_client_retry_result(app, &new_server, &connector, retry, retry_fails).await;
+        }
     }
+}
+
+async fn seed_and_advance_cache_affinity_session(
+    app: axum::Router,
+    server: &ScriptedWebSocketServer,
+    connector: &RecordingConnector,
+    cache_key: Option<&str>,
+) {
+    let mut seed_payload = json!({"model":"gpt-6-sol","input":"seed"});
+    if let Some(cache_key) = cache_key {
+        seed_payload["prompt_cache_key"] = json!(cache_key);
+    }
+    let seed = post_responses(app.clone(), seed_payload).await;
+    assert_eq!(seed.status(), StatusCode::OK);
+    let seed_create = timeout(Duration::from_secs(1), server.recv_client_message())
+        .await
+        .expect("seed create deadline")
+        .expect("seed create");
+    let seed_create: Value =
+        serde_json::from_str(&seed_create.into_text().expect("text")).expect("JSON");
+    assert_eq!(
+        seed_create.get("prompt_cache_key").and_then(Value::as_str),
+        cache_key
+    );
+    server
+        .send_text(&assistant_text_completed_event("seed-marker", "seed completion").to_string())
+        .await;
+    let _ = to_bytes(seed.into_body(), usize::MAX)
+        .await
+        .expect("seed body");
+    assert_eq!(
+        connector.recorded_sessions().await[0]
+            .cache_affinity_id
+            .as_deref(),
+        cache_key
+    );
+    let alias = begin_continuation(app, server, "seed-marker", None).await;
+    let retained = connector.recorded_sessions().await;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].cache_affinity_id.as_deref(), cache_key);
+    server
+        .send_text(&assistant_text_completed_event("alias-marker", "alias completion").to_string())
+        .await;
+    let _ = to_bytes(alias.await.expect("alias headers").into_body(), usize::MAX)
+        .await
+        .expect("alias body");
+}
+
+async fn close_retained_session_before_resend(
+    app: axum::Router,
+    server: &ScriptedWebSocketServer,
+    connector: &RecordingConnector,
+) {
+    let continuation = begin_continuation(app.clone(), server, "alias-marker", None).await;
+    server
+        .send_text(r#"{"type":"error","error":{"code":"websocket_connection_limit_reached"}}"#)
+        .await;
+    let response = timeout(Duration::from_secs(1), continuation)
+        .await
+        .expect("limit headers")
+        .expect("task");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let error: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body"),
+    )
+    .expect("error JSON");
+    assert_eq!(error["error"]["code"], "websocket_connection_limit_reached");
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert!(connector.recorded_websockets().await[0].upgrade().is_none());
+    assert_old_aliases_missing(app).await;
+}
+
+#[tokio::test]
+async fn retained_marker_keeps_original_affinity_when_incoming_key_changes() {
+    let original_key = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
+    let incoming_key = "f78a3bb8-5b4a-4c21-9f48-e3b42239d5cc:gpt-6-sol";
+    let server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = RecordingConnector::new(vec![planned_connection(&server, None, false, None)]);
+    let app = build_test_router(Arc::new(connector.clone()));
+    let seeded = post_responses(
+        app.clone(),
+        json!({"model":"gpt-6-sol","input":"seed","prompt_cache_key":original_key}),
+    )
+    .await;
+    assert_eq!(seeded.status(), StatusCode::OK);
+    let seed_create = timeout(Duration::from_secs(1), server.recv_client_message())
+        .await
+        .expect("seed create deadline")
+        .expect("seed create");
+    let seed_create: Value =
+        serde_json::from_str(&seed_create.into_text().expect("text")).expect("seed JSON");
+    assert_eq!(seed_create["prompt_cache_key"], original_key);
+    server
+        .send_text(&assistant_text_completed_event("retained-marker", "seed done").to_string())
+        .await;
+    let _ = to_bytes(seeded.into_body(), usize::MAX)
+        .await
+        .expect("seed response body");
+
+    let continuation = post_responses(
+        app,
+        json!({
+            "model":"gpt-6-sol",
+            "input":"continue",
+            "previous_response_id":"retained-marker",
+            "prompt_cache_key":incoming_key
+        }),
+    );
+    let continuation = tokio::spawn(continuation);
+    let message = timeout(Duration::from_secs(1), server.recv_client_message())
+        .await
+        .expect("continuation create deadline")
+        .expect("continuation create");
+    let request: Value =
+        serde_json::from_str(&message.into_text().expect("text")).expect("continuation JSON");
+    assert_eq!(request["prompt_cache_key"], incoming_key);
+    assert_eq!(request["previous_response_id"], "retained-marker");
+    assert_eq!(connector.recorded_sessions().await.len(), 1);
+    assert_eq!(
+        connector.recorded_sessions().await[0]
+            .cache_affinity_id
+            .as_deref(),
+        Some(original_key)
+    );
+
+    server
+        .send_text(&assistant_text_completed_event("continued-marker", "continued").to_string())
+        .await;
+    let response = continuation.await.expect("continuation task");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("continuation response body");
 }
 
 async fn assert_old_aliases_missing(app: axum::Router) {

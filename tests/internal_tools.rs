@@ -65,6 +65,7 @@ struct RecordingConnector {
     plans: Arc<Mutex<VecDeque<PlannedConnection>>>,
     websockets: Arc<Mutex<Vec<Weak<LiveUpstreamWebSocket>>>>,
     sessions: Arc<Mutex<Vec<UpstreamSessionDescriptor>>>,
+    connection_arguments: Arc<Mutex<Vec<Option<UpstreamSessionDescriptor>>>>,
     inbound_limits: UpstreamInboundLimits,
     watchdog_policy: Option<UpstreamWatchdogPolicy>,
 }
@@ -75,6 +76,7 @@ impl RecordingConnector {
             plans: Arc::new(Mutex::new(plans.into())),
             websockets: Arc::new(Mutex::new(Vec::new())),
             sessions: Arc::new(Mutex::new(Vec::new())),
+            connection_arguments: Arc::new(Mutex::new(Vec::new())),
             inbound_limits: UpstreamInboundLimits::DEFAULT,
             watchdog_policy: None,
         }
@@ -103,6 +105,10 @@ impl RecordingConnector {
     async fn recorded_websockets(&self) -> Vec<Weak<LiveUpstreamWebSocket>> {
         self.websockets.lock().await.clone()
     }
+
+    async fn recorded_connection_arguments(&self) -> Vec<Option<UpstreamSessionDescriptor>> {
+        self.connection_arguments.lock().await.clone()
+    }
 }
 
 impl UpstreamConnector for RecordingConnector {
@@ -114,9 +120,11 @@ impl UpstreamConnector for RecordingConnector {
         let plans = Arc::clone(&self.plans);
         let websockets = Arc::clone(&self.websockets);
         let sessions = Arc::clone(&self.sessions);
+        let connection_arguments = Arc::clone(&self.connection_arguments);
         let inbound_limits = self.inbound_limits;
         let watchdog_policy = self.watchdog_policy;
         Box::pin(async move {
+            connection_arguments.lock().await.push(session.clone());
             let session = session.unwrap_or_else(new_session_descriptor);
             let plan = plans
                 .lock()
@@ -298,6 +306,7 @@ fn new_session_descriptor() -> UpstreamSessionDescriptor {
         thread_id: Uuid::now_v7().to_string(),
         window_id: Uuid::now_v7().to_string(),
         turn_state: None,
+        cache_affinity_id: None,
     }
 }
 
@@ -711,12 +720,14 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
         turn_state: None,
     }]);
     let app = build_test_router(Arc::new(connector));
+    let cache_key = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
 
     let response = post_responses(
-        app,
+        app.clone(),
         json!({
             "model": "gpt-6-sol",
             "input": "run internal tool loop",
+            "prompt_cache_key": cache_key,
             "max_output_tokens": 512,
             "max_tokens": 256,
             "max_completion_tokens": 128,
@@ -747,6 +758,8 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     .expect("initial request json");
     assert_eq!(first_request["type"], "response.create");
     assert_eq!(first_request["instructions"], "");
+    assert_eq!(first_request["prompt_cache_key"], cache_key);
+    assert_ne!(first_request["client_metadata"]["session_id"], cache_key);
     assert!(first_request.get("response").is_none());
     assert!(first_request.get("max_output_tokens").is_none());
     assert!(first_request.get("max_tokens").is_none());
@@ -787,6 +800,11 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     assert_eq!(followup_request["type"], "response.create");
     assert_eq!(followup_request["store"], false);
     assert_eq!(followup_request["instructions"], "");
+    assert_eq!(followup_request["prompt_cache_key"], cache_key);
+    assert_eq!(
+        followup_request["client_metadata"]["session_id"],
+        first_request["client_metadata"]["session_id"]
+    );
     assert!(followup_request.get("response").is_none());
     assert!(followup_request.get("max_output_tokens").is_none());
     assert!(followup_request.get("max_tokens").is_none());
@@ -839,6 +857,332 @@ async fn internal_tool_outputs_are_sent_after_intermediate_response_completes() 
     assert!(!body_text.contains("response-intermediate"));
     assert!(!body_text.contains("event: response.output_item.done"));
     assert!(server.take_pending_client_messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_same_affinity_sessions_keep_internal_followups_independent() {
+    let first_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let second_server = Arc::new(ScriptedWebSocketServer::start().await);
+    let connector = Arc::new(RecordingConnector::new(vec![
+        PlannedConnection {
+            server: Arc::clone(&first_server),
+            turn_state: None,
+        },
+        PlannedConnection {
+            server: Arc::clone(&second_server),
+            turn_state: None,
+        },
+    ]));
+    let connector_service: Arc<dyn UpstreamConnector> = connector.clone();
+    let app = build_test_router(connector_service);
+    let cache_key = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
+    let first_response = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-6-sol",
+            "input":"first independent request",
+            "prompt_cache_key":cache_key
+        }),
+    )
+    .await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_create: Value = serde_json::from_str(&message_text(
+        first_server
+            .recv_client_message()
+            .await
+            .expect("first initial request"),
+    ))
+    .expect("first initial request JSON");
+
+    let second_response = post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-6-sol",
+            "input":"second independent request",
+            "prompt_cache_key":cache_key
+        }),
+    )
+    .await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_create: Value = serde_json::from_str(&message_text(
+        second_server
+            .recv_client_message()
+            .await
+            .expect("second initial request"),
+    ))
+    .expect("second initial request JSON");
+
+    assert_eq!(first_create["prompt_cache_key"], cache_key);
+    assert_eq!(second_create["prompt_cache_key"], cache_key);
+    assert_ne!(
+        first_create["client_metadata"]["session_id"],
+        second_create["client_metadata"]["session_id"]
+    );
+    let connection_arguments = connector.recorded_connection_arguments().await;
+    let first_session = connection_arguments[0]
+        .as_ref()
+        .expect("first connection descriptor");
+    let second_session = connection_arguments[1]
+        .as_ref()
+        .expect("second connection descriptor");
+    assert_eq!(
+        first_create["client_metadata"]["session_id"],
+        first_session.session_id
+    );
+    assert_eq!(
+        first_create["client_metadata"]["thread_id"],
+        first_session.thread_id
+    );
+    assert_eq!(
+        second_create["client_metadata"]["session_id"],
+        second_session.session_id
+    );
+    assert_eq!(
+        second_create["client_metadata"]["thread_id"],
+        second_session.thread_id
+    );
+    assert_eq!(first_session.cache_affinity_id.as_deref(), Some(cache_key));
+    assert_eq!(second_session.cache_affinity_id.as_deref(), Some(cache_key));
+    let first_body = tokio::spawn(async move {
+        to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .expect("first response body")
+    });
+    let second_body = tokio::spawn(async move {
+        to_bytes(second_response.into_body(), usize::MAX)
+            .await
+            .expect("second response body")
+    });
+
+    first_server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-first","name":"threadline_echo","arguments":"{\"value\":\"first-output\"}"}}"#,
+        )
+        .await;
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"intermediate-first"}}"#)
+        .await;
+    second_server
+        .send_text(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-second","name":"threadline_echo","arguments":"{\"value\":\"second-output\"}"}}"#,
+        )
+        .await;
+    second_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"intermediate-second"}}"#)
+        .await;
+
+    let first_followup: Value = serde_json::from_str(&message_text(
+        first_server
+            .recv_client_message()
+            .await
+            .expect("first follow-up"),
+    ))
+    .expect("first follow-up JSON");
+    let second_followup: Value = serde_json::from_str(&message_text(
+        second_server
+            .recv_client_message()
+            .await
+            .expect("second follow-up"),
+    ))
+    .expect("second follow-up JSON");
+
+    for (followup, original, marker, call_id, output) in [
+        (
+            &first_followup,
+            &first_create,
+            "intermediate-first",
+            "call-first",
+            "first-output",
+        ),
+        (
+            &second_followup,
+            &second_create,
+            "intermediate-second",
+            "call-second",
+            "second-output",
+        ),
+    ] {
+        assert_eq!(followup["prompt_cache_key"], cache_key);
+        assert_eq!(followup["previous_response_id"], marker);
+        assert_eq!(
+            followup["client_metadata"]["session_id"],
+            original["client_metadata"]["session_id"]
+        );
+        assert_eq!(followup["input"][0]["call_id"], call_id);
+        assert_eq!(followup["input"][0]["output"], output);
+    }
+
+    first_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first final"}"#)
+        .await;
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"final-first"}}"#)
+        .await;
+    second_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second final"}"#)
+        .await;
+    second_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"final-second"}}"#)
+        .await;
+
+    let first_body = String::from_utf8(first_body.await.expect("first body task").to_vec())
+        .expect("first body UTF-8");
+    let second_body = String::from_utf8(second_body.await.expect("second body task").to_vec())
+        .expect("second body UTF-8");
+    assert!(first_body.contains("first final"));
+    assert!(!first_body.contains("second final"));
+    assert!(second_body.contains("second final"));
+    assert!(!second_body.contains("first final"));
+    assert!(!first_body.contains("intermediate-first"));
+    assert!(!second_body.contains("intermediate-second"));
+
+    let first_continuation_task = tokio::spawn(post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-6-sol",
+            "input":"continue first marker",
+            "prompt_cache_key":cache_key,
+            "previous_response_id":"final-first"
+        }),
+    ));
+    let first_continuation_message =
+        tokio::time::timeout(Duration::from_secs(2), first_server.recv_client_message())
+            .await
+            .expect("first marker should send on its own socket")
+            .expect("first marker should reacquire its own socket");
+    let first_continuation_create: Value =
+        serde_json::from_str(&message_text(first_continuation_message))
+            .expect("first continuation JSON");
+    assert_eq!(
+        first_continuation_create["previous_response_id"],
+        "final-first"
+    );
+    assert_eq!(
+        first_continuation_create["client_metadata"]["session_id"],
+        first_create["client_metadata"]["session_id"]
+    );
+    assert_eq!(first_continuation_create["prompt_cache_key"], cache_key);
+    first_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first continuation pending"}"#)
+        .await;
+    let first_continuation = tokio::time::timeout(Duration::from_secs(2), first_continuation_task)
+        .await
+        .expect("first marker continuation should be accepted")
+        .expect("first continuation request task should join");
+    assert_eq!(first_continuation.status(), StatusCode::OK);
+
+    let first_continuation_body = tokio::spawn(async move {
+        to_bytes(first_continuation.into_body(), usize::MAX)
+            .await
+            .expect("first continuation body")
+    });
+
+    let second_continuation_task = tokio::spawn(post_responses(
+        app.clone(),
+        json!({
+            "model":"gpt-6-sol",
+            "input":"continue second marker",
+            "prompt_cache_key":cache_key,
+            "previous_response_id":"final-second"
+        }),
+    ));
+    let second_continuation_message =
+        tokio::time::timeout(Duration::from_secs(2), second_server.recv_client_message())
+            .await
+            .expect("second marker should send on its own socket")
+            .expect("second marker should reacquire its own socket");
+    let second_continuation_create: Value =
+        serde_json::from_str(&message_text(second_continuation_message))
+            .expect("second continuation JSON");
+    assert_eq!(
+        second_continuation_create["previous_response_id"],
+        "final-second"
+    );
+    assert_eq!(
+        second_continuation_create["client_metadata"]["session_id"],
+        second_create["client_metadata"]["session_id"]
+    );
+    assert_eq!(second_continuation_create["prompt_cache_key"], cache_key);
+    second_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second continuation pending"}"#)
+        .await;
+    let second_continuation =
+        tokio::time::timeout(Duration::from_secs(2), second_continuation_task)
+            .await
+            .expect("second marker continuation should be accepted")
+            .expect("second continuation request task should join");
+    assert_eq!(second_continuation.status(), StatusCode::OK);
+    let second_continuation_body = tokio::spawn(async move {
+        to_bytes(second_continuation.into_body(), usize::MAX)
+            .await
+            .expect("second continuation body")
+    });
+    second_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"second continued"}"#)
+        .await;
+    second_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"final-second-continuation"}}"#)
+        .await;
+    let second_continuation_body = String::from_utf8(
+        second_continuation_body
+            .await
+            .expect("second continuation body task")
+            .to_vec(),
+    )
+    .expect("second continuation body UTF-8");
+    assert!(second_continuation_body.contains("second continued"));
+
+    tokio::time::timeout(Duration::from_secs(2), second_server.abort_connection())
+        .await
+        .expect("second fixture abort should complete");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let sockets = connector.recorded_websockets().await;
+            let closed = sockets
+                .get(1)
+                .and_then(|socket| socket.upgrade())
+                .is_some_and(|socket| format!("{:?}", socket.terminal_state()) != "Open");
+            if closed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second retained socket should reach a terminal state");
+
+    let closed_second_continuation = tokio::time::timeout(
+        Duration::from_secs(2),
+        post_responses(
+            app,
+            json!({
+                "model":"gpt-6-sol",
+                "input":"continue closed second marker",
+                "prompt_cache_key":cache_key,
+                "previous_response_id":"final-second-continuation"
+            }),
+        ),
+    )
+    .await
+    .expect("closed second marker should fail without blocking first marker");
+    assert_eq!(closed_second_continuation.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(closed_second_continuation.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(connector.recorded_connection_arguments().await.len(), 2);
+
+    first_server
+        .send_text(r#"{"type":"response.output_text.delta","delta":"first continued"}"#)
+        .await;
+    first_server
+        .send_text(r#"{"type":"response.completed","response":{"id":"final-first-continuation"}}"#)
+        .await;
+    let first_continuation_body = String::from_utf8(
+        first_continuation_body
+            .await
+            .expect("first continuation body task")
+            .to_vec(),
+    )
+    .expect("first continuation body UTF-8");
+    assert!(first_continuation_body.contains("first continued"));
 }
 
 #[tokio::test]
@@ -1272,13 +1616,13 @@ async fn summary_request_does_not_inject_threadline_internal_tools() {
         server: Arc::clone(&server),
         turn_state: None,
     }]);
-    let app = build_test_router(Arc::new(connector));
+    let app = build_test_router(Arc::new(connector.clone()));
+    let cache_key = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
+    let mut summary_request =
+        auxiliary_summary_request_with_tools(vec![downstream_function_tool("downstream_tool")]);
+    summary_request["prompt_cache_key"] = json!(cache_key);
 
-    let response = post_responses(
-        app,
-        auxiliary_summary_request_with_tools(vec![downstream_function_tool("downstream_tool")]),
-    )
-    .await;
+    let response = post_responses(app.clone(), summary_request).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let body_task = tokio::spawn(async move {
@@ -1291,6 +1635,8 @@ async fn summary_request_does_not_inject_threadline_internal_tools() {
         server.recv_client_message().await.expect("initial request"),
     ))
     .expect("initial request json");
+    assert_eq!(connector.recorded_connection_arguments().await, vec![None]);
+    assert_eq!(first_request["prompt_cache_key"], cache_key);
     let tools = first_request["tools"].as_array().expect("tools array");
 
     assert!(tools.iter().any(|tool| tool["name"] == "downstream_tool"));
@@ -1313,6 +1659,19 @@ async fn summary_request_does_not_inject_threadline_internal_tools() {
     let body = body_task.await.expect("body task");
     let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
     assert!(!body_text.contains("threadline_"));
+
+    let marker_lookup = post_responses(
+        app,
+        json!({
+            "model":"gpt-6-sol",
+            "input":"summary marker lookup",
+            "previous_response_id":"response-summary",
+            "prompt_cache_key":cache_key
+        }),
+    )
+    .await;
+    assert_eq!(marker_lookup.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(connector.recorded_connection_arguments().await, vec![None]);
 }
 
 #[tokio::test]

@@ -193,6 +193,23 @@ fn thread_id_from_prompt_cache_key(payload: &serde_json::Map<String, Value>) -> 
         .map(|id| id.to_string())
 }
 
+fn cache_affinity_from_prompt_cache_key(
+    payload: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    let prompt_cache_key = payload.get("prompt_cache_key")?.as_str()?;
+    let (conversation_id, family) = prompt_cache_key.rsplit_once(':')?;
+    if family.is_empty()
+        || !prompt_cache_key
+            .bytes()
+            .all(|byte| (0x21..=0x7e).contains(&byte))
+        || Uuid::parse_str(conversation_id).is_err()
+        || HeaderValue::from_str(prompt_cache_key).is_err()
+    {
+        return None;
+    }
+    Some(prompt_cache_key.to_string())
+}
+
 fn request_class_label(classification: DownstreamRequestClassification) -> &'static str {
     match classification {
         DownstreamRequestClassification::Normal => "normal",

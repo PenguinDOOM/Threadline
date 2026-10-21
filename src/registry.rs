@@ -86,12 +86,22 @@ impl RetainedSessionRegistry {
         &self,
         thread_id: Option<String>,
     ) -> Result<RetainedSessionLease, RegistryAcquireError> {
+        self.acquire_new_with_thread_id_and_cache_affinity(thread_id, None)
+            .await
+    }
+
+    pub async fn acquire_new_with_thread_id_and_cache_affinity(
+        &self,
+        thread_id: Option<String>,
+        cache_affinity_id: Option<String>,
+    ) -> Result<RetainedSessionLease, RegistryAcquireError> {
         let mut state = self.inner.lock().expect("registry mutex poisoned");
         state.ensure_new_capacity()?;
 
         let entry_id = state.next_entry_id;
         state.next_entry_id += 1;
-        let session = UpstreamSessionDescriptor::new(thread_id);
+        let mut session = UpstreamSessionDescriptor::new(thread_id);
+        session.cache_affinity_id = cache_affinity_id;
         state.entries.insert(
             entry_id,
             RegistryEntry {

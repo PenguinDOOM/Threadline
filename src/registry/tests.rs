@@ -13,6 +13,7 @@ fn explicit_session() -> UpstreamSessionDescriptor {
         thread_id: "thread-known".to_string(),
         window_id: "thread-known:7".to_string(),
         turn_state: Some("turn-state-known".to_string()),
+        cache_affinity_id: None,
     }
 }
 
@@ -101,14 +102,61 @@ async fn new_session_can_use_downstream_thread_identity() {
 }
 
 #[tokio::test]
-async fn recoverable_close_preserves_window_generation() {
+async fn retained_marker_keeps_cache_affinity_with_its_session_descriptor() {
     let registry = RetainedSessionRegistry::new(1);
-    let mut lease = registry.acquire_new().await.expect("create session");
-    let original_window_id = lease.session().window_id.clone();
+    let affinity = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
+    let mut lease = registry
+        .acquire_new_with_thread_id_and_cache_affinity(None, Some(affinity.to_string()))
+        .await
+        .expect("create session");
+
+    assert_eq!(lease.session().cache_affinity_id.as_deref(), Some(affinity));
+    lease.record_completed_marker("resp_affinity").await;
+    lease.release();
+
+    let retained = registry
+        .acquire_previous("resp_affinity")
+        .await
+        .expect("acquire retained session");
+    assert_eq!(
+        retained.session().cache_affinity_id.as_deref(),
+        Some(affinity)
+    );
+}
+
+#[tokio::test]
+async fn recoverable_close_preserves_session_descriptor_metadata() {
+    let registry = RetainedSessionRegistry::new(1);
+    let affinity = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
+    let mut lease = registry
+        .acquire_new_with_thread_id_and_cache_affinity(
+            Some("thread-recoverable".to_string()),
+            Some(affinity.to_string()),
+        )
+        .await
+        .expect("create session");
+    lease
+        .update_turn_state(Some("turn-state-recoverable".to_string()))
+        .await;
+    lease.record_completed_marker("resp_recoverable").await;
+    lease.release();
+
+    let mut lease = registry
+        .acquire_previous("resp_recoverable")
+        .await
+        .expect("acquire retained session");
+    let original_session = lease.session().clone();
 
     lease.mark_upstream_recoverable().await;
 
-    assert_eq!(lease.session().window_id, original_window_id);
+    assert_eq!(lease.session().session_id, original_session.session_id);
+    assert_eq!(
+        lease.session().cache_affinity_id,
+        original_session.cache_affinity_id
+    );
+    assert_eq!(lease.session().thread_id, original_session.thread_id);
+    assert_eq!(lease.session().window_id, original_session.window_id);
+    assert_eq!(lease.session().turn_state, original_session.turn_state);
 }
 
 #[tokio::test]

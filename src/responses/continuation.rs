@@ -127,6 +127,7 @@ pub(super) async fn acquire_lease(
     registry: &RetainedSessionRegistry,
     previous_response_id: Option<&str>,
     downstream_thread_id: Option<&str>,
+    cache_affinity_id: Option<&str>,
 ) -> Result<RetainedSessionLease, ThreadlineError> {
     match previous_response_id {
         Some(previous_response_id) => registry
@@ -134,7 +135,10 @@ pub(super) async fn acquire_lease(
             .await
             .map_err(map_registry_error),
         None => registry
-            .acquire_new_with_thread_id(downstream_thread_id.map(ToOwned::to_owned))
+            .acquire_new_with_thread_id_and_cache_affinity(
+                downstream_thread_id.map(ToOwned::to_owned),
+                cache_affinity_id.map(ToOwned::to_owned),
+            )
             .await
             .map_err(map_registry_error),
     }

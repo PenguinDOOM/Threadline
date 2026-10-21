@@ -17,12 +17,29 @@ const WINDOW_ID_METADATA_KEY: &str = "x-codex-window-id";
 #[cfg(test)]
 const EXPECTED_CODEX_CLIENT_VERSION: &str = "0.136.0";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpstreamSessionDescriptor {
     pub session_id: String,
     pub thread_id: String,
     pub window_id: String,
     pub turn_state: Option<String>,
+    pub cache_affinity_id: Option<String>,
+}
+
+impl std::fmt::Debug for UpstreamSessionDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamSessionDescriptor")
+            .field("session_id", &self.session_id)
+            .field("thread_id", &self.thread_id)
+            .field("window_id", &self.window_id)
+            .field("turn_state", &self.turn_state)
+            .field(
+                "cache_affinity_id",
+                &self.cache_affinity_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl UpstreamSessionDescriptor {
@@ -37,6 +54,7 @@ impl UpstreamSessionDescriptor {
             thread_id,
             window_id,
             turn_state: None,
+            cache_affinity_id: None,
         }
     }
 
@@ -169,7 +187,11 @@ fn insert_session_headers(
     session: &UpstreamSessionDescriptor,
     client_request_id: &str,
 ) -> Result<(), HandshakeBuildError> {
-    headers.insert("session-id", header_value(&session.session_id)?);
+    let session_header = session
+        .cache_affinity_id
+        .as_deref()
+        .unwrap_or(&session.session_id);
+    headers.insert("session-id", header_value(session_header)?);
     headers.insert("thread-id", header_value(&session.thread_id)?);
     headers.insert("x-codex-window-id", header_value(&session.window_id)?);
     headers.insert("x-client-request-id", header_value(client_request_id)?);
@@ -262,6 +284,7 @@ mod tests {
             thread_id: "thread-456".to_string(),
             window_id: "thread-456:3".to_string(),
             turn_state: Some("turn-state-abc".to_string()),
+            cache_affinity_id: None,
         };
 
         let handshake = build_handshake_request_with_installation_id(
@@ -280,6 +303,61 @@ mod tests {
         assert_eq!(headers["x-codex-window-id"], session.window_id);
         assert_eq!(headers["x-codex-turn-state"], "turn-state-abc");
         assert_ne!(headers["x-client-request-id"], "turn-state-abc");
+    }
+
+    #[test]
+    fn matching_cache_affinity_uses_shared_header_without_sharing_session_identity() {
+        let affinity = "48a65359-981b-47c2-9612-e1c64ae07e22:chat";
+        let mut first_session = UpstreamSessionDescriptor::new(None);
+        first_session.cache_affinity_id = Some(affinity.to_string());
+        let mut second_session = UpstreamSessionDescriptor::new(None);
+        second_session.cache_affinity_id = Some(affinity.to_string());
+
+        let first = build_handshake_request_with_installation_id(
+            "wss://example.invalid/upstream",
+            &test_auth(),
+            EXPECTED_CODEX_CLIENT_VERSION,
+            TEST_INSTALLATION_ID,
+            Some(first_session),
+        )
+        .expect("first handshake should build");
+        let second = build_handshake_request_with_installation_id(
+            "wss://example.invalid/upstream",
+            &test_auth(),
+            EXPECTED_CODEX_CLIENT_VERSION,
+            TEST_INSTALLATION_ID,
+            Some(second_session),
+        )
+        .expect("second handshake should build");
+
+        assert_eq!(first.request.headers()["session-id"], affinity);
+        assert_eq!(second.request.headers()["session-id"], affinity);
+        assert_ne!(first.session.session_id, second.session.session_id);
+
+        let mut other_family_session = UpstreamSessionDescriptor::new(None);
+        other_family_session.cache_affinity_id =
+            Some("48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-nova".to_string());
+        let other_family = build_handshake_request_with_installation_id(
+            "wss://example.invalid/upstream",
+            &test_auth(),
+            EXPECTED_CODEX_CLIENT_VERSION,
+            TEST_INSTALLATION_ID,
+            Some(other_family_session),
+        )
+        .expect("other family handshake should build");
+        assert_ne!(other_family.request.headers()["session-id"], affinity);
+        assert!(!format!("{:?}", first.session).contains(affinity));
+
+        let mut metadata = json!({});
+        apply_session_metadata_with_installation_id(
+            metadata.as_object_mut().expect("metadata object"),
+            &first.session,
+            TEST_INSTALLATION_ID,
+        );
+        assert_eq!(
+            metadata["client_metadata"]["session_id"],
+            first.session.session_id
+        );
     }
 
     #[test]
@@ -302,6 +380,7 @@ mod tests {
             thread_id: "48a65359-981b-47c2-9612-e1c64ae07e22".to_string(),
             window_id: "48a65359-981b-47c2-9612-e1c64ae07e22:0".to_string(),
             turn_state: None,
+            cache_affinity_id: None,
         };
         let mut payload = json!({
             "client_metadata": {

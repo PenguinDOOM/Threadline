@@ -135,6 +135,16 @@ The deadline covers the total asynchronous connection future, including DNS, TCP
 
 When the deadline expires, Threadline drops the connection future before creating a pump and does not retry automatically. Before response headers, the client receives the existing JSON error with HTTP `502`, `type=server_error`, code `upstream_websocket_connect_timeout`, and message `The upstream websocket connection timed out.`. Existing handshake rejection and other connection error classifications remain unchanged. The default is an operational policy value, not a measured Codex service-level agreement.
 
+### Session identity and cache affinity
+
+For a new ordinary Main retained session, Threadline may use an eligible downstream `prompt_cache_key` as the upstream WebSocket `session-id` header's cache affinity. This header value is independent of the actual session identity: `client_metadata.session_id` and retained registry ownership continue to use the session's separately generated UUID. The affinity is not a response marker, lookup key, authorization value, or shared transport/state key.
+
+Threadline adopts the complete `prompt_cache_key` unchanged only when it is a JSON string whose final-colon prefix parses as a UUID without trimming, whose suffix is non-empty, whose bytes are all visible ASCII (`0x21` through `0x7e`), and which is accepted as an HTTP header value. It does not normalize, truncate, hash, or remove the family suffix. If the field is missing or ineligible, only the header falls back to the actual session UUID; the request body is not repaired or rewritten by this selection. Existing thread identity extraction remains separate from affinity eligibility.
+
+A retained marker continuation uses its saved session descriptor and therefore its saved affinity; a missing or changed key on the continuation request does not replace it. New sessions with the same affinity remain independent connections with separate actual identities, registry entries, markers, responses, and pending tool state. The affinity does not join their history or state. Utility, auxiliary summary, and conflict-summary fallback connections remain transient and do not acquire this Main-session affinity behavior.
+
+Stable affinity can make a request eligible for backend KV-cache reuse, but Threadline's local tests establish only the selected header and local state separation. They do not guarantee backend acceptance, cache routing or hits, improved token reuse, or safe concurrency behavior at the backend.
+
 ## Upstream WebSocket liveness watchdog
 
 Established upstream WebSockets use an immutable watchdog policy:

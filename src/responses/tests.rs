@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    ResponsesRouteState, continuation_terminal_error, normalize_persistent_reasoning_context,
-    responses_handler, thread_id_from_prompt_cache_key,
+    ResponsesRouteState, cache_affinity_from_prompt_cache_key, continuation_terminal_error,
+    normalize_persistent_reasoning_context, responses_handler, thread_id_from_prompt_cache_key,
 };
 use crate::auth::{AuthSource, LoadedUpstreamAuth, RefreshBoundary};
 use crate::codex_ws::UpstreamSessionDescriptor;
@@ -39,17 +39,23 @@ impl UpstreamAuthProvider for StaticAuthProvider {
 #[derive(Clone)]
 struct CountingConnector {
     calls: Arc<AtomicUsize>,
+    sessions: Arc<std::sync::Mutex<Vec<Option<UpstreamSessionDescriptor>>>>,
 }
 
 impl UpstreamConnector for CountingConnector {
     fn connect(
         &self,
         _auth: LoadedUpstreamAuth,
-        _session: Option<UpstreamSessionDescriptor>,
+        session: Option<UpstreamSessionDescriptor>,
     ) -> BoxFuture<'static, Result<ConnectedUpstream, ThreadlineError>> {
         let calls = Arc::clone(&self.calls);
+        let sessions = Arc::clone(&self.sessions);
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            sessions
+                .lock()
+                .expect("session recorder lock")
+                .push(session);
             Err(ThreadlineError::UpstreamWebSocketConnectFailed)
         })
     }
@@ -150,6 +156,38 @@ fn invalid_prompt_cache_key_does_not_supply_thread_identity() {
 }
 
 #[test]
+fn cache_affinity_preserves_only_complete_visible_uuid_family_keys() {
+    let key = "48A65359-981B-47C2-9612-E1C64AE07E22:GPT-6-preview";
+    let valid = json!({ "prompt_cache_key": key });
+    assert_eq!(
+        cache_affinity_from_prompt_cache_key(valid.as_object().expect("payload object")),
+        Some(key.to_string())
+    );
+
+    for payload in [
+        json!({}),
+        json!({ "prompt_cache_key": null }),
+        json!({ "prompt_cache_key": 12 }),
+        json!({ "prompt_cache_key": "" }),
+        json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22" }),
+        json!({ "prompt_cache_key": ":family" }),
+        json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:" }),
+        json!({ "prompt_cache_key": "not-a-uuid:family" }),
+        json!({ "prompt_cache_key": " 48a65359-981b-47c2-9612-e1c64ae07e22:family" }),
+        json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:family name" }),
+        json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:fa\nmily" }),
+        json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:fam\0ily" }),
+        json!({ "prompt_cache_key": "48a65359-981b-47c2-9612-e1c64ae07e22:ファミリー" }),
+    ] {
+        assert_eq!(
+            cache_affinity_from_prompt_cache_key(payload.as_object().expect("payload object")),
+            None,
+            "ineligible prompt_cache_key must not become a header affinity"
+        );
+    }
+}
+
+#[test]
 fn persistent_reasoning_normalization_inserts_context_for_missing_or_null_reasoning() {
     for mut payload in [json!({}), json!({ "reasoning": null })] {
         let applied = normalize_persistent_reasoning_context(
@@ -231,6 +269,7 @@ async fn retained_continuation_first_send_liveness_timeout_invalidates_all_alias
     let (registry, upstream, send_attempts) = seed_retained_aliases_for_first_send_timeout().await;
 
     let connector_calls = Arc::new(AtomicUsize::new(0));
+    let sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
     let state = ResponsesRouteState {
         profile: RouteProfile::Main,
         persistent_reasoning_enabled: false,
@@ -239,6 +278,7 @@ async fn retained_continuation_first_send_liveness_timeout_invalidates_all_alias
             Arc::new(StaticAuthProvider),
             Arc::new(CountingConnector {
                 calls: Arc::clone(&connector_calls),
+                sessions: Arc::clone(&sessions),
             }),
         ),
     };
@@ -272,6 +312,7 @@ async fn retained_continuation_first_send_liveness_timeout_invalidates_all_alias
 async fn retained_continuation_first_send_timeout_with_hosted_tools_is_not_replayable() {
     let (registry, upstream, send_attempts) = seed_retained_aliases_for_first_send_timeout().await;
     let connector_calls = Arc::new(AtomicUsize::new(0));
+    let sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
     let state = ResponsesRouteState {
         profile: RouteProfile::Main,
         persistent_reasoning_enabled: false,
@@ -280,6 +321,7 @@ async fn retained_continuation_first_send_timeout_with_hosted_tools_is_not_repla
             Arc::new(StaticAuthProvider),
             Arc::new(CountingConnector {
                 calls: Arc::clone(&connector_calls),
+                sessions: Arc::clone(&sessions),
             }),
         ),
     };
@@ -312,4 +354,72 @@ fn continuation_terminal_snapshot_preserves_overflow_over_closed_stale_mapping()
         continuation_terminal_error(overflow),
         Some(ThreadlineError::UpstreamInboundBufferOverflow)
     ));
+}
+
+#[tokio::test]
+async fn ensure_upstream_passes_recoverable_descriptor_to_connector() {
+    let affinity = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
+    let registry = RetainedSessionRegistry::new(1);
+    let mut lease = registry
+        .acquire_new_with_thread_id_and_cache_affinity(
+            Some("thread-recoverable".to_string()),
+            Some(affinity.to_string()),
+        )
+        .await
+        .expect("create retained session");
+    lease
+        .update_turn_state(Some("turn-state-recoverable".to_string()))
+        .await;
+    lease.record_completed_marker("resp_recoverable").await;
+    lease.release();
+
+    let mut lease = registry
+        .acquire_previous("resp_recoverable")
+        .await
+        .expect("acquire retained marker");
+    let expected = lease.session().clone();
+    lease.mark_upstream_recoverable().await;
+
+    let connector_calls = Arc::new(AtomicUsize::new(0));
+    let observed_sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let services = ThreadlineServices::new(
+        Arc::new(StaticAuthProvider),
+        Arc::new(CountingConnector {
+            calls: Arc::clone(&connector_calls),
+            sessions: Arc::clone(&observed_sessions),
+        }),
+    );
+    let auth = services.auth_provider().load().expect("test auth");
+    let error = match super::continuation::ensure_upstream(&services, &mut lease, auth).await {
+        Err(error) => error,
+        Ok(_) => panic!("recording connector should fail after capturing the descriptor"),
+    };
+
+    assert!(matches!(
+        error,
+        ThreadlineError::UpstreamWebSocketConnectFailed
+    ));
+    assert_eq!(connector_calls.load(Ordering::SeqCst), 1);
+    let observed_sessions = observed_sessions.lock().expect("session recorder lock");
+    assert_eq!(observed_sessions.len(), 1);
+    let observed = observed_sessions[0]
+        .as_ref()
+        .expect("retained descriptor passed to connector");
+    assert_ne!(observed.session_id, affinity);
+    assert_eq!(
+        (
+            observed.session_id.as_str(),
+            observed.cache_affinity_id.as_deref(),
+            observed.thread_id.as_str(),
+            observed.window_id.as_str(),
+            observed.turn_state.as_deref(),
+        ),
+        (
+            expected.session_id.as_str(),
+            expected.cache_affinity_id.as_deref(),
+            expected.thread_id.as_str(),
+            expected.window_id.as_str(),
+            expected.turn_state.as_deref(),
+        )
+    );
 }

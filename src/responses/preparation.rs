@@ -107,11 +107,13 @@ async fn prepare_normal_route(
     previous_response_id: Option<String>,
 ) -> Result<PreparedResponseRoute, ThreadlineError> {
     let downstream_thread_id = thread_id_from_prompt_cache_key(&base_request);
+    let cache_affinity_id = cache_affinity_from_prompt_cache_key(&base_request);
     let classification = DownstreamRequestClassification::Normal;
     match acquire_lease(
         &state.registry,
         previous_response_id.as_deref(),
         downstream_thread_id.as_deref(),
+        cache_affinity_id.as_deref(),
     )
     .await
     {

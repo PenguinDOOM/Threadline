@@ -289,8 +289,8 @@ mod tests {
     use std::time::Instant;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+    use tokio_tungstenite::{accept_async, accept_hdr_async};
 
     use super::*;
     use crate::env_test_support::{acknowledge, child_case, run_cases, run_child};
@@ -363,6 +363,55 @@ mod tests {
         }
     }
 
+    #[allow(clippy::result_large_err)]
+    fn echo_session_id_as_turn_state(
+        request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        let received_affinity = request
+            .headers()
+            .get("session-id")
+            .expect("session-id handshake header")
+            .to_str()
+            .expect("session-id header value");
+        response.headers_mut().insert(
+            "x-codex-turn-state",
+            HeaderValue::from_str(received_affinity).expect("echoable test header"),
+        );
+        Ok(response)
+    }
+
+    async fn connect_with_cache_affinity(
+        connector: &DefaultUpstreamConnector,
+        affinity: &str,
+        thread_id: &str,
+        window_id: &str,
+    ) -> crate::responses::ConnectedUpstream {
+        let mut session = crate::codex_ws::UpstreamSessionDescriptor::new(None);
+        session.cache_affinity_id = Some(affinity.to_string());
+        session.thread_id = thread_id.to_string();
+        session.window_id = window_id.to_string();
+        let actual_session_id = session.session_id.clone();
+        let connected =
+            crate::responses::UpstreamConnector::connect(connector, test_auth(), Some(session))
+                .await
+                .expect("production connector should complete the handshake");
+
+        assert_eq!(connected.session.session_id, actual_session_id);
+        assert_eq!(
+            connected.session.cache_affinity_id.as_deref(),
+            Some(affinity)
+        );
+        assert_ne!(connected.session.session_id, affinity);
+        assert_eq!(connected.session.thread_id, thread_id);
+        assert_eq!(connected.session.window_id, window_id);
+        assert_eq!(connected.turn_state.as_deref(), Some(affinity));
+        connected
+    }
+
     #[tokio::test]
     async fn production_connector_times_out_stalled_http_upgrade_without_creating_a_pump() {
         const NAME: &str = "http::tests::production_connector_times_out_stalled_http_upgrade_without_creating_a_pump";
@@ -425,6 +474,54 @@ mod tests {
         let peer = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let _websocket = accept_async(stream).await.unwrap();
+        });
+        tokio::task::spawn_blocking(move || {
+            run_child(NAME, "connect", &[("THREADLINE_UPSTREAM_URL", &endpoint)])
+        })
+        .await
+        .expect("child waiter should join")
+        .expect("connector child should pass");
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .expect("peer cleanup should complete")
+            .expect("peer task should join");
+    }
+
+    #[tokio::test]
+    async fn production_connector_sends_cache_affinity_in_session_header() {
+        const NAME: &str =
+            "http::tests::production_connector_sends_cache_affinity_in_session_header";
+        let affinity = "48a65359-981b-47c2-9612-e1c64ae07e22:gpt-6-sol";
+        if let Some(case) = child_case(NAME, &["connect"]) {
+            let connector = test_connector(Duration::from_secs(1));
+            let mut connected_sessions = Vec::new();
+            for (thread_id, window_id) in [
+                ("thread-first", "thread-first:4"),
+                ("thread-second", "thread-second:9"),
+            ] {
+                connected_sessions.push(
+                    connect_with_cache_affinity(&connector, affinity, thread_id, window_id).await,
+                );
+            }
+            assert_ne!(
+                connected_sessions[0].session.session_id,
+                connected_sessions[1].session.session_id
+            );
+            drop(connected_sessions);
+            acknowledge(NAME, &case);
+            return;
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = format!("ws://{address}/backend-api/codex/responses");
+        let peer = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _websocket = accept_hdr_async(stream, echo_session_id_as_turn_state)
+                    .await
+                    .unwrap();
+            }
         });
         tokio::task::spawn_blocking(move || {
             run_child(NAME, "connect", &[("THREADLINE_UPSTREAM_URL", &endpoint)])
