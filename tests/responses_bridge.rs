@@ -1148,11 +1148,13 @@ async fn astra_visible_and_raw_ids_emit_expected_upstream_payload_with_persisten
 }
 
 #[tokio::test]
-async fn gpt_6_sol_family_visible_and_raw_ids_emit_expected_upstream_payload_with_persistent_reasoning()
- {
+async fn current_main_aliases_and_raw_ids_emit_expected_upstream_payload_with_persistent_reasoning()
+{
     for (model_id, upstream_model_id) in [
         ("threadline-main-gpt-6.1-sol", "gpt-6.1-sol"),
         ("gpt-6.1-sol", "gpt-6.1-sol"),
+        ("threadline-main-gpt-6.1-terra", "gpt-6.1-terra"),
+        ("gpt-6.1-terra", "gpt-6.1-terra"),
         ("threadline-main-gpt-6-sol", "gpt-6-sol"),
         ("gpt-6-sol", "gpt-6-sol"),
         ("threadline-main-gpt-6-luna", "gpt-6-luna"),
@@ -5596,7 +5598,13 @@ async fn raw_main_models_inject_persistent_reasoning_for_missing_null_and_object
         ),
     ];
 
-    for model_id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+    for model_id in [
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+    ] {
         for (case_name, request, expected_reasoning) in &reasoning_cases {
             let mut request = request.clone();
             request
@@ -5620,7 +5628,13 @@ async fn raw_main_models_inject_persistent_reasoning_for_missing_null_and_object
 
 #[tokio::test]
 async fn raw_main_models_preserve_disabled_default_and_client_explicit_all_turns() {
-    for model_id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+    for model_id in [
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+    ] {
         let disabled_payload = completed_response_create_payload(
             ThreadlineConfig::default(),
             json!({ "model": model_id, "input": "disabled reasoning" }),
@@ -5665,6 +5679,25 @@ async fn persistent_reasoning_preserves_disabled_and_existing_reasoning_shapes()
                 "input":"disabled reasoning"
             }),
             None,
+        ),
+        (
+            "Terra disabled",
+            ThreadlineConfig::default(),
+            json!({
+                "model":"threadline-main-gpt-6.1-terra",
+                "input":"Terra disabled reasoning"
+            }),
+            None,
+        ),
+        (
+            "Terra explicit current turn",
+            enabled_main_config.clone(),
+            json!({
+                "model":"threadline-main-gpt-6.1-terra",
+                "input":"Terra explicit current turn",
+                "reasoning":{"context":"current_turn","effort":"high"}
+            }),
+            Some(json!({"context":"current_turn","effort":"high"})),
         ),
         (
             "missing",

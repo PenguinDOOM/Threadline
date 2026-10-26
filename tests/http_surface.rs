@@ -96,20 +96,27 @@ impl UpstreamAuthProvider for AvailableAuthProvider {
     }
 }
 
-const CURRENT_MAIN_VISIBLE_MODEL_IDS: [&str; 4] = [
+const CURRENT_MAIN_VISIBLE_MODEL_IDS: [&str; 5] = [
     "threadline-main-gpt-6.1-sol",
+    "threadline-main-gpt-6.1-terra",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
 ];
 
-const CURRENT_MAIN_RAW_MODEL_IDS: [&str; 4] =
-    ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
+const CURRENT_MAIN_RAW_MODEL_IDS: [&str; 5] = [
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+];
 
 const ASTRA_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-6-astra", "gpt-6-astra"];
 
-const ADVERTISED_MAIN_MODEL_IDS: [&str; 4] = [
+const ADVERTISED_MAIN_MODEL_IDS: [&str; 5] = [
     "threadline-main-gpt-6.1-sol",
+    "threadline-main-gpt-6.1-terra",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
@@ -117,12 +124,14 @@ const ADVERTISED_MAIN_MODEL_IDS: [&str; 4] = [
 
 const ADVERTISED_UTILITY_MODEL_IDS: [&str; 1] = ["threadline-utility-gpt-6-luna"];
 
-const ACCEPTED_MAIN_MODEL_IDS: [&str; 8] = [
+const ACCEPTED_MAIN_MODEL_IDS: [&str; 10] = [
     "threadline-main-gpt-6.1-sol",
+    "threadline-main-gpt-6.1-terra",
     "threadline-main-gpt-6-astra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -154,8 +163,13 @@ const UNSUPPORTED_MODEL_IDS: [&str; 5] = [
     "threadline-test-unsupported",
 ];
 
-const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 4] =
-    ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
+const HIDDEN_MAIN_COMPATIBILITY_MODEL_IDS: [&str; 5] = [
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+];
 
 const REQUEST_BODY_WHITESPACE_CHUNK_BYTES: usize = 64 * 1024;
 

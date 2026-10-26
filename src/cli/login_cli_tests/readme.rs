@@ -51,6 +51,7 @@ fn assert_readme_endpoint_catalog(custom_endpoint_document: &Value) {
         main_model_ids,
         [
             "threadline-main-gpt-6.1-sol",
+            "threadline-main-gpt-6.1-terra",
             "threadline-main-gpt-6-astra",
             "threadline-main-gpt-6-sol",
             "threadline-main-gpt-6-luna",
@@ -91,6 +92,7 @@ fn assert_readme_visible_aliases(readme: &str, custom_endpoint_json: &str) {
         .expect("README should document the supported Utility model alias list");
     for visible_alias in [
         "threadline-main-gpt-6.1-sol",
+        "threadline-main-gpt-6.1-terra",
         "threadline-main-gpt-6-astra",
         "threadline-main-gpt-6-sol",
         "threadline-main-gpt-6-luna",
@@ -154,7 +156,13 @@ fn assert_readme_model_policies(readme: &str) {
     let persistent_reasoning_scope =
         readme_section_containing(readme, "Persistent reasoning is opt-in")
             .expect("README should document persistent reasoning eligibility");
-    for raw_model_id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+    for raw_model_id in [
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+    ] {
         assert!(
             raw_upstream_ids_section.contains(raw_model_id),
             "README should explain raw upstream id {raw_model_id} in the upstream-id section"
@@ -166,7 +174,7 @@ fn assert_readme_model_policies(readme: &str) {
             .contains("These visible ids are aliases for VS Code selection and routing."),
         "README should distinguish visible aliases from raw upstream ids"
     );
-    for eligible_model_name in ["GPT-6.1 Sol", "GPT-6 Astra, Sol, and Luna"] {
+    for eligible_model_name in ["GPT-6.1 Sol and Terra", "GPT-6 Astra, Sol, and Luna"] {
         assert!(
             persistent_reasoning_scope.contains(eligible_model_name),
             "README should describe persistent reasoning eligibility for {eligible_model_name}"
@@ -304,7 +312,7 @@ fn assert_eligible_reasoning_scope(readme: &str) {
             && persistent_reasoning_scope.contains("eligible Main requests using"),
         "README should describe persistent reasoning as eligible Main-only injection"
     );
-    for advertised_main_model_name in ["GPT-6.1 Sol", "GPT-6 Astra, Sol, and Luna"] {
+    for advertised_main_model_name in ["GPT-6.1 Sol and Terra", "GPT-6 Astra, Sol, and Luna"] {
         assert!(
             persistent_reasoning_scope.contains(advertised_main_model_name),
             "README should identify {advertised_main_model_name} as eligible"

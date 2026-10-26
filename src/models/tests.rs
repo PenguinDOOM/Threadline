@@ -6,13 +6,14 @@ use serde_json::json;
 
 const ASTRA_MAIN_MODEL_IDS: [&str; 2] = ["threadline-main-gpt-6-astra", "gpt-6-astra"];
 
-const GPT_6_FAMILY_MAIN_ALIAS_IDS: [&str; 3] = [
+const GPT_6_FAMILY_MAIN_ALIAS_IDS: [&str; 4] = [
     "threadline-main-gpt-6.1-sol",
+    "threadline-main-gpt-6.1-terra",
     "threadline-main-gpt-6-sol",
     "threadline-main-gpt-6-luna",
 ];
 
-const GPT_6_FAMILY_RAW_IDS: [&str; 3] = ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"];
+const GPT_6_FAMILY_RAW_IDS: [&str; 4] = ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"];
 
 #[test]
 fn supported_model_ids_match_main_public_contract() {
@@ -20,6 +21,7 @@ fn supported_model_ids_match_main_public_contract() {
         supported_model_ids(),
         &[
             "threadline-main-gpt-6.1-sol",
+            "threadline-main-gpt-6.1-terra",
             "threadline-main-gpt-6-astra",
             "threadline-main-gpt-6-sol",
             "threadline-main-gpt-6-luna",
@@ -33,6 +35,7 @@ fn advertised_model_ids_are_filtered_by_profile() {
         advertised_model_ids_for_profile(RouteProfile::Main),
         &[
             "threadline-main-gpt-6.1-sol",
+            "threadline-main-gpt-6.1-terra",
             "threadline-main-gpt-6-astra",
             "threadline-main-gpt-6-sol",
             "threadline-main-gpt-6-luna",
@@ -84,6 +87,7 @@ fn supported_model_check_accepts_aliases_and_hidden_main_compatibility_ids() {
 fn resolve_request_model_for_profile_rewrites_visible_alias_to_upstream_model() {
     for (alias_id, upstream_model_id) in [
         ("threadline-main-gpt-6.1-sol", "gpt-6.1-sol"),
+        ("threadline-main-gpt-6.1-terra", "gpt-6.1-terra"),
         ("threadline-main-gpt-6-astra", "gpt-6-astra"),
         ("threadline-main-gpt-6-sol", "gpt-6-sol"),
         ("threadline-main-gpt-6-luna", "gpt-6-luna"),
@@ -300,10 +304,12 @@ fn resolve_request_model_for_profile_accepts_hidden_main_compatibility_ids() {
 fn resolve_request_model_for_profile_accepts_current_main_aliases_and_raw_ids() {
     for model_id in [
         "threadline-main-gpt-6.1-sol",
+        "threadline-main-gpt-6.1-terra",
         "threadline-main-gpt-6-astra",
         "threadline-main-gpt-6-sol",
         "threadline-main-gpt-6-luna",
         "gpt-6.1-sol",
+        "gpt-6.1-terra",
         "gpt-6-astra",
         "gpt-6-sol",
         "gpt-6-luna",

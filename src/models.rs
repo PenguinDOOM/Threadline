@@ -30,10 +30,16 @@ pub struct ModelAlias {
     pub advertised: bool,
 }
 
-const MODEL_ALIAS_CATALOG: [ModelAlias; 9] = [
+const MODEL_ALIAS_CATALOG: [ModelAlias; 11] = [
     ModelAlias {
         alias_id: "threadline-main-gpt-6.1-sol",
         upstream_model_id: "gpt-6.1-sol",
+        profile: RouteProfile::Main,
+        advertised: true,
+    },
+    ModelAlias {
+        alias_id: "threadline-main-gpt-6.1-terra",
+        upstream_model_id: "gpt-6.1-terra",
         profile: RouteProfile::Main,
         advertised: true,
     },
@@ -64,6 +70,12 @@ const MODEL_ALIAS_CATALOG: [ModelAlias; 9] = [
     ModelAlias {
         alias_id: "gpt-6.1-sol",
         upstream_model_id: "gpt-6.1-sol",
+        profile: RouteProfile::Main,
+        advertised: false,
+    },
+    ModelAlias {
+        alias_id: "gpt-6.1-terra",
+        upstream_model_id: "gpt-6.1-terra",
         profile: RouteProfile::Main,
         advertised: false,
     },
